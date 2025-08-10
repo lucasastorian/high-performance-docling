@@ -384,42 +384,26 @@ class TableStructureModel(BasePageModel):
         timer = get_timing_collector()
         table_cells = []
         
-        # Check if we should attach text (only if not matching and explicitly requested)
-        attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', False)
-        
-        # If we need text, get segmented page once for all cells
-        sp = page._backend.get_segmented_page() if attach_text else None
+        # Option to attach text when not matching (default: True for compatibility)
+        attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', True)
         
         with timer.scoped("assign_outputs:validate_cells"):
             for element in table_out["tf_responses"]:
-                if attach_text and sp is not None:
+                if attach_text:
+                    # When not matching, extract text for each cell
                     with timer.scoped("assign_outputs:extract_text"):
-                        # Create a scaled bbox directly from the dict
-                        bbox_dict = element["bbox"]
-                        scale_inv = 1 / self.scale
-                        scaled_bbox = BoundingBox(
-                            l=bbox_dict["l"] * scale_inv,
-                            t=bbox_dict["t"] * scale_inv,
-                            r=bbox_dict["r"] * scale_inv,
-                            b=bbox_dict["b"] * scale_inv
+                        the_bbox = BoundingBox.model_validate(
+                            element["bbox"]
+                        ).scaled(1 / self.scale)
+                        text_piece = page._backend.get_text_in_rect(
+                            the_bbox
                         )
-                        # Use segmented page for faster text extraction
-                        words = sp.get_cells_in_bbox(TextCellUnit.WORD, scaled_bbox)
-                        element["bbox"]["token"] = " ".join(w.text for w in words if w.text.strip())
-                
-                # Scale bbox in place before creating TableCell
-                if "bbox" in element and element["bbox"] is not None:
-                    bbox_dict = element["bbox"]
-                    scale_inv = 1 / self.scale
-                    # Scale the bbox values in the dict (preserving token field)
-                    if all(k in bbox_dict for k in ["l", "t", "r", "b"]):
-                        bbox_dict["l"] *= scale_inv
-                        bbox_dict["t"] *= scale_inv
-                        bbox_dict["r"] *= scale_inv
-                        bbox_dict["b"] *= scale_inv
-                
-                # Use model_validate - it's safer and handles the bbox dict properly
+                        element["bbox"]["token"] = text_piece
+
+                # Use model_validate to ensure the validator runs and text field is populated
                 tc = TableCell.model_validate(element)
+                if tc.bbox is not None:
+                    tc.bbox = tc.bbox.scaled(1 / self.scale)
                 table_cells.append(tc)
 
         assert "predict_details" in table_out
