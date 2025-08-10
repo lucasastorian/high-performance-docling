@@ -233,7 +233,10 @@ class LayoutPredictor:
         # Only move pixel_values; keep dict on CPU
         # pixel_values = inputs["pixel_values"]
 
-        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device.type)
+        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device)
+
+        # DO NOT pin; it's already on GPU. Just ensure channels_last is set.
+        pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
 
         print(f"   Preprocessed tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
 
