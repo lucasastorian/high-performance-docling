@@ -211,29 +211,31 @@ class LayoutPredictor:
 
         w, h = page_img.size
         result = results[0]
-        for score, label_id, box in zip(
-                result["scores"], result["labels"], result["boxes"]
-        ):
-            score = float(score.item())
-            label_id = int(label_id.item()) + self._label_offset
+        
+        # Bulk move to CPU once to avoid sync storms
+        scores_cpu = result["scores"].cpu().numpy().tolist()
+        labels_cpu = result["labels"].cpu().numpy().tolist()
+        boxes_cpu = result["boxes"].cpu().numpy().tolist()
+        
+        for score, label_id, box in zip(scores_cpu, labels_cpu, boxes_cpu):
+            label_id = int(label_id) + self._label_offset
             label_str = self._classes_map[label_id]
 
             # Filter out blacklisted classes
             if label_str in self._black_classes:
                 continue
 
-            bbox_float = [float(b.item()) for b in box]
-            l = min(w, max(0, bbox_float[0]))
-            t = min(h, max(0, bbox_float[1]))
-            r = min(w, max(0, bbox_float[2]))
-            b = min(h, max(0, bbox_float[3]))
+            l = min(w, max(0, box[0]))
+            t = min(h, max(0, box[1]))
+            r = min(w, max(0, box[2]))
+            b = min(h, max(0, box[3]))
             yield {
-                "l": l,
-                "t": t,
-                "r": r,
-                "b": b,
+                "l": float(l),
+                "t": float(t),
+                "r": float(r),
+                "b": float(b),
                 "label": label_str,
-                "confidence": score,
+                "confidence": float(score),
             }
 
     @torch.inference_mode()
@@ -324,21 +326,44 @@ class LayoutPredictor:
         else:
             boxes, scores, labels, batch_idx = post_process()
 
+        # Bulk move to CPU once to avoid sync storms from .item() calls
+        if len(boxes) > 0:
+            boxes_cpu = boxes.detach().cpu()
+            scores_cpu = scores.detach().cpu() 
+            labels_cpu = labels.detach().cpu()
+            batch_idx_cpu = batch_idx.detach().cpu()
+        else:
+            boxes_cpu = boxes.cpu()
+            scores_cpu = scores.cpu()
+            labels_cpu = labels.cpu()
+            batch_idx_cpu = batch_idx.cpu()
+        
         # Finally, for each page, slice and wrap into dicts once:
         all_predictions = []
         for i in range(len(pil_images)):
-            mask = (batch_idx == i)
-            b_i, s_i, l_i = boxes[mask], scores[mask], labels[mask]
-            w, h = pil_images[i].size
-            preds = [
-                {
-                    "l": float(b[0].item()), "t": float(b[1].item()),
-                    "r": float(b[2].item()), "b": float(b[3].item()),
-                    "label": self._classes_map[int(l.item()) + self._label_offset],
-                    "confidence": float(sc.item()),
-                }
-                for b, sc, l in zip(b_i, s_i, l_i)
-            ]
+            mask = (batch_idx_cpu == i)
+            b_i = boxes_cpu[mask]
+            s_i = scores_cpu[mask]
+            l_i = labels_cpu[mask]
+            
+            # Convert to numpy arrays and then to lists in bulk (single sync)
+            if len(b_i) > 0:
+                coords = b_i.numpy().tolist()  # [[l,t,r,b], ...]
+                confs = s_i.numpy().tolist()   # [score, ...]
+                labs = l_i.numpy().tolist()    # [int, ...]
+                
+                w, h = pil_images[i].size
+                preds = [
+                    {
+                        "l": float(c[0]), "t": float(c[1]),
+                        "r": float(c[2]), "b": float(c[3]),
+                        "label": self._classes_map[int(lbl) + self._label_offset],
+                        "confidence": float(sc),
+                    }
+                    for c, sc, lbl in zip(coords, confs, labs)
+                ]
+            else:
+                preds = []
             all_predictions.append(preds)
 
         # Report timing (only if enabled)
