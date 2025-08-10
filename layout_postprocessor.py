@@ -4,7 +4,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
-from docling_core.types.doc import DocItemLabel, Size
+from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell
 from rtree import index
 
@@ -532,8 +532,8 @@ class LayoutPostprocessor:
             best.cells = self._sort_cells(best.cells)
             result.append(best)
 
-        elapsed = (time.perf_counter() - t0) * 1000
-        _log.debug(f"[remove_overlapping_{cluster_type}] {pair_count} pairs checked, {len(clusters)} -> {len(result)} clusters in {elapsed:.1f}ms")
+        # elapsed = (time.perf_counter() - t0) * 1000
+        # _log.debug(f"[remove_overlapping_{cluster_type}] {pair_count} pairs checked, {len(clusters)} -> {len(result)} clusters in {elapsed:.1f}ms")
         return result
 
     def _select_best_cluster(
