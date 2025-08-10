@@ -39,7 +39,7 @@ if __name__ == '__main__':
         do_ocr=False,
         do_table_structure=True,
         images_scale=1.0,
-        accelerator_options=AcceleratorOptions(device="cpu")
+        accelerator_options=AcceleratorOptions(device="mps")
     )
 
     # ========================================

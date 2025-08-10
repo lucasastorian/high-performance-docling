@@ -15,7 +15,7 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 from bbox_decoder_optimized import BBoxDecoder
 from encoder04_rs import Encoder04
-from transformer_rs import Tag_Transformer
+from transformer_optimized import Tag_Transformer
 from optimization_utils import safe_autocast, prepare_model_for_infer, to_device_images, maybe_compile
 
 LOG_LEVEL = logging.WARN
@@ -33,7 +33,7 @@ class TableModel04_rs(BaseModel, nn.Module):
     def __init__(self, config, init_data, device):
         super(TableModel04_rs, self).__init__(config, init_data, device)
 
-        self._prof = config["predict"].get("profiling", False)
+        self._prof = False  # Disable profiling for now (needs proper initialization)
         self._device = device
         # Extract the word_map from the init_data
         word_map = init_data["word_map"]
@@ -81,6 +81,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._dec_layers,
             self._enc_image_size,
             n_heads=self._n_heads,
+            use_sdpa=True,  # Enable SDPA optimization
         ).to(device)
 
         self._bbox_decoder = BBoxDecoder(
@@ -124,6 +125,13 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Do the heavy lift ONCE
         with torch.inference_mode():
             self._encoder.eval()
+            
+            # Check tensor device
+            if str(self._device) == 'mps':
+                assert imgs.device.type == 'mps', f"Images on {imgs.device}, expected mps"
+                if hasattr(torch, 'mps'):
+                    torch.mps.synchronize()
+            
             enc_out_batch = self._encoder(imgs)  # [B, H, W, C]
 
         # Now loop per image but reuse its encoded features
@@ -362,6 +370,20 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # Do the rest of the steps...
         AggProfiler().end("predict_total", self._prof)
+        
+        # Print profiling results if enabled
+        if self._prof:
+            profiler = AggProfiler()
+            print("\n📊 Model Profiling Results:")
+            for key in ["model_encoder", "model_tag_transformer_encoder", 
+                       "model_tag_transformer_decoder", "model_tag_transformer_fc",
+                       "model_bbox_decoder", "predict_total"]:
+                if hasattr(profiler, '_timings') and key in profiler._timings:
+                    times = profiler._timings[key]
+                    if times:
+                        avg_ms = (sum(times) / len(times)) * 1000
+                        print(f"  {key:30s}: {avg_ms:.2f} ms")
+        
         num_tab_cells = seq.count(4) + seq.count(5)
         num_rows = seq.count(9)
         self._log().info(

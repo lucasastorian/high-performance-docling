@@ -31,6 +31,7 @@ from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 from tablemodel04_rs import TableModel04_rs
+from mps_diagnostics import check_model_device, assert_on_device
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
@@ -224,6 +225,11 @@ class TFPredictor:
                 )
                 self._log().error(err_msg)
                 raise ValueError(err_msg)
+        
+        # Check if model is on the correct device
+        if str(self._device) == 'mps':
+            print(f"\n🔍 Checking model device placement...")
+            check_model_device(model, self._device)
 
         return model
 
