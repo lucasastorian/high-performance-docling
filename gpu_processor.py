@@ -14,6 +14,7 @@ import numpy as np
 
 from layout_model import LayoutModel
 from table_structure_model import TableStructureModel
+from table_timing_debug import print_timing_summary
 
 
 def fmt_secs(s: float) -> str:
@@ -107,6 +108,7 @@ class GPUProcessor:
             pages_with_tables = list(self.table_model(conv_res, pages_with_ocr))
             t_tables = time.perf_counter() - t_tables_start
             print(f"     ⏱ tables: {fmt_secs(t_tables)}")
+            print_timing_summary()
         else:
             pages_with_tables = pages_with_ocr
 
