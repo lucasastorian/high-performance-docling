@@ -329,7 +329,8 @@ class TableStructureModel(BasePageModel):
 
     def _get_table_tokens(self, page: Page, table_cluster: Any):
         """Returns all the tokens for a table - optimized without deep copies"""
-        sp = page._backend.get_segmented_page()
+        # sp = page._backend.get_segmented_page()
+        sp = page.parsed_page
         if sp is not None:
             tcells = sp.get_cells_in_bbox(
                 cell_unit=TextCellUnit.WORD,
