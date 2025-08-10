@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+import time
 from itertools import groupby
 from pathlib import Path
 import hashlib
@@ -17,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_model
+from optimization_utils import enable_fast_backends, safe_autocast, prepare_model_for_infer
 
 import docling_ibm_models.tableformer.common as c
 import docling_ibm_models.tableformer.settings as s
@@ -110,6 +112,11 @@ class TFPredictor:
         # self._device = torch.device(device)
         self._device = device
         self._log().info("Running on device: {}".format(device))
+        
+        # Enable GPU optimizations explicitly
+        enable_fast_backends()
+        if device == "cuda" or device.startswith("cuda:"):
+            torch.set_float32_matmul_precision("high")
 
         self._config = config
         self.enable_post_process = True
@@ -134,7 +141,22 @@ class TFPredictor:
 
         # Load the model
         self._model = self._load_model()
-        self._model.eval()
+        
+        # Apply optimizations to the model
+        if isinstance(self._device, str):
+            device_obj = torch.device(self._device)
+        else:
+            device_obj = self._device
+            
+        self._model = prepare_model_for_infer(self._model, device_obj)
+        
+        # Try to compile for extra speed (optional)
+        if device == "cuda" or device.startswith("cuda:"):
+            try:
+                self._model = torch.compile(self._model, mode="max-autotune", fullgraph=False)
+                self._log().info("Model compiled successfully for GPU")
+            except Exception as e:
+                self._log().info(f"torch.compile not available or failed: {e}")
         self._prof = config["predict"].get("profiling", False)
         self._profiling_agg_window = config["predict"].get("profiling_agg_window", None)
         if self._profiling_agg_window is not None:
@@ -1175,7 +1197,10 @@ class TFPredictor:
             else:
                 start = datetime.now()
                 timer.start("model_inference")
-                model_result = self._model.predict(image_batch, max_steps, beam_size)
+                # Use mixed precision for inference
+                device_obj = torch.device(self._device) if isinstance(self._device, str) else self._device
+                with safe_autocast(device_obj, dtype=torch.float16):
+                    model_result = self._model.predict(image_batch, max_steps, beam_size)
                 timer.end("model_inference")
                 print(f"Made table predictions in {datetime.now() - start} seconds")
 
@@ -1290,6 +1315,7 @@ class TFPredictor:
         from table_timing_debug import reset_timing
         reset_timing()
         timer = get_timing_collector()
+        wall_start = time.time()
 
         # Phase 1: collect all tables
         timer.start("phase1_collect_tables")
@@ -1301,24 +1327,17 @@ class TFPredictor:
 
         for rel_page_idx, (page_input, page_tbl_bboxes) in enumerate(zip(page_inputs, table_bboxes_list)):
             page_image = page_input["image"]
-            # Pre-resize once per page
-            timer.start("resize_page_image")
-            page_image_resized, scale_factor = self.resize_img(page_image, height=1024)
-            timer.end("resize_page_image")
-
+            # Skip page resize - crop directly from original image
+            scale_factor = 1.0  # No page resize
             timer.start("crop_tables")
             for table_idx, tbl_bbox in enumerate(page_tbl_bboxes):
-                # Work from a copy; keep caller data pristine
-                scaled_crop_bbox = [
-                    tbl_bbox[0] * scale_factor,
-                    tbl_bbox[1] * scale_factor,
-                    tbl_bbox[2] * scale_factor,
-                    tbl_bbox[3] * scale_factor,
-                ]
-                table_crop = page_image_resized[
-                             round(scaled_crop_bbox[1]): round(scaled_crop_bbox[3]),
-                             round(scaled_crop_bbox[0]): round(scaled_crop_bbox[2]),
-                             ]
+                # Use original bbox directly (no scaling needed)
+                scaled_crop_bbox = tbl_bbox  # Already in page_image coordinates
+                
+                # Crop directly from original page image
+                y1, y2 = round(tbl_bbox[1]), round(tbl_bbox[3])
+                x1, x2 = round(tbl_bbox[0]), round(tbl_bbox[2])
+                table_crop = page_image[y1:y2, x1:x2]
 
                 all_table_images.append(table_crop)
                 all_scaled_bboxes.append(scaled_crop_bbox)
@@ -1384,8 +1403,8 @@ class TFPredictor:
             })
         timer.end("phase3_package_outputs")
 
-        # Print comprehensive timing summary
-        from table_timing_debug import print_timing_summary
-        print_timing_summary()
+        # Print comprehensive timing summary with wall time
+        wall_time = time.time() - wall_start
+        timer.print_summary(wall_time=wall_time, method_name="multi_table_predict")
 
         return multi_tf_output
