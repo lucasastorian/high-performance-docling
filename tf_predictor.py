@@ -973,59 +973,54 @@ class TFPredictor:
     #
     #     return batch_tensor
 
-    def _prepare_image_batch(self, images: list) -> torch.Tensor:
+    def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
         """
-        GPU prep with original semantics:
-          1) normalize in 0..255 HWC:  (img - mean) / std
-          2) resize to (S, S) bilinear, align_corners=False
-          3) transpose to (C, W, H)  (yes, keep this quirk)
-          4) divide by 255.0 last
-        Output: [N, 3, S, S] on self._device (interpreted as N,C,W,H downstream)
+        Full-GPU batch prep with semantics equivalent to:
+          x = F.normalize(img, mean, std)  # (img - 255*mean)/std  in 0..255
+          x = cv2.resize(x, (S,S), INTER_LINEAR)
+          x = x.transpose(2,1,0)           # (C, W, H)
+          x = x / 255.0
+        which is identical to: ((img/255) - mean) / std, then resize, then (C,W,H).
         """
         S = self._config["dataset"]["resized_image"]
         if not images:
             return torch.empty(0, 3, S, S, device=self._device, dtype=torch.float32)
 
-        mean = torch.tensor(
-            self._config["dataset"]["image_normalization"]["mean"],
-            device=self._device, dtype=torch.float32
-        ).view(1, 1, 3)  # HWC broadcast
-        std = torch.tensor(
-            self._config["dataset"]["image_normalization"]["std"],
-            device=self._device, dtype=torch.float32
-        ).view(1, 1, 3)
+        # mean/std are in 0..1 domain (ImageNet-style)
+        mean = torch.tensor(self._config["dataset"]["image_normalization"]["mean"],
+                            device=self._device, dtype=torch.float32).view(1, 1, 3)  # HWC broadcast
+        std = torch.tensor(self._config["dataset"]["image_normalization"]["std"],
+                           device=self._device, dtype=torch.float32).view(1, 1, 3)
 
         out = torch.empty(len(images), 3, S, S, device=self._device, dtype=torch.float32)
 
         for i, np_img in enumerate(images):
-            # Defensive channel fixes
+            # Defensive channel handling: grayscale -> 3ch, drop alpha
             if np_img.ndim == 2:
                 np_img = np.repeat(np_img[..., None], 3, axis=-1)
             elif np_img.shape[-1] > 3:
                 np_img = np_img[..., :3]
 
-            # HWC -> float32 on GPU (keep 0..255 domain for normalize)
+            # HWC uint8/float -> HWC float32 on GPU, scaled to [0,1]
             t = torch.from_numpy(np_img).to(self._device)
             if t.dtype != torch.float32:
                 t = t.to(torch.float32)
+            t = t / 255.0
 
-            # (1) normalize BEFORE resize (0..255 space, HWC)
-            t = (t - mean) / std  # [H,W,3]
+            # Normalize in 0..1 domain (equivalent to your (img - 255*mean)/std then /255 later)
+            t = (t - mean) / std  # HWC
 
-            # (2) resize to S×S (go NCHW for interpolate)
-            t = t.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
-            t = F.interpolate(t, size=(S, S),
-                              mode="bilinear",
-                              align_corners=False,
-                              antialias=False)  # closer to your original path
+            # Resize to S×S (bilinear, align_corners=False ~ OpenCV INTER_LINEAR)
+            t = t.permute(2, 0, 1).unsqueeze(0)  # 1,C,H,W
+            t = F.interpolate(t, size=(S, S), mode="bilinear", align_corners=False)
+            t = t.squeeze(0)  # C,H,S
 
-            # (3) transpose to (C, W, H) to match original training code
-            t = t.squeeze(0).permute(0, 2, 1)  # [C,W,H]
+            # Final layout quirk: (C, W, H) — keep it because the model was trained this way
+            t = t.permute(0, 2, 1)  # C,W,H
 
-            # (4) divide by 255 last
-            out[i].copy_(t / 255.0)
+            out[i].copy_(t)
 
-        return out
+        return out.contiguous(memory_format=torch.channels_last)
 
     def _normalize_model_batch_outputs(self, model_result):
         """
@@ -1161,10 +1156,10 @@ class TFPredictor:
         AggProfiler().start_agg(self._prof)
 
         timer = get_timing_collector()
-        
+
         max_steps = self._config["predict"]["max_steps"]
         beam_size = self._config["predict"]["beam_size"]
-        
+
         timer.start("prepare_image_batch")
         image_batch = self._prepare_image_batch(table_images)
         timer.end("prepare_image_batch")
@@ -1187,7 +1182,7 @@ class TFPredictor:
                 model_result = self._model.predict(image_batch, max_steps, beam_size)
                 timer.end("model_inference")
                 print(f"Made table predictions in {datetime.now() - start} seconds")
-                
+
                 timer.start("normalize_outputs")
                 triples = self._normalize_model_batch_outputs(model_result)
                 timer.end("normalize_outputs")
@@ -1272,9 +1267,9 @@ class TFPredictor:
             tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
 
             outputs.append((tf_output, matching_details))
-        
+
         # Don't print here - let multi_table_predict handle it
-        
+
         return outputs
 
     # -----------------------
@@ -1299,7 +1294,7 @@ class TFPredictor:
         from table_timing_debug import reset_timing
         reset_timing()
         timer = get_timing_collector()
-        
+
         # Phase 1: collect all tables
         timer.start("phase1_collect_tables")
         all_table_images: list[np.ndarray] = []
@@ -1396,5 +1391,5 @@ class TFPredictor:
         # Print comprehensive timing summary
         from table_timing_debug import print_timing_summary
         print_timing_summary()
-        
+
         return multi_tf_output
