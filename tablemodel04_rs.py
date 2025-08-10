@@ -13,9 +13,10 @@ import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
-from bbox_decoder_rs import BBoxDecoder
+from bbox_decoder_optimized import BBoxDecoder
 from encoder04_rs import Encoder04
 from transformer_rs import Tag_Transformer
+from optimization_utils import safe_autocast, prepare_model_for_infer, to_device_images, maybe_compile
 
 LOG_LEVEL = logging.WARN
 
