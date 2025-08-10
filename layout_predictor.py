@@ -143,6 +143,14 @@ class LayoutPredictor:
             )
             # Use optimization utils for proper model preparation
             self._model = prepare_model_for_infer(self._model, self._device)
+            
+            # Warmup to stabilize cuDNN autotune and avoid first-run penalty
+            if self._device.type == "cuda":
+                dummy = torch.zeros(1, 3, 640, 640, device=self._device).contiguous(memory_format=torch.channels_last)
+                with safe_autocast(self._device, dtype=torch.float16), torch.inference_mode():
+                    _ = self._model(pixel_values=dummy)
+                torch.cuda.synchronize()
+                _log.debug("Model warmup complete")
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -155,6 +163,16 @@ class LayoutPredictor:
         
         # Pre-compute name to ID mapping for blacklist filtering
         self._name_to_id = {name: i for i, name in enumerate(self._classes_map)}
+        
+        # Optional: compile the fast postprocess path for extra speed
+        if self._device.type == "cuda":
+            try:
+                self.post_process_object_detection_fast = torch.compile(
+                    self.post_process_object_detection_fast, mode="reduce-overhead", fullgraph=False
+                )
+                _log.debug("Post-processing function compiled successfully")
+            except Exception as e:
+                _log.debug(f"torch.compile not available or failed: {e}")
 
         _log.debug("LayoutPredictor settings: {}".format(self.info()))
 
@@ -292,26 +310,27 @@ class LayoutPredictor:
             )
 
             # Early GPU culling of small/extreme aspect ratio boxes (optional)
-            if self._device.type == "cuda" and len(boxes) > 0:
+            if self._device.type == "cuda" and boxes.numel() > 0:
                 wh = (boxes[:, 2] - boxes[:, 0]).clamp_min_(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min_(0)
                 ar = (boxes[:, 2] - boxes[:, 0]).clamp_min_(1e-6) / (boxes[:, 3] - boxes[:, 1]).clamp_min_(1e-6)
                 keep = (wh >= 9.0) & (ar <= 20) & (ar >= 1/20)
-                if keep.any():
-                    boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
+                # No need for keep.any() check - indexing with empty mask is fine
+                boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
             # GPU-accelerated blacklist filtering
-            if self._black_classes and len(labels) > 0:
+            if self._black_classes and labels.numel() > 0:
                 blk = torch.tensor(
                     [self._name_to_id[n] - self._label_offset for n in self._black_classes],
                     device=labels.device, dtype=labels.dtype
                 )
                 keep = ~torch.isin(labels, blk)
-                if keep.any():
-                    boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
+                # No need for keep.any() check - indexing with empty mask is fine
+                boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
             # Batched NMS (only if enabled - can add overhead)
-            if self._enable_nms and self._device.type == "cuda" and len(boxes) > 0:
-                label_stride = int(labels.max().item()) + 1 if len(labels) > 0 else 1
+            if self._enable_nms and self._device.type == "cuda" and boxes.numel() > 0:
+                # Avoid .item() sync - keep label_stride on GPU
+                label_stride = (labels.max() + 1) if labels.numel() > 0 else labels.new_tensor(1)
                 kept = torchvision.ops.batched_nms(
                     boxes, scores, labels + batch_idx * label_stride, iou_threshold=0.5
                 )
@@ -327,16 +346,17 @@ class LayoutPredictor:
             boxes, scores, labels, batch_idx = post_process()
 
         # Bulk move to CPU once to avoid sync storms from .item() calls
-        if len(boxes) > 0:
-            boxes_cpu = boxes.detach().cpu()
-            scores_cpu = scores.detach().cpu() 
-            labels_cpu = labels.detach().cpu()
-            batch_idx_cpu = batch_idx.detach().cpu()
-        else:
-            boxes_cpu = boxes.cpu()
-            scores_cpu = scores.cpu()
-            labels_cpu = labels.cpu()
-            batch_idx_cpu = batch_idx.cpu()
+        # Single path - .detach().cpu() works fine on empty tensors
+        boxes_cpu = boxes.detach().cpu()
+        scores_cpu = scores.detach().cpu() 
+        labels_cpu = labels.detach().cpu()
+        batch_idx_cpu = batch_idx.detach().cpu()
+        
+        # Detection count logging for spotting outliers
+        if self._enable_timing and scores.numel() > 0:
+            det_total = int(scores.numel())
+            det_per_page = torch.bincount(batch_idx, minlength=len(pil_images)).detach().cpu().tolist()
+            _log.debug(f"[layout.det] total={det_total} | per_page={det_per_page[:8]}{'...' if len(det_per_page)>8 else ''}")
         
         # Finally, for each page, slice and wrap into dicts once:
         all_predictions = []
@@ -454,8 +474,6 @@ class LayoutPredictor:
         B, Q, C = logits.shape
 
         # Convert to xyxy in absolute pixels if target_sizes provided
-        # center_to_corners_format is cheap; keep it on device
-        boxes_xyxy = torch.empty_like(pred_boxes)
         # cxcywh -> xyxy
         cx, cy, w, h = pred_boxes.unbind(-1)
         x0 = cx - 0.5 * w
