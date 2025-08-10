@@ -1228,8 +1228,6 @@ class TFPredictor:
 
             outputs.append((tf_output, matching_details))
         
-        timer.end("matching_total")
-        timer.print_summary()
         return outputs
 
     # -----------------------
@@ -1253,7 +1251,7 @@ class TFPredictor:
         timer = get_timing_collector()
         
         # Phase 1: collect all tables
-        timer.start("phase1_total")
+        timer.start("phase1_collect_tables")
         all_table_images: list[np.ndarray] = []
         all_scaled_bboxes: list[list[float]] = []
         all_scale_factors: list[float] = []
@@ -1263,8 +1261,11 @@ class TFPredictor:
         for rel_page_idx, (page_input, page_tbl_bboxes) in enumerate(zip(page_inputs, table_bboxes_list)):
             page_image = page_input["image"]
             # Pre-resize once per page
+            timer.start("resize_page_image")
             page_image_resized, scale_factor = self.resize_img(page_image, height=1024)
+            timer.end("resize_page_image")
 
+            timer.start("crop_tables")
             for table_idx, tbl_bbox in enumerate(page_tbl_bboxes):
                 # Work from a copy; keep caller data pristine
                 scaled_crop_bbox = [
@@ -1287,11 +1288,14 @@ class TFPredictor:
                     "table_idx": table_idx,
                     "doc_id": doc_id,
                 })
+            timer.end("crop_tables")
+        timer.end("phase1_collect_tables")
 
         if not all_table_images:
             return []
 
         # Phase 2: model + matching
+        timer.start("phase2_predict")
         batched_results = self.predict(
             iocr_pages=all_iocr_pages,
             table_bboxes=all_scaled_bboxes,
@@ -1300,20 +1304,25 @@ class TFPredictor:
             correct_overlapping_cells=correct_overlapping_cells,
             do_matching=do_matching,
         )
+        timer.end("phase2_predict")
 
         # Phase 3: package outputs per table (order preserved)
+        timer.start("phase3_package_outputs")
         multi_tf_output: list[dict] = []
         for i, (tf_responses, matching_details) in enumerate(batched_results):
             # Compute row/col counts and compact indexes if requested
             predict_details = matching_details  # naming compatibility
+            timer.start("finalize_predict_details")
             predict_details = self._finalize_predict_details(
                 tf_responses=tf_responses,
                 predict_details=predict_details,
                 sort_row_col_indexes=sort_row_col_indexes,
             )
+            timer.end("finalize_predict_details")
 
             # Cache if needed (YOUR ORIGINAL BLOCK)
             if self.enable_cache:
+                timer.start("cache_prediction")
                 prepared_tensor = self._prepare_image(all_table_images[i])
                 self._cache_prediction(
                     predict_details=predict_details,
@@ -1326,10 +1335,12 @@ class TFPredictor:
                     table_bbox=all_scaled_bboxes[i],
                     scale_factor=all_scale_factors[i]
                 )
+                timer.end("cache_prediction")
 
             multi_tf_output.append({
                 "tf_responses": tf_responses,
                 "predict_details": predict_details,
             })
+        timer.end("phase3_package_outputs")
 
         return multi_tf_output

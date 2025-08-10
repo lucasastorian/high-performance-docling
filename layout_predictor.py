@@ -199,6 +199,7 @@ class LayoutPredictor:
             return []
 
         # Convert all images to RGB PIL format
+        t_convert0 = time.perf_counter()
         pil_images = []
         for img in images:
             if isinstance(img, Image.Image):
@@ -207,25 +208,40 @@ class LayoutPredictor:
                 pil_images.append(Image.fromarray(img).convert("RGB"))
             else:
                 raise TypeError("Not supported input image format")
+        t_convert1 = time.perf_counter()
 
         # Target sizes remain on CPU for postprocess
         target_sizes = torch.tensor([img.size[::-1] for img in pil_images])
 
-        # Build inputs on CPU
+        # Build inputs on CPU - this is the expensive operation!
+        # Let's profile what the image processor is doing internally
         torch.cuda.synchronize() if self._device.type == "cuda" else None
         t0 = time.perf_counter()
+        
+        # The image processor likely does:
+        # 1. Resize images to fixed size (expensive on CPU)
+        # 2. Convert to tensors
+        # 3. Normalize pixel values
+        # Let's time this more granularly
+        print(f"📊 Processing {len(pil_images)} images, sizes: {[img.size for img in pil_images[:3]]}...")
+        
         inputs = self._image_processor(images=pil_images, return_tensors="pt")
         t_pre = time.perf_counter()
 
         # Only move pixel_values; keep dict on CPU
         pixel_values = inputs["pixel_values"]
+        print(f"   Preprocessed tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
 
         # Prepare memory layout for better kernel perf without changing numerics
+        t_layout0 = time.perf_counter()
         pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
+        t_layout1 = time.perf_counter()
 
         # Move to device
         if self._device.type == "cuda":
+            t_pin0 = time.perf_counter()
             pixel_values = pixel_values.pin_memory()
+            t_pin1 = time.perf_counter()
             pixel_values = pixel_values.to(self._device, non_blocking=True)
             torch.cuda.synchronize()
         elif self._device.type == "mps":
@@ -253,12 +269,19 @@ class LayoutPredictor:
         )
         t_post = time.perf_counter()
 
+        # Detailed timing breakdown
         print(
-            f"preprocess: {t_pre - t0:.3f}s | "
-            f"h2d: {t_h2d - t_pre:.3f}s | "
-            f"forward: {t_fwd - t_h2d:.3f}s | "
-            f"post: {t_post - t_fwd:.3f}s"
+            f"⏱ Layout timing breakdown:\n"
+            f"   img_convert: {t_convert1 - t_convert0:.3f}s\n"
+            f"   preprocess: {t_pre - t0:.3f}s (RTDetrImageProcessor - resize/normalize)\n"
+            f"   channels_last: {t_layout1 - t_layout0:.3f}s\n"
+            f"   h2d: {t_h2d - t_layout1:.3f}s\n"
+            f"   forward: {t_fwd - t_h2d:.3f}s\n"
+            f"   post: {t_post - t_fwd:.3f}s"
         )
+        
+        if self._device.type == "cuda" and 't_pin0' in locals():
+            print(f"   (pin_memory: {t_pin1 - t_pin0:.3f}s)")
 
         # Convert results to standard format for each image
         all_predictions: List[List[dict]] = []
