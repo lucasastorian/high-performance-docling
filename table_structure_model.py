@@ -407,26 +407,19 @@ class TableStructureModel(BasePageModel):
                         words = sp.get_cells_in_bbox(TextCellUnit.WORD, scaled_bbox)
                         element["bbox"]["token"] = " ".join(w.text for w in words if w.text.strip())
                 
-                # Use faster model_construct if we trust the output
-                if getattr(self.options, 'trust_tf_output', True):
-                    # When using model_construct, we need to manually create BoundingBox
-                    if "bbox" in element and element["bbox"] is not None:
-                        bbox_dict = element["bbox"]
-                        scale_inv = 1 / self.scale
-                        # Create a proper BoundingBox object with scaled values
-                        element["bbox"] = BoundingBox(
-                            l=bbox_dict.get("l", 0) * scale_inv,
-                            t=bbox_dict.get("t", 0) * scale_inv,
-                            r=bbox_dict.get("r", 0) * scale_inv,
-                            b=bbox_dict.get("b", 0) * scale_inv
-                        )
-                    tc = TableCell.model_construct(**element)
-                else:
-                    # model_validate will handle type conversion automatically
-                    tc = TableCell.model_validate(element)
-                    if tc.bbox is not None:
-                        tc.bbox = tc.bbox.scaled(1 / self.scale)
-                    
+                # Scale bbox in place before creating TableCell
+                if "bbox" in element and element["bbox"] is not None:
+                    bbox_dict = element["bbox"]
+                    scale_inv = 1 / self.scale
+                    # Scale the bbox values in the dict (preserving token field)
+                    if all(k in bbox_dict for k in ["l", "t", "r", "b"]):
+                        bbox_dict["l"] *= scale_inv
+                        bbox_dict["t"] *= scale_inv
+                        bbox_dict["r"] *= scale_inv
+                        bbox_dict["b"] *= scale_inv
+                
+                # Use model_validate - it's safer and handles the bbox dict properly
+                tc = TableCell.model_validate(element)
                 table_cells.append(tc)
 
         assert "predict_details" in table_out
