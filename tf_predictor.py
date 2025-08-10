@@ -16,6 +16,7 @@ from typing import List, Dict, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_model
 
 import docling_ibm_models.tableformer.common as c
@@ -972,49 +973,59 @@ class TFPredictor:
     #
     #     return batch_tensor
 
-    def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
+    def _prepare_image_batch(self, images: list) -> torch.Tensor:
         """
-        Convert a list of OpenCV images (H,W,C) to a single batch tensor on self._device.
-        Semantics preserved:
-          1) Normalize in 0..255 space (BGR order, as given)
-          2) Resize to (S,S) with bilinear, align_corners=False
-          3) Divide by 255.0
+        GPU prep with original semantics:
+          1) normalize in 0..255 HWC:  (img - mean) / std
+          2) resize to (S, S) bilinear, align_corners=False
+          3) transpose to (C, W, H)  (yes, keep this quirk)
+          4) divide by 255.0 last
+        Output: [N, 3, S, S] on self._device (interpreted as N,C,W,H downstream)
         """
         S = self._config["dataset"]["resized_image"]
-        mean = torch.as_tensor(self._config["dataset"]["image_normalization"]["mean"],
-                               dtype=torch.float32, device=self._device).view(1, 3, 1, 1)
-        std = torch.as_tensor(self._config["dataset"]["image_normalization"]["std"],
-                              dtype=torch.float32, device=self._device).view(1, 3, 1, 1)
-
         if not images:
-            return torch.empty(0, 3, S, S, device=self._device)
+            return torch.empty(0, 3, S, S, device=self._device, dtype=torch.float32)
 
-        # Preallocate the output on device
+        mean = torch.tensor(
+            self._config["dataset"]["image_normalization"]["mean"],
+            device=self._device, dtype=torch.float32
+        ).view(1, 1, 3)  # HWC broadcast
+        std = torch.tensor(
+            self._config["dataset"]["image_normalization"]["std"],
+            device=self._device, dtype=torch.float32
+        ).view(1, 1, 3)
+
         out = torch.empty(len(images), 3, S, S, device=self._device, dtype=torch.float32)
-        for i, img in enumerate(images):
-            # Handle channel oddities defensively
-            if img.ndim == 2:  # grayscale -> 3ch
-                img = np.repeat(img[..., None], 3, axis=-1)
-            elif img.shape[-1] > 3:  # drop alpha if present
-                img = img[..., :3]
 
-            # HWC (uint8/float) -> CHW float32 on device
-            t = torch.from_numpy(img).permute(2, 0, 1).contiguous()  # [3,H,W], CPU
-            t = t.to(self._device, dtype=torch.float32, non_blocking=True)
+        for i, np_img in enumerate(images):
+            # Defensive channel fixes
+            if np_img.ndim == 2:
+                np_img = np.repeat(np_img[..., None], 3, axis=-1)
+            elif np_img.shape[-1] > 3:
+                np_img = np_img[..., :3]
 
-            # (1) normalize in 0..255 space (original code path)
-            t = (t - mean[0]) / std[0]
+            # HWC -> float32 on GPU (keep 0..255 domain for normalize)
+            t = torch.from_numpy(np_img).to(self._device)
+            if t.dtype != torch.float32:
+                t = t.to(torch.float32)
 
-            # (2) resize to SxS
-            t = torch.nn.functional.interpolate(t.unsqueeze(0),
-                                                size=(S, S),
-                                                mode="bilinear",
-                                                align_corners=False).squeeze(0)
+            # (1) normalize BEFORE resize (0..255 space, HWC)
+            t = (t - mean) / std  # [H,W,3]
 
-            # (3) divide by 255.0
-            out[i] = t / 255.0
+            # (2) resize to S×S (go NCHW for interpolate)
+            t = t.permute(2, 0, 1).unsqueeze(0)  # [1,C,H,W]
+            t = F.interpolate(t, size=(S, S),
+                              mode="bilinear",
+                              align_corners=False,
+                              antialias=False)  # closer to your original path
 
-        return out.contiguous(memory_format=torch.channels_last)
+            # (3) transpose to (C, W, H) to match original training code
+            t = t.squeeze(0).permute(0, 2, 1)  # [C,W,H]
+
+            # (4) divide by 255 last
+            out[i].copy_(t / 255.0)
+
+        return out
 
     def _normalize_model_batch_outputs(self, model_result):
         """
