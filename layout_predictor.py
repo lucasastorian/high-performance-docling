@@ -281,13 +281,10 @@ class LayoutPredictor:
             f"   img_convert: {t_convert1 - t_convert0:.3f}s\n"
             f"   preprocess: {t_pre - t0:.3f}s (RTDetrImageProcessor - resize/normalize)\n"
             f"   channels_last: {t_layout1 - t_layout0:.3f}s\n"
-            f"   h2d: {t_h2d - t_layout1:.3f}s\n"
-            f"   forward: {t_fwd - t_h2d:.3f}s\n"
+            # f"   h2d: {t_h2d - t_layout1:.3f}s\n"
+            # f"   forward: {t_fwd - t_h2d:.3f}s\n"
             f"   post: {t_post - t_fwd:.3f}s"
         )
-        
-        if self._device.type == "cuda" and 't_pin0' in locals():
-            print(f"   (pin_memory: {t_pin1 - t_pin0:.3f}s)")
 
         # Convert results to standard format for each image
         all_predictions: List[List[dict]] = []
