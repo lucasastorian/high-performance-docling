@@ -70,18 +70,12 @@ class BatchedTableDecoder:
         S = encoder_out.size(1) * encoder_out.size(2)
         
         # Reshape for transformer: [B, S, C] -> [S, B, C]
-        memory = encoder_out.view(B, S, C).permute(1, 0, 2).contiguous()
+        # Use reshape instead of view since encoder_out may be non-contiguous after permute
+        memory = encoder_out.reshape(B, S, C).permute(1, 0, 2).contiguous()
         
-        # Create encoder mask (though it's basically a no-op)
-        encoder_mask = torch.zeros(
-            (B * n_heads, S, S), device=device
-        ) == torch.ones(
-            (B * n_heads, S, S), device=device
-        )
-        
-        # Run encoder once for all B
+        # Run encoder once for all B (no mask needed - it was all False anyway)
         AggProfiler().begin("batched_encoder", self._prof)
-        mem_enc = tt._encoder(memory, mask=encoder_mask)  # [S, B, C]
+        mem_enc = tt._encoder(memory, mask=None)  # [S, B, C]
         AggProfiler().end("batched_encoder", self._prof)
         
         # Initialize tokens with <start> for all sequences
@@ -124,26 +118,23 @@ class BatchedTableDecoder:
             logits = tt._fc(decoded[-1, :, :])  # [B, vocab]
             new_tags = logits.argmax(dim=1)     # [B]
             
-            # Apply structure corrections per item
-            new_tags_list = new_tags.tolist()
-            for b in range(B):
-                if state.finished[b]:
-                    new_tags_list[b] = end_id
-                    continue
-                    
-                t = new_tags_list[b]
-                
-                # First line: xcel -> lcel
-                if state.line_num[b].item() == 0 and t == word_map.get("xcel", -999):
-                    t = word_map["lcel"]
-                    
-                # ucel -> next lcel becomes fcel
-                if state.prev_tag_ucel[b] and t == word_map.get("lcel", -999):
-                    t = word_map["fcel"]
-                    
-                new_tags_list[b] = t
-                
-            new_tags = torch.tensor(new_tags_list, device=device, dtype=torch.long)
+            # Apply structure corrections vectorized on device (no CPU sync!)
+            xcel_id = word_map.get("xcel", -999)
+            lcel_id = word_map.get("lcel", -999)
+            fcel_id = word_map.get("fcel", -999)
+            
+            # First line: xcel -> lcel
+            if xcel_id != -999 and lcel_id != -999:
+                mask_first_line = (state.line_num == 0) & (new_tags == xcel_id)
+                new_tags = torch.where(mask_first_line, torch.full_like(new_tags, lcel_id), new_tags)
+            
+            # ucel then lcel -> fcel
+            if lcel_id != -999 and fcel_id != -999:
+                mask_ucel_lcel = state.prev_tag_ucel & (new_tags == lcel_id)
+                new_tags = torch.where(mask_ucel_lcel, torch.full_like(new_tags, fcel_id), new_tags)
+            
+            # Force <end> for finished sequences
+            new_tags = torch.where(state.finished, torch.full_like(new_tags, end_id), new_tags)
             
             # Store hidden states for bbox prediction
             last_H = decoded[-1, :, :]  # [B, D]

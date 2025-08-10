@@ -110,16 +110,17 @@ class TableModel04_rs(BaseModel, nn.Module):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
     def mergebboxes(self, bbox1, bbox2):
+        device = bbox1.device
         new_w = (bbox2[0] + bbox2[2] / 2) - (bbox1[0] - bbox1[2] / 2)
         new_h = (bbox2[1] + bbox2[3] / 2) - (bbox1[1] - bbox1[3] / 2)
 
         new_left = bbox1[0] - bbox1[2] / 2
-        new_top = min((bbox2[1] - bbox2[3] / 2), (bbox1[1] - bbox1[3] / 2))
+        new_top = torch.minimum(bbox2[1] - bbox2[3] / 2, bbox1[1] - bbox1[3] / 2)
 
         new_cx = new_left + new_w / 2
         new_cy = new_top + new_h / 2
 
-        bboxm = torch.tensor([new_cx, new_cy, new_w, new_h])
+        bboxm = torch.stack([new_cx, new_cy, new_w, new_h]).to(device)
         return bboxm
 
     # --- in TableModel04_rs.predict ---
@@ -215,18 +216,14 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         batch_size = encoder_out.size(0)
         encoder_dim = encoder_out.size(-1)
-        enc_inputs = encoder_out.view(batch_size, -1, encoder_dim).to(self._device)
+        # Use reshape instead of view for non-contiguous tensor
+        enc_inputs = encoder_out.reshape(batch_size, -1, encoder_dim).to(self._device)
         enc_inputs = enc_inputs.permute(1, 0, 2)
         positions = enc_inputs.shape[0]
 
-        encoder_mask = torch.zeros(
-            (batch_size * n_heads, positions, positions), device=self._device
-        ) == torch.ones(
-            (batch_size * n_heads, positions, positions), device=self._device
-        )
-
+        # Don't create giant all-False mask - just use None
         AggProfiler().begin("model_tag_transformer_encoder", self._prof)
-        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
+        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=None)
         AggProfiler().end("model_tag_transformer_encoder", self._prof)
 
         decoded_tags = (
@@ -257,7 +254,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                 decoded_embedding,
                 encoder_out,
                 cache,
-                memory_key_padding_mask=encoder_mask,
+                memory_key_padding_mask=None,  # Don't use the mask
             )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
