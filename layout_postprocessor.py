@@ -1,6 +1,7 @@
 import bisect
 import logging
 import sys
+import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
@@ -10,6 +11,7 @@ from rtree import index
 
 from docling.datamodel.base_models import BoundingBox, Cluster, Page
 from docling.datamodel.pipeline_options import LayoutOptions
+from table_timing_debug import get_timing_collector
 
 _log = logging.getLogger(__name__)
 
@@ -221,9 +223,17 @@ class LayoutPostprocessor:
 
     def postprocess(self) -> Tuple[List[Cluster], List[TextCell]]:
         """Main processing pipeline."""
+        timer = get_timing_collector()
+        
+        timer.start("layout_process_regular")
         self.regular_clusters = self._process_regular_clusters()
+        timer.end("layout_process_regular")
+        
+        timer.start("layout_process_special")
         self.special_clusters = self._process_special_clusters()
+        timer.end("layout_process_special")
 
+        timer.start("layout_remove_contained")
         # Remove regular clusters that are included in wrappers
         contained_ids = {
             child.id
@@ -234,7 +244,9 @@ class LayoutPostprocessor:
         self.regular_clusters = [
             c for c in self.regular_clusters if c.id not in contained_ids
         ]
+        timer.end("layout_remove_contained")
 
+        timer.start("layout_final_sort")
         # Combine and sort final clusters
         final_clusters = self._sort_clusters(
             self.regular_clusters + self.special_clusters, mode="id"
@@ -244,6 +256,7 @@ class LayoutPostprocessor:
             # Also sort cells in children if any
             for child in cluster.children:
                 child.cells = self._sort_cells(child.cells)
+        timer.end("layout_final_sort")
 
         assert self.page.parsed_page is not None
         self.page.parsed_page.textline_cells = self.cells
@@ -253,11 +266,15 @@ class LayoutPostprocessor:
 
     def _process_regular_clusters(self) -> List[Cluster]:
         """Process regular clusters with iterative refinement."""
+        timer = get_timing_collector()
+        
+        timer.start("layout_filter_confidence")
         clusters = [
             c
             for c in self.regular_clusters
             if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
         ]
+        timer.end("layout_filter_confidence")
 
         # Apply label remapping
         for cluster in clusters:
@@ -265,7 +282,9 @@ class LayoutPostprocessor:
                 cluster.label = self.LABEL_REMAPPING[cluster.label]
 
         # Initial cell assignment
+        timer.start("layout_assign_cells")
         clusters = self._assign_cells_to_clusters(clusters)
+        timer.end("layout_assign_cells")
 
         # Remove clusters with no cells (if keep_empty_clusters is False),
         # but always keep clusters with label DocItemLabel.FORMULA
@@ -277,6 +296,7 @@ class LayoutPostprocessor:
             ]
 
         # Handle orphaned cells
+        timer.start("layout_handle_orphans")
         unassigned = self._find_unassigned_cells(clusters)
         if unassigned and self.options.create_orphan_clusters:
             next_id = max((c.id for c in self.all_clusters), default=0) + 1
@@ -294,8 +314,10 @@ class LayoutPostprocessor:
                     )
                 )
             clusters.extend(orphan_clusters)
+        timer.end("layout_handle_orphans")
 
         # Iterative refinement
+        timer.start("layout_iterative_refine")
         prev_count = len(clusters) + 1
         for _ in range(3):  # Maximum 3 iterations
             if prev_count == len(clusters):
@@ -303,6 +325,7 @@ class LayoutPostprocessor:
             prev_count = len(clusters)
             clusters = self._adjust_cluster_bboxes(clusters)
             clusters = self._remove_overlapping_clusters(clusters, "regular")
+        timer.end("layout_iterative_refine")
 
         return clusters
 
@@ -577,38 +600,173 @@ class LayoutPostprocessor:
         return unique_cells
 
     def _assign_cells_to_clusters(
-        self, clusters: List[Cluster], min_overlap: float = 0.2
+            self,
+            clusters: List[Cluster],
+            min_overlap: float = 0.2,
+            use_spatial_index: bool = True,
+            build_index_threshold: int = 2000,
     ) -> List[Cluster]:
-        """Assign cells to best overlapping cluster."""
-        for cluster in clusters:
-            cluster.cells = []
+        """
+        Assign text cells to the best-overlapping cluster.
 
-        for cell in self.cells:
-            if not cell.text.strip():
+        Strategy:
+          1) Clear cells on all candidate clusters.
+          2) For each cell with non-empty text, fetch candidate clusters via R-tree
+             (or fall back to all clusters if small), then vectorize overlap
+             computation to pick the best cluster by intersection_over_self(cell).
+          3) Enforce `min_overlap`; if none exceed, the cell remains unassigned.
+          4) Deduplicate cells per cluster (by TextCell.index) to avoid double adds.
+
+        Args:
+            clusters: Already-filtered "regular" clusters (not wrappers/pictures).
+            min_overlap: Minimum fraction of the CELL area covered by the cluster bbox.
+            use_spatial_index: If True, build an R-tree over the provided clusters.
+            build_index_threshold: If (#cells * #clusters) below this, skip the index
+                to avoid the tiny R-tree build overhead on very small pages.
+
+        Returns:
+            The same list with `cluster.cells` filled.
+        """
+        # Fast exits
+        if not clusters or not self.cells:
+            for c in clusters:
+                c.cells = []
+            return clusters
+
+        # Clear previous assignments
+        for c in clusters:
+            c.cells = []
+
+        # Precompute cluster arrays (ids, boxes, confidences) once
+        id_to_idx = {c.id: i for i, c in enumerate(clusters)}
+        idx_to_cluster = {i: c for i, c in enumerate(clusters)}
+        cl_boxes = np.asarray([c.bbox.as_tuple() for c in clusters], dtype=np.float32)  # (M, 4)
+        cl_conf = np.asarray([c.confidence for c in clusters], dtype=np.float32)  # (M,)
+
+        # Precompute cell boxes + a text mask (keep Python objects for final append)
+        cells = self.cells
+        cell_boxes = np.asarray([cell.rect.to_bounding_box().as_tuple() for cell in cells], dtype=np.float32)  # (N,4)
+        cell_text_mask = np.asarray([bool(cell.text.strip()) for cell in cells], dtype=bool)
+
+        N = len(cells)
+        M = len(clusters)
+
+        # Decide whether to use R-tree: helpful when N*M is non-trivial
+        use_index = use_spatial_index and (N * M >= build_index_threshold)
+
+        spatial = None
+        if use_index:
+            # Build an index ONLY over these filtered clusters (cheap, ~sub-ms for dozens)
+            spatial = SpatialClusterIndex(clusters).spatial_index
+
+        # Small epsilon to avoid division by zero for degenerate cell bboxes
+        EPS = 1e-6
+
+        # Main assignment loop (vectorized per-cell over candidates)
+        for i in range(N):
+            if not cell_text_mask[i]:
                 continue
 
-            best_overlap = min_overlap
-            best_cluster = None
+            l1, t1, r1, b1 = cell_boxes[i]
+            # Skip degenerate cells
+            area_cell = max(0.0, (r1 - l1)) * max(0.0, (b1 - t1))
+            if area_cell <= EPS:
+                continue
 
-            for cluster in clusters:
-                if cell.rect.to_bounding_box().area() <= 0:
+            # Candidate cluster indices for this cell
+            if spatial is not None:
+                cand_ids = list(spatial.intersection((l1, t1, r1, b1)))
+                if not cand_ids:
                     continue
+                # Map cluster ids -> contiguous indices
+                try:
+                    cand_idx = np.fromiter((id_to_idx[cid] for cid in cand_ids), dtype=np.int64)
+                except KeyError:
+                    # In case of any mismatch (shouldn't happen), fallback to scanning all
+                    cand_idx = np.arange(M, dtype=np.int64)
+            else:
+                # Very small problems: scanning all clusters is faster than building an index
+                cand_idx = np.arange(M, dtype=np.int64)
 
-                overlap_ratio = cell.rect.to_bounding_box().intersection_over_self(
-                    cluster.bbox
-                )
-                if overlap_ratio > best_overlap:
-                    best_overlap = overlap_ratio
-                    best_cluster = cluster
+            # Vectorized overlap (intersection_over_self for the cell)
+            boxes = cl_boxes[cand_idx]  # (K,4)
+            inter_l = np.maximum(boxes[:, 0], l1)
+            inter_t = np.maximum(boxes[:, 1], t1)
+            inter_r = np.minimum(boxes[:, 2], r1)
+            inter_b = np.minimum(boxes[:, 3], b1)
 
-            if best_cluster is not None:
-                best_cluster.cells.append(cell)
+            iw = np.clip(inter_r - inter_l, 0.0, None)
+            ih = np.clip(inter_b - inter_t, 0.0, None)
+            inter = iw * ih
+            overlap = inter / max(area_cell, EPS)  # fraction of the cell covered by the cluster
 
-        # Deduplicate cells in each cluster after assignment
-        for cluster in clusters:
-            cluster.cells = self._deduplicate_cells(cluster.cells)
+            # Threshold
+            keep = overlap >= float(min_overlap)
+            if not np.any(keep):
+                continue
+
+            # Choose best: max overlap → max confidence → min cluster.id (stable)
+            kept_idx = cand_idx[keep]
+            kept_ovl = overlap[keep]
+            # First criterion: overlap
+            best_mask = (kept_ovl == kept_ovl.max())
+            if best_mask.sum() > 1:
+                # Tie → confidence
+                tie_idx = kept_idx[best_mask]
+                tie_conf = cl_conf[tie_idx]
+                best2 = (tie_conf == tie_conf.max())
+                if best2.sum() > 1:
+                    # Final tie-break: smallest cluster.id
+                    tie2_idx = tie_idx[best2]
+                    winner_local = int(np.argmin([idx_to_cluster[j].id for j in tie2_idx]))
+                    chosen_idx = tie2_idx[winner_local]
+                else:
+                    chosen_idx = tie_idx[int(best2.argmax())]
+            else:
+                chosen_idx = kept_idx[int(best_mask.argmax())]
+
+            # Append the cell object
+            idx_to_cluster[int(chosen_idx)].cells.append(cells[i])
+
+        # Deduplicate cells per cluster (keeps first occurrence order)
+        for c in clusters:
+            c.cells = self._deduplicate_cells(c.cells)
 
         return clusters
+
+    # def _assign_cells_to_clusters(
+    #     self, clusters: List[Cluster], min_overlap: float = 0.2
+    # ) -> List[Cluster]:
+    #     """Assign cells to best overlapping cluster."""
+    #     for cluster in clusters:
+    #         cluster.cells = []
+    #
+    #     for cell in self.cells:
+    #         if not cell.text.strip():
+    #             continue
+    #
+    #         best_overlap = min_overlap
+    #         best_cluster = None
+    #
+    #         for cluster in clusters:
+    #             if cell.rect.to_bounding_box().area() <= 0:
+    #                 continue
+    #
+    #             overlap_ratio = cell.rect.to_bounding_box().intersection_over_self(
+    #                 cluster.bbox
+    #             )
+    #             if overlap_ratio > best_overlap:
+    #                 best_overlap = overlap_ratio
+    #                 best_cluster = cluster
+    #
+    #         if best_cluster is not None:
+    #             best_cluster.cells.append(cell)
+    #
+    #     # Deduplicate cells in each cluster after assignment
+    #     for cluster in clusters:
+    #         cluster.cells = self._deduplicate_cells(cluster.cells)
+    #
+    #     return clusters
 
     def _find_unassigned_cells(self, clusters: List[Cluster]) -> List[TextCell]:
         """Find cells not assigned to any cluster."""

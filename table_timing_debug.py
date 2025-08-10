@@ -53,9 +53,16 @@ class TimingCollector:
                        "normalize_outputs", "match_cells", "post_process"]
         phase3_names = ["finalize_predict_details", "cache_prediction"]
         
+        # Layout processing timers (separate category)
+        layout_names = ["layout_process_regular", "layout_process_special",
+                       "layout_remove_contained", "layout_final_sort",
+                       "layout_filter_confidence", "layout_assign_cells",
+                       "layout_handle_orphans", "layout_iterative_refine"]
+        
         phase1_total = 0
         phase2_total = 0
         phase3_total = 0
+        layout_total = 0
         other_total = 0
         
         # Print grouped timings
@@ -86,15 +93,27 @@ class TimingCollector:
                 phase3_total += total
                 print(f"  {name:28s}: {total:7.3f}s (avg {avg*1000:6.1f}ms × {len(times)})")
         
+        # Print layout timings if any exist
+        has_layout = any(name in self.timings for name in layout_names)
+        if has_layout:
+            print(f"\nLAYOUT POSTPROCESSING:")
+            for name in layout_names:
+                if name in self.timings:
+                    times = self.timings[name]
+                    total = sum(times)
+                    avg = total / len(times)
+                    layout_total += total
+                    print(f"  {name:28s}: {total:7.3f}s (avg {avg*1000:6.1f}ms × {len(times)})")
+        
         print(f"\nOTHER:")
         for name, times in sorted(self.timings.items()):
-            if name not in phase1_names + phase2_names + phase3_names + envelope_timers:
+            if name not in phase1_names + phase2_names + phase3_names + layout_names + envelope_timers:
                 total = sum(times)
                 avg = total / len(times)
                 other_total += total
                 print(f"  {name:28s}: {total:7.3f}s (avg {avg*1000:6.1f}ms × {len(times)})")
         
-        tracked_total = phase1_total + phase2_total + phase3_total + other_total
+        tracked_total = phase1_total + phase2_total + phase3_total + layout_total + other_total
         
         # Show envelope timers for reference (but don't add to total)
         print("\n" + "-"*70)
@@ -110,6 +129,8 @@ class TimingCollector:
         print(f"Phase 1 (Collection):          {phase1_total:7.3f}s ({phase1_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
         print(f"Phase 2 (Inference & Match):   {phase2_total:7.3f}s ({phase2_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
         print(f"Phase 3 (Output):              {phase3_total:7.3f}s ({phase3_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
+        if layout_total > 0:
+            print(f"Layout Postprocessing:         {layout_total:7.3f}s ({layout_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
         if other_total > 0:
             print(f"Other:                         {other_total:7.3f}s ({other_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
         print(f"{'TRACKED TOTAL (leaf timers)':30s}: {tracked_total:7.3f}s")
