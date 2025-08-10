@@ -223,6 +223,7 @@ class TableStructureModel(BasePageModel):
                 page_input = {
                     "width": page.size.width * self.scale,
                     "height": page.size.height * self.scale,
+                    # NOTE: Numpy image at scale 2 is cached during Lambda preprocessing, so getting image is instantaneous.
                     "image": page.get_image_np(scale=self.scale),
                     "tokens": aggregated_tokens,
                 }
@@ -354,6 +355,7 @@ class TableStructureModel(BasePageModel):
         table_cells = []
         for element in table_out["tf_responses"]:
             if not self.do_cell_matching:
+                # THIS is definetly a bottleneck...
                 the_bbox = BoundingBox.model_validate(
                     element["bbox"]
                 ).scaled(1 / self.scale)

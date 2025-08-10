@@ -532,6 +532,8 @@ class LayoutPostprocessor:
             best.cells = self._sort_cells(best.cells)
             result.append(best)
 
+        elapsed = (time.perf_counter() - t0) * 1000
+        _log.debug(f"[remove_overlapping_{cluster_type}] {pair_count} pairs checked, {len(clusters)} -> {len(result)} clusters in {elapsed:.1f}ms")
         return result
 
     def _select_best_cluster(

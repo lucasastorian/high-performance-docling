@@ -36,6 +36,7 @@ class LambdaPreprocessor:
             pages.append(page)
 
         print(f"Lambda preprocessed pages {start}-{end}")
+
         return pages
 
 
