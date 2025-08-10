@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, Any, Dict
 
-import numpy
 from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell
 from docling_core.types.doc.page import (
     BoundingRectangle,
@@ -12,8 +11,8 @@ from docling_core.types.doc.page import (
 )
 from PIL import ImageDraw
 
-from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-from docling.datamodel.base_models import Page, Table, TableStructurePrediction
+from docling.datamodel.accelerator_options import AcceleratorOptions
+from docling.datamodel.base_models import Table, TableStructurePrediction
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import (
     TableFormerMode,
@@ -25,11 +24,11 @@ from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
+from page_model import Page
 from tf_predictor import TFPredictor
 
 
 class TableStructureModel(BasePageModel):
-
     _model_repo_folder = "ds4sd--docling-models"
     _model_path = "model_artifacts/tableformer"
 
@@ -83,6 +82,7 @@ class TableStructureModel(BasePageModel):
             self.tf_predictor = TFPredictor(
                 self.tm_config, device, accelerator_options.num_threads
             )
+
             # DISABLED: Baseline caching was taking 1.6s!
             # self.tf_predictor.enable_baseline_cache("/users/lucasastorian/docling-ibm-models/baseline_cache/", mode="baseline")
             self.scale = 2.0  # Scale up table input images to 144 dpi
@@ -169,7 +169,7 @@ class TableStructureModel(BasePageModel):
     def __call__(self, conv_res: ConversionResult, page_batch: Iterable[Page]) -> Iterable[Page]:
         import time
         t_full_start = time.perf_counter()
-        
+
         if not self.enabled:
             yield from page_batch
             return
@@ -179,8 +179,8 @@ class TableStructureModel(BasePageModel):
         # Per-batch accumulators
         page_inputs: list[dict] = []
         table_bboxes_list: list[list[list[float]]] = []  # one bbox list per page
-        page_clusters_list: list[list[Any]] = []         # clusters for each page, same order as bboxes
-        batched_page_indexes: list[int] = []             # map batch idx -> original pages_list idx
+        page_clusters_list: list[list[Any]] = []  # clusters for each page, same order as bboxes
+        batched_page_indexes: list[int] = []  # map batch idx -> original pages_list idx
 
         # Prepare per-page structures (and create empty predictions so downstream code doesn't explode)
         for page_idx, page in enumerate(pages_list):
@@ -223,7 +223,7 @@ class TableStructureModel(BasePageModel):
                 page_input = {
                     "width": page.size.width * self.scale,
                     "height": page.size.height * self.scale,
-                    "image": numpy.asarray(page.get_image(scale=self.scale)),
+                    "image": page.get_image_np(scale=self.scale),
                     "tokens": aggregated_tokens,
                 }
 
@@ -282,8 +282,8 @@ class TableStructureModel(BasePageModel):
         if settings.debug.visualize_tables:
             for page in pages_list:
                 if (
-                    getattr(page.predictions, "tablestructure", None)
-                    and page.predictions.tablestructure.table_map
+                        getattr(page.predictions, "tablestructure", None)
+                        and page.predictions.tablestructure.table_map
                 ):
                     self.draw_table_and_cells(
                         conv_res,
@@ -294,10 +294,9 @@ class TableStructureModel(BasePageModel):
         # Preserve original order
         for page in pages_list:
             yield page
-        
+
         t_full_end = time.perf_counter()
         print(f"⏱ TableStructureModel.__call__ TOTAL: {t_full_end - t_full_start:.3f}s")
-
 
     def _get_tables_from_page(self, page: Page):
         """Returns all the tables on a page"""

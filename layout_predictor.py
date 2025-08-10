@@ -16,7 +16,6 @@ import torch
 import torchvision
 from PIL import Image
 from torch import Tensor
-import torch.nn.functional as F
 from transformers import AutoModelForObjectDetection, RTDetrImageProcessor
 
 from docling_ibm_models.layoutmodel.labels import LayoutLabels
