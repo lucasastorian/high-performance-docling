@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
+import torch.nn.functional as F
 from transformers import AutoModelForObjectDetection, RTDetrImageProcessor
 
 from docling_ibm_models.layoutmodel.labels import LayoutLabels
@@ -139,9 +140,10 @@ class LayoutPredictor:
             raise TypeError("Not supported input image format")
 
         target_sizes = torch.tensor([page_img.size[::-1]])
+
         inputs = self._image_processor(images=[page_img], return_tensors="pt")
-        # Only move the tensor we need to GPU, not the whole dict
         pixel_values = inputs["pixel_values"]
+
         if self._device.type == "cuda":
             # contiguous channels_last + pinned host + non_blocking copy
             pixel_values = (
@@ -225,11 +227,14 @@ class LayoutPredictor:
         # Let's time this more granularly
         print(f"📊 Processing {len(pil_images)} images, sizes: {[img.size for img in pil_images[:3]]}...")
         
-        inputs = self._image_processor(images=pil_images, return_tensors="pt")
+        # inputs = self._image_processor(images=pil_images, return_tensors="pt")
         t_pre = time.perf_counter()
 
         # Only move pixel_values; keep dict on CPU
-        pixel_values = inputs["pixel_values"]
+        # pixel_values = inputs["pixel_values"]
+
+        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device.type)
+
         print(f"   Preprocessed tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
 
         # Prepare memory layout for better kernel perf without changing numerics
@@ -318,3 +323,14 @@ class LayoutPredictor:
             all_predictions.append(predictions)
 
         return all_predictions
+
+
+def rtdetr_preprocess_tensor(pil_list, device="cuda"):
+    # Convert PIL -> RGB np.uint8
+    rgb_list = [np.array(im.convert("RGB"), dtype=np.uint8) for im in pil_list]
+    t = torch.stack([torch.from_numpy(x) for x in rgb_list])          # [B,H,W,3], uint8
+    t = t.permute(0, 3, 1, 2).contiguous().to(torch.float32)          # [B,3,H,W], float32
+    t = t.div_(255.0)                                                 # rescale to [0,1]
+    t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)  # warp (no AR)
+    t = t.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+    return t  # feed as pixel_values

@@ -969,6 +969,7 @@ class TFPredictor:
             batch.append(img)
 
         batch_tensor = torch.stack(batch, dim=0).to(self._device)
+
         return batch_tensor
 
     def _normalize_model_batch_outputs(self, model_result):
