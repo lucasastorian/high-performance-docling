@@ -233,38 +233,36 @@ class LayoutPredictor:
         # Only move pixel_values; keep dict on CPU
         # pixel_values = inputs["pixel_values"]
 
-        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device)
-
-        # DO NOT pin; it's already on GPU. Just ensure channels_last is set.
-        pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
-
+        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device.type)
         print(f"   Preprocessed tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
+
+        assert pixel_values.shape[-2:] == (640, 640)
 
         # Prepare memory layout for better kernel perf without changing numerics
         t_layout0 = time.perf_counter()
         pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
         t_layout1 = time.perf_counter()
 
-        # Move to device
-        if self._device.type == "cuda":
-            t_pin0 = time.perf_counter()
-            pixel_values = pixel_values.pin_memory()
-            t_pin1 = time.perf_counter()
-            pixel_values = pixel_values.to(self._device, non_blocking=True)
-            torch.cuda.synchronize()
-        elif self._device.type == "mps":
-            pixel_values = pixel_values.to(self._device)
-        t_h2d = time.perf_counter()
+        # # Move to device
+        # if self._device.type == "cuda":
+        #     t_pin0 = time.perf_counter()
+        #     pixel_values = pixel_values.pin_memory()
+        #     t_pin1 = time.perf_counter()
+        #     pixel_values = pixel_values.to(self._device, non_blocking=True)
+        #     torch.cuda.synchronize()
+        #
+        # elif self._device.type == "mps":
+        #     pixel_values = pixel_values.to(self._device)
+        # t_h2d = time.perf_counter()
 
         # Forward pass - autocast only benefits CUDA
-        if self._device.type == "cuda":
-            from torch import amp
-            with amp.autocast("cuda", dtype=torch.float16):
+        with torch.inference_mode():
+            if self._device.type == "cuda":
+                from torch import amp
+                with amp.autocast("cuda", dtype=torch.float16):
+                    outputs = self._model(pixel_values=pixel_values)
+            else:
                 outputs = self._model(pixel_values=pixel_values)
-            torch.cuda.synchronize()
-        else:
-            # No autocast for MPS or CPU - just run in default precision
-            outputs = self._model(pixel_values=pixel_values)
         t_fwd = time.perf_counter()
 
         # Post-process all results at once on CPU (unchanged numerics)
