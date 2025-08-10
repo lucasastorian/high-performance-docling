@@ -25,6 +25,7 @@ from docling.utils.profiling import TimeRecorder
 
 from page_model import Page
 from tf_predictor import TFPredictor
+from table_timing_debug import get_timing_collector
 
 
 class TableStructureModel(BasePageModel):
