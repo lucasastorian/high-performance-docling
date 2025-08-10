@@ -11,7 +11,6 @@ from itertools import groupby
 from pathlib import Path
 import hashlib
 from datetime import datetime
-from typing import List, Dict, Tuple
 
 import cv2
 import numpy as np
@@ -23,16 +22,13 @@ import docling_ibm_models.tableformer.common as c
 import docling_ibm_models.tableformer.data_management.transforms as T
 import docling_ibm_models.tableformer.settings as s
 import docling_ibm_models.tableformer.utils.utils as u
-from docling_ibm_models.tableformer.data_management.matching_post_processor import (
-    MatchingPostProcessor,
-)
 from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
-from docling_ibm_models.tableformer.models.common.base_model import BaseModel
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 from tablemodel04_rs import TableModel04_rs
 from table_timing_debug import get_timing_collector
+from matching_post_processor import MatchingPostProcessor
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG

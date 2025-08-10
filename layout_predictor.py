@@ -9,7 +9,7 @@ import io
 import contextlib
 import threading
 from collections.abc import Iterable
-from typing import Dict, List, Set, Union
+from typing import Dict, List, Set, Union, Optional
 
 import numpy as np
 import torch
@@ -228,55 +228,170 @@ class LayoutPredictor:
         t_fwd = time.perf_counter()
 
         # Post-process results
-        results_list: List[Dict[str, Tensor]] = (
-            self._image_processor.post_process_object_detection(
-                outputs,
-                target_sizes=target_sizes,
-                threshold=self._threshold,
-            )
-        )
-        t_post = time.perf_counter()
-
-        # Simple timing output
-        print(
-            f"Layout: preprocess={t_pre-t0:.2f}s, forward={t_fwd-t_pre:.2f}s, post={t_post-t_fwd:.2f}s"
+        boxes, scores, labels, batch_idx, splits = self.post_process_object_detection(
+            outputs, threshold=self._threshold, target_sizes=target_sizes, use_focal_loss=True
         )
 
-        # Convert results to standard format for each image
-        all_predictions: List[List[dict]] = []
-        for img, results in zip(pil_images, results_list):
-            w, h = img.size
-            predictions = []
-            for score, label_id, box in zip(
-                    results["scores"], results["labels"], results["boxes"]
-            ):
-                score = float(score.item())
-                label_id = int(label_id.item()) + self._label_offset
-                label_str = self._classes_map[label_id]
+        # Optional GPU prefilter (area/ratio/score) + per-class NMS here (all CUDA)
+        # e.g., torchvision.ops.batched_nms(boxes, scores, labels + batch_idx*label_stride, iou_thr)
 
-                # Filter out blacklisted classes
-                if label_str in self._black_classes:
-                    continue
-
-                bbox_float = [float(b.item()) for b in box]
-                l = min(w, max(0, bbox_float[0]))
-                t = min(h, max(0, bbox_float[1]))
-                r = min(w, max(0, bbox_float[2]))
-                b = min(h, max(0, bbox_float[3]))
-
-                predictions.append(
-                    {
-                        "l": l,
-                        "t": t,
-                        "r": r,
-                        "b": b,
-                        "label": label_str,
-                        "confidence": score,
-                    }
-                )
-            all_predictions.append(predictions)
+        # Finally, for each page, slice and wrap into dicts once:
+        all_predictions = []
+        for i, (s, e) in enumerate(splits):
+            b_i, s_i, l_i = boxes[s:e], scores[s:e], labels[s:e]
+            w, h = pil_images[i].size
+            preds = [
+                {
+                    "l": float(b[0].item()), "t": float(b[1].item()),
+                    "r": float(b[2].item()), "b": float(b[3].item()),
+                    "label": self._classes_map[int(l.item()) + self._label_offset],
+                    "confidence": float(sc.item()),
+                }
+                for b, sc, l in zip(b_i, s_i, l_i)
+                # (Optionally filter blacklisted labels before converting)
+            ]
+            all_predictions.append(preds)
 
         return all_predictions
+        # results_list: List[Dict[str, Tensor]] = (
+        #     self._image_processor.post_process_object_detection(
+        #         outputs,
+        #         target_sizes=target_sizes,
+        #         threshold=self._threshold,
+        #     )
+        # )
+        # t_post = time.perf_counter()
+        #
+        # # Simple timing output
+        # print(
+        #     f"Layout: preprocess={t_pre-t0:.2f}s, forward={t_fwd-t_pre:.2f}s, post={t_post-t_fwd:.2f}s"
+        # )
+        #
+        # # Convert results to standard format for each image
+        # all_predictions: List[List[dict]] = []
+        # for img, results in zip(pil_images, results_list):
+        #     w, h = img.size
+        #     predictions = []
+        #     for score, label_id, box in zip(
+        #             results["scores"], results["labels"], results["boxes"]
+        #     ):
+        #         score = float(score.item())
+        #         label_id = int(label_id.item()) + self._label_offset
+        #         label_str = self._classes_map[label_id]
+        #
+        #         # Filter out blacklisted classes
+        #         if label_str in self._black_classes:
+        #             continue
+        #
+        #         bbox_float = [float(b.item()) for b in box]
+        #         l = min(w, max(0, bbox_float[0]))
+        #         t = min(h, max(0, bbox_float[1]))
+        #         r = min(w, max(0, bbox_float[2]))
+        #         b = min(h, max(0, bbox_float[3]))
+        #
+        #         predictions.append(
+        #             {
+        #                 "l": l,
+        #                 "t": t,
+        #                 "r": r,
+        #                 "b": b,
+        #                 "label": label_str,
+        #                 "confidence": score,
+        #             }
+        #         )
+        #     all_predictions.append(predictions)
+        #
+        # return all_predictions
+
+    @torch.inference_mode()
+    def post_process_object_detection(
+            outputs,
+            threshold: float = 0.5,
+            target_sizes: Optional[torch.Tensor] = None,
+            use_focal_loss: bool = True,
+    ):
+        """
+        Vectorized, GPU-friendly variant of RTDetrImageProcessor.post_process_object_detection.
+
+        Returns:
+          boxes:     [N,4] (l,t,r,b)
+          scores:    [N]
+          labels:    [N]   (int64)
+          batch_idx: [N]   (int64) index of original image in batch
+          splits:    Optional[List[Tuple[start,end]]] for per-image slicing (device-free metadata)
+        """
+        # logits: [B, Q, C]  pred_boxes: [B, Q, 4]  in cxcywh relative coords
+        logits = outputs.logits
+        pred_boxes = outputs.pred_boxes
+        device = logits.device
+        B, Q, C = logits.shape
+
+        # Convert to xyxy in absolute pixels if target_sizes provided
+        # center_to_corners_format is cheap; keep it on device
+        boxes_xyxy = torch.empty_like(pred_boxes)
+        # cxcywh -> xyxy
+        cx, cy, w, h = pred_boxes.unbind(-1)
+        x0 = cx - 0.5 * w
+        y0 = cy - 0.5 * h
+        x1 = cx + 0.5 * w
+        y1 = cy + 0.5 * h
+        boxes_xyxy = torch.stack([x0, y0, x1, y1], dim=-1)
+
+        if target_sizes is not None:
+            if isinstance(target_sizes, list):
+                target_sizes = torch.as_tensor(target_sizes, device=device)
+            # target_sizes: [B,2]= (H,W)
+            img_h, img_w = target_sizes.unbind(1)  # [B], [B]
+            scale = torch.stack([img_w, img_h, img_w, img_h], dim=1).unsqueeze(1)  # [B,1,4]
+            boxes_xyxy = boxes_xyxy * scale
+
+        # Scores/labels selection
+        if use_focal_loss:
+            # sigmoid over classes, then take top-Q over flattened (Q*C)
+            prob = logits.sigmoid()  # [B,Q,C]
+            prob_flat = prob.flatten(1)  # [B,Q*C]
+            topk_scores, topk_idx = torch.topk(prob_flat, k=Q, dim=1)  # [B,Q]
+            labels = topk_idx % C  # [B,Q]
+            query_idx = topk_idx // C  # [B,Q]
+            # gather boxes by chosen queries
+            gather_idx = query_idx.unsqueeze(-1).expand(B, Q, 4)  # [B,Q,4]
+            boxes = boxes_xyxy.gather(1, gather_idx)  # [B,Q,4]
+            scores = topk_scores  # [B,Q]
+        else:
+            # Softmax over classes (excluding background last class)
+            prob = torch.softmax(logits[..., :-1], dim=-1)  # [B,Q,C-1]
+            scores, labels = prob.max(dim=-1)  # [B,Q]
+            # Optional: topQ again to cap per-image detections to Q
+            topk_scores, topk_idx = torch.topk(scores, k=Q, dim=1)
+            scores = topk_scores
+            labels = labels.gather(1, topk_idx)
+            gather_idx = topk_idx.unsqueeze(-1).expand(B, Q, 4)
+            boxes = boxes_xyxy.gather(1, gather_idx)
+
+        # Threshold mask (vectorized)
+        keep_mask = scores > threshold  # [B,Q]
+        # Flatten batch
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(scores)  # [B,Q]
+
+        boxes = boxes[keep_mask]  # [N,4]
+        scores = scores[keep_mask]  # [N]
+        labels = labels[keep_mask].to(torch.int64)
+        batch_idx = batch_idx[keep_mask].to(torch.int64)
+
+        # Optional: per-image splits metadata (CPU small list, OK)
+        if B > 1:
+            # Compute counts per image without sync to CPU tensors
+            counts = keep_mask.sum(dim=1)  # [B]
+            # prefix sums on CPU for easy slicing later
+            counts_cpu = counts.detach().cpu().tolist()
+            offsets = [0]
+            for c in counts_cpu:
+                offsets.append(offsets[-1] + int(c))
+            splits = [(offsets[i], offsets[i + 1]) for i in range(B)]
+        else:
+            splits = [(0, boxes.shape[0])]
+
+        return boxes, scores, labels, batch_idx, splits
 
 
 # def rtdetr_preprocess_tensor(pil_list, device="cuda"):
