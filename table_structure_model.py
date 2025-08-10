@@ -394,21 +394,39 @@ class TableStructureModel(BasePageModel):
             for element in table_out["tf_responses"]:
                 if attach_text and sp is not None:
                     with timer.scoped("assign_outputs:extract_text"):
-                        the_bbox = BoundingBox.model_validate(
-                            element["bbox"]
-                        ).scaled(1 / self.scale)
+                        # Create a scaled bbox directly from the dict
+                        bbox_dict = element["bbox"]
+                        scale_inv = 1 / self.scale
+                        scaled_bbox = BoundingBox(
+                            l=bbox_dict["l"] * scale_inv,
+                            t=bbox_dict["t"] * scale_inv,
+                            r=bbox_dict["r"] * scale_inv,
+                            b=bbox_dict["b"] * scale_inv
+                        )
                         # Use segmented page for faster text extraction
-                        words = sp.get_cells_in_bbox(TextCellUnit.WORD, the_bbox)
+                        words = sp.get_cells_in_bbox(TextCellUnit.WORD, scaled_bbox)
                         element["bbox"]["token"] = " ".join(w.text for w in words if w.text.strip())
                 
                 # Use faster model_construct if we trust the output
                 if getattr(self.options, 'trust_tf_output', True):
+                    # When using model_construct, we need to manually create BoundingBox
+                    if "bbox" in element and element["bbox"] is not None:
+                        bbox_dict = element["bbox"]
+                        scale_inv = 1 / self.scale
+                        # Create a proper BoundingBox object with scaled values
+                        element["bbox"] = BoundingBox(
+                            l=bbox_dict.get("l", 0) * scale_inv,
+                            t=bbox_dict.get("t", 0) * scale_inv,
+                            r=bbox_dict.get("r", 0) * scale_inv,
+                            b=bbox_dict.get("b", 0) * scale_inv
+                        )
                     tc = TableCell.model_construct(**element)
                 else:
+                    # model_validate will handle type conversion automatically
                     tc = TableCell.model_validate(element)
+                    if tc.bbox is not None:
+                        tc.bbox = tc.bbox.scaled(1 / self.scale)
                     
-                if tc.bbox is not None:
-                    tc.bbox = tc.bbox.scaled(1 / self.scale)
                 table_cells.append(tc)
 
         assert "predict_details" in table_out
