@@ -168,7 +168,10 @@ class TableStructureModel(BasePageModel):
 
     def __call__(self, conv_res: ConversionResult, page_batch: Iterable[Page]) -> Iterable[Page]:
         import time
+        from table_timing_debug import get_timing_collector
+        
         t_full_start = time.perf_counter()
+        timer = get_timing_collector()
 
         if not self.enabled:
             yield from page_batch
@@ -183,6 +186,7 @@ class TableStructureModel(BasePageModel):
         batched_page_indexes: list[int] = []  # map batch idx -> original pages_list idx
 
         # Prepare per-page structures (and create empty predictions so downstream code doesn't explode)
+        timer.start("prep_inputs")
         for page_idx, page in enumerate(pages_list):
             assert page is not None
             if page._backend is None or not page._backend.is_valid():
@@ -232,6 +236,8 @@ class TableStructureModel(BasePageModel):
                 table_bboxes_list.append(page_table_bboxes)
                 page_clusters_list.append(page_clusters)
                 batched_page_indexes.append(page_idx)
+        
+        timer.end("prep_inputs")
 
         # If there is nothing to run, just yield the originals
         if not page_inputs:
@@ -267,6 +273,7 @@ class TableStructureModel(BasePageModel):
         print(f"⏱ multi_table_predict took: {t_predict_end - t_predict_start:.3f}s")
 
         # Map flat outputs back to pages and clusters in strict order
+        timer.start("assign_outputs")
         result_idx = 0
         for i, page_batch_idx in enumerate(batched_page_indexes):
             page = pages_list[page_batch_idx]
@@ -278,6 +285,8 @@ class TableStructureModel(BasePageModel):
             for output, table_cluster in zip(page_outputs, clusters):
                 table = self._process_table_output(page, table_cluster, output)
                 page.predictions.tablestructure.table_map[table_cluster.id] = table
+        
+        timer.end("assign_outputs")
 
         # Optional debug viz
         if settings.debug.visualize_tables:

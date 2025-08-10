@@ -44,10 +44,14 @@ class TimingCollector:
         print("="*70)
         
         # Group timings by phase
-        phase1_names = ["phase1_collect_tables", "resize_page_image", "crop_tables"]
-        phase2_names = ["phase2_predict", "prepare_image_batch", "model_inference", 
+        # Envelope timers (don't add to total - they contain other timers)
+        envelope_timers = ["phase1_collect_tables", "phase2_predict", "phase3_package_outputs"]
+        
+        # Leaf timers (these are the actual work - add to total)
+        phase1_names = ["resize_page_image", "crop_tables"]
+        phase2_names = ["prepare_image_batch", "model_inference", 
                        "normalize_outputs", "match_cells", "post_process"]
-        phase3_names = ["phase3_package_outputs", "finalize_predict_details", "cache_prediction"]
+        phase3_names = ["finalize_predict_details", "cache_prediction"]
         
         phase1_total = 0
         phase2_total = 0
@@ -92,13 +96,23 @@ class TimingCollector:
         
         tracked_total = phase1_total + phase2_total + phase3_total + other_total
         
+        # Show envelope timers for reference (but don't add to total)
         print("\n" + "-"*70)
-        print(f"Phase 1 (Collection):          {phase1_total:7.3f}s ({phase1_total/tracked_total*100:5.1f}%)")
-        print(f"Phase 2 (Inference & Match):   {phase2_total:7.3f}s ({phase2_total/tracked_total*100:5.1f}%)")
-        print(f"Phase 3 (Output):              {phase3_total:7.3f}s ({phase3_total/tracked_total*100:5.1f}%)")
+        print("ENVELOPE TIMERS (for reference, not added to total):")
+        for name in envelope_timers:
+            if name in self.timings:
+                times = self.timings[name]
+                total = sum(times)
+                avg = total / len(times)
+                print(f"  {name:28s}: {total:7.3f}s (avg {avg*1000:6.1f}ms × {len(times)})")
+        
+        print("\n" + "-"*70)
+        print(f"Phase 1 (Collection):          {phase1_total:7.3f}s ({phase1_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
+        print(f"Phase 2 (Inference & Match):   {phase2_total:7.3f}s ({phase2_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
+        print(f"Phase 3 (Output):              {phase3_total:7.3f}s ({phase3_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
         if other_total > 0:
-            print(f"Other:                         {other_total:7.3f}s ({other_total/tracked_total*100:5.1f}%)")
-        print(f"{'TRACKED TOTAL':30s}: {tracked_total:7.3f}s")
+            print(f"Other:                         {other_total:7.3f}s ({other_total/tracked_total*100 if tracked_total > 0 else 0:5.1f}%)")
+        print(f"{'TRACKED TOTAL (leaf timers)':30s}: {tracked_total:7.3f}s")
         
         if wall_time:
             untracked = wall_time - tracked_total

@@ -1201,6 +1201,9 @@ class TFPredictor:
                 device_obj = torch.device(self._device) if isinstance(self._device, str) else self._device
                 with safe_autocast(device_obj, dtype=torch.float16):
                     model_result = self._model.predict(image_batch, max_steps, beam_size)
+                # Sync GPU before stopping timer for accurate measurement
+                if device_obj.type == "cuda":
+                    torch.cuda.synchronize()
                 timer.end("model_inference")
                 print(f"Made table predictions in {datetime.now() - start} seconds")
 
