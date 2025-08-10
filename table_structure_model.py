@@ -83,7 +83,8 @@ class TableStructureModel(BasePageModel):
             self.tf_predictor = TFPredictor(
                 self.tm_config, device, accelerator_options.num_threads
             )
-            self.tf_predictor.enable_baseline_cache("/users/lucasastorian/docling-ibm-models/baseline_cache/", mode="baseline")
+            # DISABLED: Baseline caching was taking 1.6s!
+            # self.tf_predictor.enable_baseline_cache("/users/lucasastorian/docling-ibm-models/baseline_cache/", mode="baseline")
             self.scale = 2.0  # Scale up table input images to 144 dpi
 
     @staticmethod
