@@ -19,16 +19,16 @@ import torch.nn.functional as F
 from safetensors.torch import load_model
 
 import docling_ibm_models.tableformer.common as c
-import docling_ibm_models.tableformer.data_management.transforms as T
 import docling_ibm_models.tableformer.settings as s
 import docling_ibm_models.tableformer.utils.utils as u
-from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
+from tf_cell_matcher import CellMatcher
 from tablemodel04_rs import TableModel04_rs
 from table_timing_debug import get_timing_collector
 from matching_post_processor import MatchingPostProcessor
+import transforms as T
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG

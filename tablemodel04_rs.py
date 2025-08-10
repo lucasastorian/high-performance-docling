@@ -17,7 +17,6 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from bbox_decoder_optimized import BBoxDecoder
 from encoder04_rs import Encoder04
 from transformer_optimized import Tag_Transformer
-from optimization_utils import safe_autocast, prepare_model_for_infer, to_device_images, maybe_compile
 from batched_decoder import BatchedTableDecoder
 
 LOG_LEVEL = logging.WARN

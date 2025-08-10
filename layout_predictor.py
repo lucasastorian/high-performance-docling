@@ -88,8 +88,8 @@ class LayoutPredictor:
         # Use lock to prevent threading issues during model initialization
         with _model_init_lock:
             self._model = AutoModelForObjectDetection.from_pretrained(
-                artifact_path, config=self._model_config, device_map=self._device
-            )
+                artifact_path, config=self._model_config
+            ).to(self._device)
             self._model.eval()
 
         # Prefer channels_last memory format for better kernel perf (no numeric changes)
@@ -107,6 +107,9 @@ class LayoutPredictor:
         else:
             self._classes_map = self._labels.canonical_categories()
             self._label_offset = 0
+        
+        # Pre-compute name to ID mapping for blacklist filtering
+        self._name_to_id = {name: i for i, name in enumerate(self._classes_map)}
 
         _log.debug("LayoutPredictor settings: {}".format(self.info()))
 
@@ -211,8 +214,8 @@ class LayoutPredictor:
             else:
                 raise TypeError("Not supported input image format")
 
-        # Target sizes for postprocess
-        target_sizes = torch.tensor([img.size[::-1] for img in pil_images])
+        # Target sizes for postprocess (create on same device as model)
+        target_sizes = torch.tensor([img.size[::-1] for img in pil_images], device=self._device)
 
         # GPU-accelerated preprocessing (resize + normalize on GPU)
         t_pre = time.perf_counter()
@@ -228,17 +231,28 @@ class LayoutPredictor:
         t_fwd = time.perf_counter()
 
         # Post-process results
-        boxes, scores, labels, batch_idx, splits = self.post_process_object_detection(
+        boxes, scores, labels, batch_idx, splits = self.post_process_object_detection_fast(
             outputs, threshold=self._threshold, target_sizes=target_sizes, use_focal_loss=True
         )
+
+        # GPU-accelerated blacklist filtering
+        if self._black_classes:
+            blk = torch.tensor(
+                [self._name_to_id[n] - self._label_offset for n in self._black_classes],
+                device=labels.device, dtype=labels.dtype
+            )
+            keep = ~torch.isin(labels, blk)
+            if keep.any():
+                boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
         # Optional GPU prefilter (area/ratio/score) + per-class NMS here (all CUDA)
         # e.g., torchvision.ops.batched_nms(boxes, scores, labels + batch_idx*label_stride, iou_thr)
 
         # Finally, for each page, slice and wrap into dicts once:
         all_predictions = []
-        for i, (s, e) in enumerate(splits):
-            b_i, s_i, l_i = boxes[s:e], scores[s:e], labels[s:e]
+        for i in range(len(pil_images)):
+            mask = (batch_idx == i)
+            b_i, s_i, l_i = boxes[mask], scores[mask], labels[mask]
             w, h = pil_images[i].size
             preds = [
                 {
@@ -248,7 +262,6 @@ class LayoutPredictor:
                     "confidence": float(sc.item()),
                 }
                 for b, sc, l in zip(b_i, s_i, l_i)
-                # (Optionally filter blacklisted labels before converting)
             ]
             all_predictions.append(preds)
 
@@ -304,7 +317,8 @@ class LayoutPredictor:
         # return all_predictions
 
     @torch.inference_mode()
-    def post_process_object_detection(
+    def post_process_object_detection_fast(
+            self,
             outputs,
             threshold: float = 0.5,
             target_sizes: Optional[torch.Tensor] = None,
@@ -322,7 +336,7 @@ class LayoutPredictor:
         """
         # logits: [B, Q, C]  pred_boxes: [B, Q, 4]  in cxcywh relative coords
         logits = outputs.logits
-        pred_boxes = outputs.pred_boxes
+        pred_boxes = outputs.pred_boxes.to(torch.float32)  # Ensure float32 for geometry
         device = logits.device
         B, Q, C = logits.shape
 
@@ -340,6 +354,8 @@ class LayoutPredictor:
         if target_sizes is not None:
             if isinstance(target_sizes, list):
                 target_sizes = torch.as_tensor(target_sizes, device=device)
+            elif target_sizes.device != device:
+                target_sizes = target_sizes.to(device)
             # target_sizes: [B,2]= (H,W)
             img_h, img_w = target_sizes.unbind(1)  # [B], [B]
             scale = torch.stack([img_w, img_h, img_w, img_h], dim=1).unsqueeze(1)  # [B,1,4]

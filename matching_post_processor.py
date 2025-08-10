@@ -8,7 +8,8 @@ import math
 import statistics
 
 import docling_ibm_models.tableformer.settings as s
-from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
+
+from tf_cell_matcher import CellMatcher
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
