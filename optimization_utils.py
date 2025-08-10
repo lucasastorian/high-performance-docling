@@ -77,6 +77,3 @@ def to_device_images(img_batch, device):
         return img_batch.to(device, non_blocking=True, memory_format=torch.channels_last)
     else:
         return img_batch.to(device, memory_format=torch.channels_last)
-
-# Enable fast backends on import
-enable_fast_backends()
