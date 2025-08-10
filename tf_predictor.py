@@ -974,46 +974,47 @@ class TFPredictor:
 
     def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
         """
-        Vectorized batch prep: HWC uint8/float -> CHW float32 on self._device,
-        resized to (S, S), normalized, channels_last. No per-image Python loop.
+        Convert a list of OpenCV images (H,W,C) to a single batch tensor on self._device.
+        Semantics preserved:
+          1) Normalize in 0..255 space (BGR order, as given)
+          2) Resize to (S,S) with bilinear, align_corners=False
+          3) Divide by 255.0
         """
         S = self._config["dataset"]["resized_image"]
-        mean = self._config["dataset"]["image_normalization"]["mean"]
-        std = self._config["dataset"]["image_normalization"]["std"]
+        mean = torch.as_tensor(self._config["dataset"]["image_normalization"]["mean"],
+                               dtype=torch.float32, device=self._device).view(1, 3, 1, 1)
+        std = torch.as_tensor(self._config["dataset"]["image_normalization"]["std"],
+                              dtype=torch.float32, device=self._device).view(1, 3, 1, 1)
 
         if not images:
             return torch.empty(0, 3, S, S, device=self._device)
 
-        # 1) Stack once on CPU (no copies if arrays are contiguous)
-        #    shape: [B, H, W, C]; dtype: usually uint8 from cv2
-        x_np = np.stack(images, axis=0)
-        x = torch.from_numpy(x_np)  # CPU
+        # Preallocate the output on device
+        out = torch.empty(len(images), 3, S, S, device=self._device, dtype=torch.float32)
+        for i, img in enumerate(images):
+            # Handle channel oddities defensively
+            if img.ndim == 2:  # grayscale -> 3ch
+                img = np.repeat(img[..., None], 3, axis=-1)
+            elif img.shape[-1] > 3:  # drop alpha if present
+                img = img[..., :3]
 
-        # 2) HWC -> CHW, keep channel order (BGR stays BGR)
-        x = x.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+            # HWC (uint8/float) -> CHW float32 on device
+            t = torch.from_numpy(img).permute(2, 0, 1).contiguous()  # [3,H,W], CPU
+            t = t.to(self._device, dtype=torch.float32, non_blocking=True)
 
-        # 3) Move to device and cast
-        x = x.to(self._device, non_blocking=True)
-        if x.dtype != torch.float32:
-            x = x.to(torch.float32)
+            # (1) normalize in 0..255 space (original code path)
+            t = (t - mean[0]) / std[0]
 
-        # 4) Scale to [0,1]
-        x = x.div_(255.0)
+            # (2) resize to SxS
+            t = torch.nn.functional.interpolate(t.unsqueeze(0),
+                                                size=(S, S),
+                                                mode="bilinear",
+                                                align_corners=False).squeeze(0)
 
-        # 5) Normalize on the SAME scale the model expects
-        #    If config uses 0..255 means/std (e.g., 123.675), scale them down.
-        m = torch.tensor(mean, device=self._device, dtype=torch.float32).view(1, 3, 1, 1)
-        s = torch.tensor(std, device=self._device, dtype=torch.float32).view(1, 3, 1, 1)
-        if float(m.max()) > 2.5 or float(s.max()) > 2.5:  # heuristic: 0..255 stats
-            m = m / 255.0
-            s = s / 255.0
-        x = (x - m) / s
+            # (3) divide by 255.0
+            out[i] = t / 255.0
 
-        # 6) Resize as a single op (bilinear, align_corners=False matches your path)
-        x = torch.nn.functional.interpolate(x, size=(S, S), mode="bilinear", align_corners=False)
-
-        # 7) Layout hint for convs
-        return x.contiguous(memory_format=torch.channels_last)
+        return out.contiguous(memory_format=torch.channels_last)
 
     def _normalize_model_batch_outputs(self, model_result):
         """
