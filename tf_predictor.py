@@ -1228,6 +1228,10 @@ class TFPredictor:
 
             outputs.append((tf_output, matching_details))
         
+        # Print timing summary
+        from table_timing_debug import print_timing_summary
+        print_timing_summary()
+        
         return outputs
 
     # -----------------------
@@ -1248,6 +1252,9 @@ class TFPredictor:
         Batch over pages, then batch over all tables. Stable mapping and no coordinate shenanigans.
         Expects page_inputs[i]["tokens"] populated in ORIGINAL page_input coords.
         """
+        # Reset timing collector for this run
+        from table_timing_debug import reset_timing
+        reset_timing()
         timer = get_timing_collector()
         
         # Phase 1: collect all tables
