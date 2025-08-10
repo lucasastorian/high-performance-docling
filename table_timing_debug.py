@@ -37,6 +37,10 @@ class TimingCollector:
         finally:
             self.end(name)
     
+    def scoped(self, name: str):
+        """Alias for time_block for cleaner syntax"""
+        return self.time_block(name)
+    
     def print_summary(self, wall_time: float = None, method_name: str = ""):
         """Print timing summary with better formatting and analysis"""
         print("\n" + "="*70)
@@ -48,10 +52,13 @@ class TimingCollector:
         envelope_timers = ["phase1_collect_tables", "phase2_predict", "phase3_package_outputs"]
         
         # Leaf timers (these are the actual work - add to total)
-        phase1_names = ["resize_page_image", "crop_tables"]
+        phase1_names = ["resize_page_image", "crop_tables", "prep_inputs", 
+                       "prep_inputs:gather_tokens", "prep_inputs:image_np"]
         phase2_names = ["prepare_image_batch", "model_inference", 
-                       "normalize_outputs", "match_cells", "post_process"]
-        phase3_names = ["finalize_predict_details", "cache_prediction"]
+                       "normalize_outputs", "match_cells", "match_cells_dummy", "post_process"]
+        phase3_names = ["finalize_predict_details", "cache_prediction", 
+                       "assign_outputs", "assign_outputs:validate_cells", 
+                       "assign_outputs:extract_text"]
         
         # Layout processing timers (separate category)
         layout_names = ["layout_process_regular", "layout_process_special",

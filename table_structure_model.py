@@ -1,4 +1,3 @@
-import copy
 import warnings
 from collections.abc import Iterable
 from pathlib import Path
@@ -205,32 +204,46 @@ class TableStructureModel(BasePageModel):
                     # Nothing to predict for this page; skip batching but still yield later.
                     continue
 
-                # Aggregate tokens across all tables on this page, dedup by cell id
-                seen_ids = set()
-                aggregated_tokens = []
+                # Only aggregate tokens if we're doing cell matching
                 page_table_bboxes = []
                 page_clusters = []
 
-                for table_cluster, tbl_box in in_tables:
-                    table_tokens = self._get_table_tokens(page, table_cluster)
-                    for tok in table_tokens:
-                        tid = tok.get("id")
-                        if tid is None or tid in seen_ids:
-                            continue
-                        seen_ids.add(tid)
-                        aggregated_tokens.append(tok)
+                if self.do_cell_matching:
+                    timer.start("prep_inputs:gather_tokens")
+                    seen_ids = set()
+                    aggregated_tokens = []
+                    
+                    for table_cluster, tbl_box in in_tables:
+                        table_tokens = self._get_table_tokens(page, table_cluster)
+                        for tok in table_tokens:
+                            tid = tok.get("id")
+                            if tid is None or tid in seen_ids:
+                                continue
+                            seen_ids.add(tid)
+                            aggregated_tokens.append(tok)
 
-                    page_table_bboxes.append(tbl_box)
-                    page_clusters.append(table_cluster)
+                        page_table_bboxes.append(tbl_box)
+                        page_clusters.append(table_cluster)
+                    timer.end("prep_inputs:gather_tokens")
+                else:
+                    # No tokens needed - just collect bboxes
+                    for table_cluster, tbl_box in in_tables:
+                        page_table_bboxes.append(tbl_box)
+                        page_clusters.append(table_cluster)
 
-                # Build the page_input once per page with the full token set
+                # Build the page_input
+                timer.start("prep_inputs:image_np")
                 page_input = {
                     "width": page.size.width * self.scale,
                     "height": page.size.height * self.scale,
                     # NOTE: Numpy image at scale 2 is cached during Lambda preprocessing, so getting image is instantaneous.
                     "image": page.get_image_np(scale=self.scale),
-                    "tokens": aggregated_tokens,
                 }
+                timer.end("prep_inputs:image_np")
+                
+                # Only add tokens if matching
+                if self.do_cell_matching:
+                    page_input["tokens"] = aggregated_tokens
 
                 page_inputs.append(page_input)
                 table_bboxes_list.append(page_table_bboxes)
@@ -326,7 +339,7 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page: Page, table_cluster: Any):
-        """Returns all the tokens for a table"""
+        """Returns all the tokens for a table - optimized without deep copies"""
         sp = page._backend.get_segmented_page()
         if sp is not None:
             tcells = sp.get_cells_in_bbox(
@@ -341,42 +354,61 @@ class TableStructureModel(BasePageModel):
             tcells = table_cluster.cells
 
         tokens = []
+        sx = sy = self.scale  # Pre-compute scale factors
+        
         for c in tcells:
             # Only allow non empty strings (spaces) into the cells of a table
-            if len(c.text.strip()) > 0:
-                new_cell = copy.deepcopy(c)
-                new_cell.rect = BoundingRectangle.from_bounding_box(
-                    new_cell.rect.to_bounding_box().scaled(
-                        scale=self.scale
-                    )
-                )
-                tokens.append(
-                    {
-                        "id": new_cell.index,
-                        "text": new_cell.text,
-                        "bbox": new_cell.rect.to_bounding_box().model_dump(),
-                    }
-                )
+            text = c.text.strip()
+            if not text:
+                continue
+                
+            # Direct bbox calculation without deep copy or intermediate objects
+            bb = c.rect.to_bounding_box()
+            tokens.append(
+                {
+                    "id": c.index,
+                    "text": text,
+                    "bbox": {
+                        "l": bb.l * sx,
+                        "t": bb.t * sy,
+                        "r": bb.r * sx,
+                        "b": bb.b * sy,
+                    },
+                }
+            )
 
         return tokens
 
     def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
+        timer = get_timing_collector()
         table_cells = []
-        for element in table_out["tf_responses"]:
-            if not self.do_cell_matching:
-                # THIS is definetly a bottleneck...
-                the_bbox = BoundingBox.model_validate(
-                    element["bbox"]
-                ).scaled(1 / self.scale)
-                text_piece = page._backend.get_text_in_rect(
-                    the_bbox
-                )
-                element["bbox"]["token"] = text_piece
-
-            tc = TableCell.model_validate(element)
-            if tc.bbox is not None:
-                tc.bbox = tc.bbox.scaled(1 / self.scale)
-            table_cells.append(tc)
+        
+        # Check if we should attach text (only if not matching and explicitly requested)
+        attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', False)
+        
+        # If we need text, get segmented page once for all cells
+        sp = page._backend.get_segmented_page() if attach_text else None
+        
+        with timer.scoped("assign_outputs:validate_cells"):
+            for element in table_out["tf_responses"]:
+                if attach_text and sp is not None:
+                    with timer.scoped("assign_outputs:extract_text"):
+                        the_bbox = BoundingBox.model_validate(
+                            element["bbox"]
+                        ).scaled(1 / self.scale)
+                        # Use segmented page for faster text extraction
+                        words = sp.get_cells_in_bbox(TextCellUnit.WORD, the_bbox)
+                        element["bbox"]["token"] = " ".join(w.text for w in words if w.text.strip())
+                
+                # Use faster model_construct if we trust the output
+                if getattr(self.options, 'trust_tf_output', True):
+                    tc = TableCell.model_construct(**element)
+                else:
+                    tc = TableCell.model_validate(element)
+                    
+                if tc.bbox is not None:
+                    tc.bbox = tc.bbox.scaled(1 / self.scale)
+                table_cells.append(tc)
 
         assert "predict_details" in table_out
 
