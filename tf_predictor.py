@@ -1217,9 +1217,7 @@ class TFPredictor:
 
             outputs.append((tf_output, matching_details))
         
-        # Print timing summary
-        from table_timing_debug import print_timing_summary
-        print_timing_summary()
+        # Don't print here - let multi_table_predict handle it
         
         return outputs
 
@@ -1339,4 +1337,8 @@ class TFPredictor:
             })
         timer.end("phase3_package_outputs")
 
+        # Print comprehensive timing summary
+        from table_timing_debug import print_timing_summary
+        print_timing_summary()
+        
         return multi_tf_output

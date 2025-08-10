@@ -166,6 +166,9 @@ class TableStructureModel(BasePageModel):
             image.save(str(out_file), format="png")
 
     def __call__(self, conv_res: ConversionResult, page_batch: Iterable[Page]) -> Iterable[Page]:
+        import time
+        t_full_start = time.perf_counter()
+        
         if not self.enabled:
             yield from page_batch
             return
@@ -234,6 +237,8 @@ class TableStructureModel(BasePageModel):
             return
 
         # Run the batched predictor
+        import time
+        t_predict_start = time.perf_counter()
         with TimeRecorder(conv_res, "table_structure_predict"):
             try:
                 # Batched API (preferred)
@@ -256,6 +261,8 @@ class TableStructureModel(BasePageModel):
                         do_matching=self.do_cell_matching,
                     )
                     all_outputs.extend(outs)
+        t_predict_end = time.perf_counter()
+        print(f"⏱ multi_table_predict took: {t_predict_end - t_predict_start:.3f}s")
 
         # Map flat outputs back to pages and clusters in strict order
         result_idx = 0
@@ -286,6 +293,9 @@ class TableStructureModel(BasePageModel):
         # Preserve original order
         for page in pages_list:
             yield page
+        
+        t_full_end = time.perf_counter()
+        print(f"⏱ TableStructureModel.__call__ TOTAL: {t_full_end - t_full_start:.3f}s")
 
 
     def _get_tables_from_page(self, page: Page):
