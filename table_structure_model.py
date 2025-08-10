@@ -420,27 +420,24 @@ class TableStructureModel(BasePageModel):
         timer = get_timing_collector()
         table_cells = []
 
-        # Toggle to reduce per-element timing overhead if needed
-        SAMPLE_EVERY = 1  # set to 2/4/8 to sample every Nth element
+        # Reduce overhead of per-element timing; set to 2/4/8 to sample
+        SAMPLE_EVERY = 1
         attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', True)
 
-        with timer.scoped("assign_outputs"):  # whole per-table section
+        with timer.scoped("assign_outputs"):  # per-table envelope
             tf_responses = table_out.get("tf_responses", ())
-            n = len(tf_responses)
-
-            # Predeclare locals to reduce attribute lookups in the hot loop
             _BoundingBox_validate = BoundingBox.model_validate
             _TableCell_validate = TableCell.model_validate
             _scale = 1.0 / self.scale
             _backend = page._backend
             _get_text = _backend.get_text_in_rect if (_backend is not None) else None
 
-            # Per-table coarse timers
+            # Hot loop: split into coarse buckets so we can see where time goes
             with timer.scoped("assign_outputs:loop"):
                 for idx, element in enumerate(tf_responses):
                     do_sample = (idx % SAMPLE_EVERY) == 0
 
-                    # 1) Optional text extraction (dominant when enabled)
+                    # 1) Optional text extraction (usually dominant when enabled)
                     if attach_text and _get_text is not None:
                         if do_sample:
                             t_ctx = timer.scoped("assign_outputs:extract_text")
@@ -451,7 +448,7 @@ class TableStructureModel(BasePageModel):
                         if do_sample:
                             t_ctx.__exit__(None, None, None)
 
-                    # 2) Pydantic validation (can be surprisingly costly)
+                    # 2) Pydantic validation
                     if do_sample:
                         t_ctx = timer.scoped("assign_outputs:validate_cell")
                         t_ctx.__enter__()
@@ -459,7 +456,7 @@ class TableStructureModel(BasePageModel):
                     if do_sample:
                         t_ctx.__exit__(None, None, None)
 
-                    # 3) Bbox rescale back to page coords (cheap but frequent)
+                    # 3) Bbox rescale back to page coords
                     if tc.bbox is not None:
                         if do_sample:
                             t_ctx = timer.scoped("assign_outputs:scale_bbox")
@@ -470,14 +467,14 @@ class TableStructureModel(BasePageModel):
 
                     table_cells.append(tc)
 
-            # 4) predict_details parse (row/col/meta) — keep separate so we see it
+            # 4) Predict-details parse (should be tiny; measured separately)
             with timer.scoped("assign_outputs:predict_details_parse"):
-                pd = table_out.get("predict_details", {})  # dict from TF
+                pd = table_out.get("predict_details", {})
                 num_rows = pd.get("num_rows", 0)
                 num_cols = pd.get("num_cols", 0)
                 otsl_seq = pd.get("prediction", {}).get("rs_seq", [])
 
-            # 5) Table object construction (should be tiny, but make it explicit)
+            # 5) Construct the Table object (should be near-zero)
             with timer.scoped("assign_outputs:table_ctor"):
                 result = Table(
                     otsl_seq=otsl_seq,
@@ -489,15 +486,5 @@ class TableStructureModel(BasePageModel):
                     cluster=table_cluster,
                     label=table_cluster.label,
                 )
-
-            # Optional: attach quick counters for this table to the timer (cheap metadata)
-            timer.add_meta(
-                "assign_outputs",
-                {
-                    "n_cells": len(table_cells),
-                    "attach_text": bool(attach_text),
-                    "sample_every": SAMPLE_EVERY,
-                },
-            )
 
         return result
