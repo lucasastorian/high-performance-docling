@@ -1383,23 +1383,6 @@ class TFPredictor:
             )
             timer.end("finalize_predict_details")
 
-            # Cache if needed (YOUR ORIGINAL BLOCK)
-            if self.enable_cache:
-                timer.start("cache_prediction")
-                prepared_tensor = self._prepare_image(all_table_images[i])
-                self._cache_prediction(
-                    predict_details=predict_details,
-                    doc_id=meta[i]["doc_id"],
-                    page_idx=meta[i]["page_idx"],
-                    table_idx=meta[i]["table_idx"],
-                    table_image=all_table_images[i],
-                    prepared_tensor=prepared_tensor,
-                    orig_table_bbox=None,  # Not available in this flow
-                    table_bbox=all_scaled_bboxes[i],
-                    scale_factor=all_scale_factors[i]
-                )
-                timer.end("cache_prediction")
-
             multi_tf_output.append({
                 "tf_responses": tf_responses,
                 "predict_details": predict_details,

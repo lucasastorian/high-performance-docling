@@ -262,27 +262,15 @@ class TableStructureModel(BasePageModel):
         import time
         t_predict_start = time.perf_counter()
         with TimeRecorder(conv_res, "table_structure_predict"):
-            try:
-                # Batched API (preferred)
-                all_outputs = self.tf_predictor.multi_table_predict(
-                    page_inputs,
-                    table_bboxes_list,
-                    do_matching=self.do_cell_matching,
-                    correct_overlapping_cells=False,
-                    sort_row_col_indexes=True,
-                    doc_id="document",
-                    start_page_idx=0,
-                )
-            except TypeError:
-                # Fallback for non-batched implementations: flatten by calling per page
-                all_outputs = []
-                for single_input, single_bboxes in zip(page_inputs, table_bboxes_list):
-                    outs = self.tf_predictor.multi_table_predict(
-                        single_input,
-                        single_bboxes,
-                        do_matching=self.do_cell_matching,
-                    )
-                    all_outputs.extend(outs)
+            all_outputs = self.tf_predictor.multi_table_predict(
+                page_inputs,
+                table_bboxes_list,
+                do_matching=self.do_cell_matching,
+                correct_overlapping_cells=False,
+                sort_row_col_indexes=True,
+                doc_id="document",
+                start_page_idx=0,
+            )
         t_predict_end = time.perf_counter()
         print(f"⏱ multi_table_predict took: {t_predict_end - t_predict_start:.3f}s")
 
@@ -380,50 +368,136 @@ class TableStructureModel(BasePageModel):
 
         return tokens
 
+    # def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
+    #     timer = get_timing_collector()
+    #     table_cells = []
+    #
+    #     # Option to attach text when not matching (default: True for compatibility)
+    #     attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', True)
+    #
+    #     with timer.scoped("assign_outputs:validate_cells"):
+    #         for element in table_out["tf_responses"]:
+    #             if attach_text:
+    #                 # When not matching, extract text for each cell
+    #                 with timer.scoped("assign_outputs:extract_text"):
+    #                     the_bbox = BoundingBox.model_validate(
+    #                         element["bbox"]
+    #                     ).scaled(1 / self.scale)
+    #                     text_piece = page._backend.get_text_in_rect(
+    #                         the_bbox
+    #                     )
+    #                     element["bbox"]["token"] = text_piece
+    #
+    #             # Use model_validate to ensure the validator runs and text field is populated
+    #             tc = TableCell.model_validate(element)
+    #             if tc.bbox is not None:
+    #                 tc.bbox = tc.bbox.scaled(1 / self.scale)
+    #             table_cells.append(tc)
+    #
+    #     assert "predict_details" in table_out
+    #
+    #     # Retrieving cols/rows, after post processing:
+    #     num_rows = table_out["predict_details"].get("num_rows", 0)
+    #     num_cols = table_out["predict_details"].get("num_cols", 0)
+    #     otsl_seq = (
+    #         table_out["predict_details"]
+    #         .get("prediction", {})
+    #         .get("rs_seq", [])
+    #     )
+    #
+    #     return Table(
+    #         otsl_seq=otsl_seq,
+    #         table_cells=table_cells,
+    #         num_rows=num_rows,
+    #         num_cols=num_cols,
+    #         id=table_cluster.id,
+    #         page_no=page.page_no,
+    #         cluster=table_cluster,
+    #         label=table_cluster.label,
+    #     )
+
     def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
         timer = get_timing_collector()
         table_cells = []
-        
-        # Option to attach text when not matching (default: True for compatibility)
+
+        # Toggle to reduce per-element timing overhead if needed
+        SAMPLE_EVERY = 1  # set to 2/4/8 to sample every Nth element
         attach_text = not self.do_cell_matching and getattr(self.options, 'attach_cell_text', True)
-        
-        with timer.scoped("assign_outputs:validate_cells"):
-            for element in table_out["tf_responses"]:
-                if attach_text:
-                    # When not matching, extract text for each cell
-                    with timer.scoped("assign_outputs:extract_text"):
-                        the_bbox = BoundingBox.model_validate(
-                            element["bbox"]
-                        ).scaled(1 / self.scale)
-                        text_piece = page._backend.get_text_in_rect(
-                            the_bbox
-                        )
+
+        with timer.scoped("assign_outputs"):  # whole per-table section
+            tf_responses = table_out.get("tf_responses", ())
+            n = len(tf_responses)
+
+            # Predeclare locals to reduce attribute lookups in the hot loop
+            _BoundingBox_validate = BoundingBox.model_validate
+            _TableCell_validate = TableCell.model_validate
+            _scale = 1.0 / self.scale
+            _backend = page._backend
+            _get_text = _backend.get_text_in_rect if (_backend is not None) else None
+
+            # Per-table coarse timers
+            with timer.scoped("assign_outputs:loop"):
+                for idx, element in enumerate(tf_responses):
+                    do_sample = (idx % SAMPLE_EVERY) == 0
+
+                    # 1) Optional text extraction (dominant when enabled)
+                    if attach_text and _get_text is not None:
+                        if do_sample:
+                            t_ctx = timer.scoped("assign_outputs:extract_text")
+                            t_ctx.__enter__()
+                        bb = _BoundingBox_validate(element["bbox"]).scaled(_scale)
+                        text_piece = _get_text(bb)
                         element["bbox"]["token"] = text_piece
+                        if do_sample:
+                            t_ctx.__exit__(None, None, None)
 
-                # Use model_validate to ensure the validator runs and text field is populated
-                tc = TableCell.model_validate(element)
-                if tc.bbox is not None:
-                    tc.bbox = tc.bbox.scaled(1 / self.scale)
-                table_cells.append(tc)
+                    # 2) Pydantic validation (can be surprisingly costly)
+                    if do_sample:
+                        t_ctx = timer.scoped("assign_outputs:validate_cell")
+                        t_ctx.__enter__()
+                    tc = _TableCell_validate(element)
+                    if do_sample:
+                        t_ctx.__exit__(None, None, None)
 
-        assert "predict_details" in table_out
+                    # 3) Bbox rescale back to page coords (cheap but frequent)
+                    if tc.bbox is not None:
+                        if do_sample:
+                            t_ctx = timer.scoped("assign_outputs:scale_bbox")
+                            t_ctx.__enter__()
+                        tc.bbox = tc.bbox.scaled(_scale)
+                        if do_sample:
+                            t_ctx.__exit__(None, None, None)
 
-        # Retrieving cols/rows, after post processing:
-        num_rows = table_out["predict_details"].get("num_rows", 0)
-        num_cols = table_out["predict_details"].get("num_cols", 0)
-        otsl_seq = (
-            table_out["predict_details"]
-            .get("prediction", {})
-            .get("rs_seq", [])
-        )
+                    table_cells.append(tc)
 
-        return Table(
-            otsl_seq=otsl_seq,
-            table_cells=table_cells,
-            num_rows=num_rows,
-            num_cols=num_cols,
-            id=table_cluster.id,
-            page_no=page.page_no,
-            cluster=table_cluster,
-            label=table_cluster.label,
-        )
+            # 4) predict_details parse (row/col/meta) — keep separate so we see it
+            with timer.scoped("assign_outputs:predict_details_parse"):
+                pd = table_out.get("predict_details", {})  # dict from TF
+                num_rows = pd.get("num_rows", 0)
+                num_cols = pd.get("num_cols", 0)
+                otsl_seq = pd.get("prediction", {}).get("rs_seq", [])
+
+            # 5) Table object construction (should be tiny, but make it explicit)
+            with timer.scoped("assign_outputs:table_ctor"):
+                result = Table(
+                    otsl_seq=otsl_seq,
+                    table_cells=table_cells,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                    id=table_cluster.id,
+                    page_no=page.page_no,
+                    cluster=table_cluster,
+                    label=table_cluster.label,
+                )
+
+            # Optional: attach quick counters for this table to the timer (cheap metadata)
+            timer.add_meta(
+                "assign_outputs",
+                {
+                    "n_cells": len(table_cells),
+                    "attach_text": bool(attach_text),
+                    "sample_every": SAMPLE_EVERY,
+                },
+            )
+
+        return result
