@@ -23,7 +23,8 @@ def is_cpu(dev):
 @contextlib.contextmanager
 def safe_autocast(device, dtype=None):
     if is_cuda(device):
-        with torch.autocast(device_type="cuda", dtype=dtype or torch.bfloat16):
+        # Use provided dtype, default to float16 for better compatibility
+        with torch.autocast(device_type="cuda", dtype=dtype or torch.float16):
             yield
     elif is_mps(device):
         # bfloat16 not fully supported on some MPS; use float16

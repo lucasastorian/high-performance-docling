@@ -80,6 +80,8 @@ class LayoutPredictor:
             num_threads: int = 4,
             base_threshold: float = 0.3,
             blacklist_classes: Set[str] = set(),
+            enable_timing: bool = False,
+            enable_nms: bool = False,
     ):
         """
         Provide the artifact path that contains the LayoutModel file
@@ -96,6 +98,8 @@ class LayoutPredictor:
         """
         # Blacklisted classes
         self._black_classes = blacklist_classes  # set(["Form", "Key-Value Region"])
+        self._enable_timing = enable_timing
+        self._enable_nms = enable_nms
 
         # Canonical classes
         self._labels = LayoutLabels()
@@ -244,9 +248,10 @@ class LayoutPredictor:
         if not images:
             return []
 
-        # Performance timing
-        st = StageTimes()
-        wall_t0 = time.perf_counter()
+        # Performance timing (only if enabled to avoid synchronization overhead)
+        if self._enable_timing:
+            st = StageTimes()
+            wall_t0 = time.perf_counter()
         
         # Convert all images to RGB PIL format
         pil_images = []
@@ -262,22 +267,29 @@ class LayoutPredictor:
         target_sizes = torch.tensor([img.size[::-1] for img in pil_images], device=self._device)
 
         # GPU-accelerated preprocessing (resize + normalize on GPU)
-        with CudaTimer() as t_pre:
+        if self._enable_timing:
+            with CudaTimer() as t_pre:
+                pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device)
+            st.add("pre", t_pre.ms)
+        else:
             pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device)
-        st.add("pre", t_pre.ms)
         
         # Forward pass with safe autocast (handles cuda/mps/cpu)
-        with CudaTimer() as t_fwd, safe_autocast(self._device, dtype=torch.float16):
-            outputs = self._model(pixel_values=pixel_values)
-        st.add("fwd", t_fwd.ms)
+        if self._enable_timing:
+            with CudaTimer() as t_fwd, safe_autocast(self._device, dtype=torch.float16):
+                outputs = self._model(pixel_values=pixel_values)
+            st.add("fwd", t_fwd.ms)
+        else:
+            with safe_autocast(self._device, dtype=torch.float16):
+                outputs = self._model(pixel_values=pixel_values)
 
-        # Post-process results with GPU timing
-        with CudaTimer() as t_post:
+        # Post-process results
+        def post_process():
             boxes, scores, labels, batch_idx, splits = self.post_process_object_detection_fast(
                 outputs, threshold=self._threshold, target_sizes=target_sizes, use_focal_loss=True
             )
 
-            # Early GPU culling of small/extreme aspect ratio boxes
+            # Early GPU culling of small/extreme aspect ratio boxes (optional)
             if self._device.type == "cuda" and len(boxes) > 0:
                 wh = (boxes[:, 2] - boxes[:, 0]).clamp_min_(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min_(0)
                 ar = (boxes[:, 2] - boxes[:, 0]).clamp_min_(1e-6) / (boxes[:, 3] - boxes[:, 1]).clamp_min_(1e-6)
@@ -295,15 +307,22 @@ class LayoutPredictor:
                 if keep.any():
                     boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
-            # Batched NMS (groups by page with label stride)
-            if self._device.type == "cuda" and len(boxes) > 0:
+            # Batched NMS (only if enabled - can add overhead)
+            if self._enable_nms and self._device.type == "cuda" and len(boxes) > 0:
                 label_stride = int(labels.max().item()) + 1 if len(labels) > 0 else 1
                 kept = torchvision.ops.batched_nms(
                     boxes, scores, labels + batch_idx * label_stride, iou_threshold=0.5
                 )
                 boxes, scores, labels, batch_idx = boxes[kept], scores[kept], labels[kept], batch_idx[kept]
+            
+            return boxes, scores, labels, batch_idx
         
-        st.add("post", t_post.ms)
+        if self._enable_timing:
+            with CudaTimer() as t_post:
+                boxes, scores, labels, batch_idx = post_process()
+            st.add("post", t_post.ms)
+        else:
+            boxes, scores, labels, batch_idx = post_process()
 
         # Finally, for each page, slice and wrap into dicts once:
         all_predictions = []
@@ -322,16 +341,17 @@ class LayoutPredictor:
             ]
             all_predictions.append(preds)
 
-        # Report timing
-        wall_ms = (time.perf_counter() - wall_t0) * 1e3
-        total_ms = sum(st.data.values())
-        pps = len(pil_images) / (total_ms / 1e3) if total_ms > 0 else 0
-        _log.info(f"[layout.gpu] {st.report(total_ms)} | pages={len(pil_images)} | {pps:.1f} pages/s")
-        _log.info(f"[layout.wall] {wall_ms:.1f}ms for {len(pil_images)} pages ({len(pil_images)/(wall_ms/1e3):.1f} pages/s)")
-        
-        if torch.cuda.is_available():
-            peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
-            _log.debug(f"[gpu.mem] peak_allocated={peak_gb:.2f} GB")
+        # Report timing (only if enabled)
+        if self._enable_timing:
+            wall_ms = (time.perf_counter() - wall_t0) * 1e3
+            total_ms = sum(st.data.values())
+            pps = len(pil_images) / (total_ms / 1e3) if total_ms > 0 else 0
+            _log.info(f"[layout.gpu] {st.report(total_ms)} | pages={len(pil_images)} | {pps:.1f} pages/s")
+            _log.info(f"[layout.wall] {wall_ms:.1f}ms for {len(pil_images)} pages ({len(pil_images)/(wall_ms/1e3):.1f} pages/s)")
+            
+            if torch.cuda.is_available():
+                peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                _log.debug(f"[gpu.mem] peak_allocated={peak_gb:.2f} GB")
 
         return all_predictions
         # results_list: List[Dict[str, Tensor]] = (
