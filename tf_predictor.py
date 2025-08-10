@@ -32,6 +32,7 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 from tablemodel04_rs import TableModel04_rs
 from mps_diagnostics import check_model_device, assert_on_device
+from table_timing_debug import get_timing_collector
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
@@ -1114,9 +1115,14 @@ class TFPredictor:
         """
         AggProfiler().start_agg(self._prof)
 
+        timer = get_timing_collector()
+        
         max_steps = self._config["predict"]["max_steps"]
         beam_size = self._config["predict"]["beam_size"]
+        
+        timer.start("prepare_image_batch")
         image_batch = self._prepare_image_batch(table_images)
+        timer.end("prepare_image_batch")
 
         all_predictions: list[dict] = []
 
@@ -1132,9 +1138,14 @@ class TFPredictor:
                     all_predictions.append(pred)
             else:
                 start = datetime.now()
+                timer.start("model_inference")
                 model_result = self._model.predict(image_batch, max_steps, beam_size)
+                timer.end("model_inference")
                 print(f"Made table predictions in {datetime.now() - start} seconds")
+                
+                timer.start("normalize_outputs")
                 triples = self._normalize_model_batch_outputs(model_result)
+                timer.end("normalize_outputs")
                 for seq, outputs_class, outputs_coord in triples:
                     pred = self._build_prediction_from_heads(seq, outputs_class, outputs_coord)
                     all_predictions.append(pred)
@@ -1175,19 +1186,25 @@ class TFPredictor:
             # Matching
             if len(prediction["bboxes"]) > 0:
                 if do_matching:
+                    timer.start("match_cells")
                     matching_details = self._cell_matcher.match_cells(
                         iocr_page, tbl_bbox_for_match, prediction
                     )
+                    timer.end("match_cells")
                     if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
                         AggProfiler().begin("post_process", self._prof)
+                        timer.start("post_process")
                         matching_details = self._post_processor.process(
                             matching_details, correct_overlapping_cells
                         )
+                        timer.end("post_process")
                         AggProfiler().end("post_process", self._prof)
                 else:
+                    timer.start("match_cells_dummy")
                     matching_details = self._cell_matcher.match_cells_dummy(
                         iocr_page, tbl_bbox_for_match, prediction
                     )
+                    timer.end("match_cells_dummy")
 
             # Attach prediction for downstream consumers
             matching_details["prediction"] = prediction
@@ -1210,7 +1227,9 @@ class TFPredictor:
             tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
 
             outputs.append((tf_output, matching_details))
-
+        
+        timer.end("matching_total")
+        timer.print_summary()
         return outputs
 
     # -----------------------
@@ -1231,7 +1250,10 @@ class TFPredictor:
         Batch over pages, then batch over all tables. Stable mapping and no coordinate shenanigans.
         Expects page_inputs[i]["tokens"] populated in ORIGINAL page_input coords.
         """
+        timer = get_timing_collector()
+        
         # Phase 1: collect all tables
+        timer.start("phase1_total")
         all_table_images: list[np.ndarray] = []
         all_scaled_bboxes: list[list[float]] = []
         all_scale_factors: list[float] = []
