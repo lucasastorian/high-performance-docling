@@ -88,7 +88,7 @@ class TimingCollector:
         
         print(f"\nOTHER:")
         for name, times in sorted(self.timings.items()):
-            if name not in phase1_names + phase2_names + phase3_names:
+            if name not in phase1_names + phase2_names + phase3_names + envelope_timers:
                 total = sum(times)
                 avg = total / len(times)
                 other_total += total

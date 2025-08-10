@@ -95,7 +95,8 @@ class GPUProcessor:
             t_ocr_run = time.perf_counter() - t_ocr_run_start
             print(f"     ⏱ ocr-generate+apply: {fmt_secs(t_ocr_run)}")
         else:
-            print("  3️⃣ No OCR needed - all text extractable")
+            print("  3️⃣ No OC"
+                  "R needed - all text extractable")
 
         # Step 4: Table Structure Analysis
         t_tables = 0.0
@@ -207,30 +208,30 @@ class GPUProcessor:
                             break
 
         return pages
-    
+
     def cleanup(self):
         """Release GPU memory by deleting models and clearing cache."""
         print("\n🧹 Cleaning up GPU resources...")
-        
+
         # Delete models
         if hasattr(self, 'layout_model'):
             if hasattr(self.layout_model, 'layout_predictor'):
                 if hasattr(self.layout_model.layout_predictor, '_model'):
                     del self.layout_model.layout_predictor._model
             del self.layout_model
-        
+
         if hasattr(self, 'ocr_model'):
             del self.ocr_model
-        
+
         if hasattr(self, 'ocr_processor'):
             del self.ocr_processor
-            
+
         if hasattr(self, 'table_model'):
             if hasattr(self.table_model, 'tf_predictor'):
                 if hasattr(self.table_model.tf_predictor, '_model'):
                     del self.table_model.tf_predictor._model
             del self.table_model
-        
+
         # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -241,11 +242,11 @@ class GPUProcessor:
             if hasattr(torch.mps, 'synchronize'):
                 torch.mps.synchronize()
             print("✓ MPS memory released")
-        
+
     def __enter__(self):
         """Context manager entry."""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup on exit."""
         self.cleanup()
