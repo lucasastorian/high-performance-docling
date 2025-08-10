@@ -31,7 +31,6 @@ from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 from tablemodel04_rs import TableModel04_rs
-from mps_diagnostics import check_model_device, assert_on_device
 from table_timing_debug import get_timing_collector
 
 # LOG_LEVEL = logging.INFO
@@ -139,11 +138,6 @@ class TFPredictor:
         # Load the model
         self._model = self._load_model()
         self._model.eval()
-        try:
-            src = "local" if USING_LOCAL_TABLEFORMER else "package"
-            self._log().info(f"Using TableModel04_rs from: {src}")
-        except Exception:
-            pass
         self._prof = config["predict"].get("profiling", False)
         self._profiling_agg_window = config["predict"].get("profiling_agg_window", None)
         if self._profiling_agg_window is not None:
@@ -226,11 +220,6 @@ class TFPredictor:
                 )
                 self._log().error(err_msg)
                 raise ValueError(err_msg)
-        
-        # Check if model is on the correct device
-        if str(self._device) == 'mps':
-            print(f"\n🔍 Checking model device placement...")
-            check_model_device(model, self._device)
 
         return model
 

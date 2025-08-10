@@ -26,7 +26,6 @@ from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
 from tf_predictor import TFPredictor
-from mps_diagnostics import check_mps_setup, check_model_device
 
 
 class TableStructureModel(BasePageModel):
@@ -76,10 +75,6 @@ class TableStructureModel(BasePageModel):
 
             device = decide_device(accelerator_options.device)
             print(f"Running Table predictions on {device}")
-            
-            # Check MPS setup and diagnostics
-            if str(device) == 'mps':
-                check_mps_setup()
 
             self.tm_config = c.read_config(f"{artifacts_path}/tm_config.json")
             self.tm_config["model"]["save_dir"] = artifacts_path
