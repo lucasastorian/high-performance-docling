@@ -219,21 +219,21 @@ class LayoutPredictor:
         # Let's profile what the image processor is doing internally
         torch.cuda.synchronize() if self._device.type == "cuda" else None
         t0 = time.perf_counter()
-        
+
         # The image processor likely does:
         # 1. Resize images to fixed size (expensive on CPU)
         # 2. Convert to tensors
         # 3. Normalize pixel values
         # Let's time this more granularly
         print(f"📊 Processing {len(pil_images)} images, sizes: {[img.size for img in pil_images[:3]]}...")
-        
+
         # inputs = self._image_processor(images=pil_images, return_tensors="pt")
         t_pre = time.perf_counter()
 
         # Only move pixel_values; keep dict on CPU
         # pixel_values = inputs["pixel_values"]
 
-        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device.type)
+        pixel_values = rtdetr_preprocess_tensor(pil_images, device=self._device)
         print(f"   Preprocessed tensor shape: {pixel_values.shape}, dtype: {pixel_values.dtype}")
 
         assert pixel_values.shape[-2:] == (640, 640)
@@ -323,12 +323,29 @@ class LayoutPredictor:
         return all_predictions
 
 
-def rtdetr_preprocess_tensor(pil_list, device="cuda"):
-    # Convert PIL -> RGB np.uint8
+# def rtdetr_preprocess_tensor(pil_list, device="cuda"):
+#     # Convert PIL -> RGB np.uint8
+#     rgb_list = [np.array(im.convert("RGB"), dtype=np.uint8) for im in pil_list]
+#     t = torch.stack([torch.from_numpy(x) for x in rgb_list])          # [B,H,W,3], uint8
+#     t = t.permute(0, 3, 1, 2).contiguous().to(torch.float32)          # [B,3,H,W], float32
+#     t = t.div_(255.0)                                                 # rescale to [0,1]
+#     t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)  # warp (no AR)
+#     t = t.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+#     return t  # feed as pixel_values
+
+
+def rtdetr_preprocess_tensor(pil_list, device):
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    # PIL -> RGB uint8 (CPU)
     rgb_list = [np.array(im.convert("RGB"), dtype=np.uint8) for im in pil_list]
-    t = torch.stack([torch.from_numpy(x) for x in rgb_list])          # [B,H,W,3], uint8
-    t = t.permute(0, 3, 1, 2).contiguous().to(torch.float32)          # [B,3,H,W], float32
-    t = t.div_(255.0)                                                 # rescale to [0,1]
-    t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)  # warp (no AR)
-    t = t.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
-    return t  # feed as pixel_values
+    t = torch.stack([torch.from_numpy(x) for x in rgb_list])  # [B,H,W,3] uint8 (CPU)
+    t = t.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W] uint8 (CPU)
+
+    # Move first, then do math on GPU
+    t = t.to(device, non_blocking=True).to(torch.float32)  # (CUDA)
+    t = t.div_(255.0)  # rescale on GPU
+    t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)  # resize on GPU
+    return t.contiguous(memory_format=torch.channels_last)
