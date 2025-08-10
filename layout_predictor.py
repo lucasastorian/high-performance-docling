@@ -163,16 +163,6 @@ class LayoutPredictor:
         
         # Pre-compute name to ID mapping for blacklist filtering
         self._name_to_id = {name: i for i, name in enumerate(self._classes_map)}
-        
-        # Optional: compile the fast postprocess path for extra speed
-        if self._device.type == "cuda":
-            try:
-                self.post_process_object_detection_fast = torch.compile(
-                    self.post_process_object_detection_fast, mode="reduce-overhead", fullgraph=False
-                )
-                _log.debug("Post-processing function compiled successfully")
-            except Exception as e:
-                _log.debug(f"torch.compile not available or failed: {e}")
 
         _log.debug("LayoutPredictor settings: {}".format(self.info()))
 
