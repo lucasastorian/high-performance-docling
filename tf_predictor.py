@@ -1314,9 +1314,6 @@ class TFPredictor:
         Batch over pages, then batch over all tables. Stable mapping and no coordinate shenanigans.
         Expects page_inputs[i]["tokens"] populated in ORIGINAL page_input coords.
         """
-        # Reset timing collector for this run
-        from table_timing_debug import reset_timing
-        reset_timing()
         timer = get_timing_collector()
         wall_start = time.time()
 
