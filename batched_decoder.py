@@ -1,0 +1,273 @@
+#
+# Copyright IBM Corp. 2024 - 2024
+# SPDX-License-Identifier: MIT
+#
+# Batched decoder implementation for TableModel04_rs
+# Processes multiple tables in parallel instead of sequentially
+
+import torch
+import torch.nn as nn
+from dataclasses import dataclass
+from typing import List, Optional, Dict
+from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
+
+
+@dataclass
+class BatchState:
+    """State for batched decoding - all tensors stay on GPU"""
+    decoded_tags: torch.Tensor          # [T, B] Long - the generated tokens
+    finished: torch.Tensor              # [B] bool - which sequences are done
+    cache: Optional[torch.Tensor]       # per-layer cache from transformer
+    tag_H_buf: List[List[torch.Tensor]] # B lists of step features for bbox head (GPU tensors)
+    first_lcel: torch.Tensor            # [B] bool - tracking horizontal spans
+    skip_next_tag: torch.Tensor         # [B] bool - skip bbox for next token
+    prev_tag_ucel: torch.Tensor         # [B] bool - was previous tag ucel
+    line_num: torch.Tensor              # [B] int - current line number
+    bboxes_to_merge: List[Dict]         # per item: {start_idx: end_idx}
+    bbox_ind: torch.Tensor              # [B] int - current bbox index
+    cur_bbox_ind: torch.Tensor          # [B] int - current span start index
+
+
+class BatchedTableDecoder:
+    """Batched decoder for table structure prediction"""
+    
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
+        self._prof = model._prof
+        
+    @torch.inference_mode()
+    def predict_batched(self, enc_out_batch: torch.Tensor, max_steps: int) -> List:
+        """
+        Batched prediction for multiple tables at once
+        
+        Args:
+            enc_out_batch: [B, H, W, C] encoded features for B tables
+            max_steps: maximum decoding steps
+            
+        Returns:
+            List of (seq, outputs_class, outputs_coord) per table
+        """
+        device = self.device
+        B = enc_out_batch.size(0)
+        
+        # If batch size is 1, fall back to original implementation for safety
+        if B == 1:
+            return self._predict_single(enc_out_batch, max_steps)
+        
+        tt = self.model._tag_transformer
+        word_map = self.model._init_data["word_map"]["word_map_tag"]
+        n_heads = tt._n_heads
+        
+        # Pre-filter + flatten encoder features once for all B
+        # [B, H, W, C] -> [B, h, w, C]
+        AggProfiler().begin("batched_input_filter", self._prof)
+        encoder_out = tt._input_filter(enc_out_batch.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        AggProfiler().end("batched_input_filter", self._prof)
+        
+        batch_size = encoder_out.size(0)
+        C = encoder_out.size(-1)
+        S = encoder_out.size(1) * encoder_out.size(2)
+        
+        # Reshape for transformer: [B, S, C] -> [S, B, C]
+        memory = encoder_out.view(B, S, C).permute(1, 0, 2).contiguous()
+        
+        # Create encoder mask (though it's basically a no-op)
+        encoder_mask = torch.zeros(
+            (B * n_heads, S, S), device=device
+        ) == torch.ones(
+            (B * n_heads, S, S), device=device
+        )
+        
+        # Run encoder once for all B
+        AggProfiler().begin("batched_encoder", self._prof)
+        mem_enc = tt._encoder(memory, mask=encoder_mask)  # [S, B, C]
+        AggProfiler().end("batched_encoder", self._prof)
+        
+        # Initialize tokens with <start> for all sequences
+        start_id = word_map["<start>"]
+        end_id = word_map["<end>"]
+        decoded_tags = torch.full((1, B), start_id, dtype=torch.long, device=device)
+        
+        # Initialize per-sequence state
+        state = BatchState(
+            decoded_tags=decoded_tags,
+            finished=torch.zeros(B, dtype=torch.bool, device=device),
+            cache=None,
+            tag_H_buf=[[] for _ in range(B)],
+            first_lcel=torch.ones(B, dtype=torch.bool, device=device),
+            skip_next_tag=torch.ones(B, dtype=torch.bool, device=device),  # starts True
+            prev_tag_ucel=torch.zeros(B, dtype=torch.bool, device=device),
+            line_num=torch.zeros(B, dtype=torch.long, device=device),
+            bboxes_to_merge=[{} for _ in range(B)],
+            bbox_ind=torch.zeros(B, dtype=torch.long, device=device),
+            cur_bbox_ind=torch.full((B,), -1, dtype=torch.long, device=device),
+        )
+        
+        # Main autoregressive loop
+        AggProfiler().begin("batched_ar_loop", self._prof)
+        for step in range(max_steps):
+            # Embed and add positional encoding: [T, B, D]
+            tgt_emb = tt._positional_encoding(tt._embedding(state.decoded_tags))
+            
+            # Decode: returns ([T, B, D], cache)
+            AggProfiler().begin("batched_decoder_step", self._prof)
+            decoded, state.cache = tt._decoder(
+                tgt_emb, 
+                memory=mem_enc, 
+                cache=state.cache,
+                memory_key_padding_mask=None
+            )
+            AggProfiler().end("batched_decoder_step", self._prof)
+            
+            # Get logits for last token for all B sequences
+            logits = tt._fc(decoded[-1, :, :])  # [B, vocab]
+            new_tags = logits.argmax(dim=1)     # [B]
+            
+            # Apply structure corrections per item
+            new_tags_list = new_tags.tolist()
+            for b in range(B):
+                if state.finished[b]:
+                    new_tags_list[b] = end_id
+                    continue
+                    
+                t = new_tags_list[b]
+                
+                # First line: xcel -> lcel
+                if state.line_num[b].item() == 0 and t == word_map.get("xcel", -999):
+                    t = word_map["lcel"]
+                    
+                # ucel -> next lcel becomes fcel
+                if state.prev_tag_ucel[b] and t == word_map.get("lcel", -999):
+                    t = word_map["fcel"]
+                    
+                new_tags_list[b] = t
+                
+            new_tags = torch.tensor(new_tags_list, device=device, dtype=torch.long)
+            
+            # Store hidden states for bbox prediction
+            last_H = decoded[-1, :, :]  # [B, D]
+            
+            for b in range(B):
+                if state.finished[b]:
+                    continue
+                    
+                t = new_tags[b].item()
+                
+                # BBOX PREDICTION logic
+                if not state.skip_next_tag[b]:
+                    if t in [word_map.get(x, -999) for x in ["fcel", "ecel", "ched", "rhed", "srow", "nl", "ucel"]]:
+                        state.tag_H_buf[b].append(last_H[b:b+1, :])  # Keep on GPU
+                        if not state.first_lcel[b]:
+                            # Mark end index for horizontal cell bbox merge
+                            state.bboxes_to_merge[b][int(state.cur_bbox_ind[b].item())] = int(state.bbox_ind[b].item())
+                        state.bbox_ind[b] += 1
+                
+                # Handle horizontal span bboxes
+                if t != word_map.get("lcel", -999):
+                    state.first_lcel[b] = True
+                else:
+                    if state.first_lcel[b]:
+                        # Beginning of horizontal span
+                        state.tag_H_buf[b].append(last_H[b:b+1, :])
+                        state.first_lcel[b] = False
+                        state.cur_bbox_ind[b] = state.bbox_ind[b]
+                        state.bboxes_to_merge[b][int(state.cur_bbox_ind[b].item())] = -1
+                        state.bbox_ind[b] += 1
+                
+                # Update skip_next_tag
+                if t in [word_map.get(x, -999) for x in ["nl", "ucel", "xcel"]]:
+                    state.skip_next_tag[b] = True
+                else:
+                    state.skip_next_tag[b] = False
+                
+                # Update prev_tag_ucel
+                state.prev_tag_ucel[b] = (t == word_map.get("ucel", -999))
+            
+            # Append new tokens
+            state.decoded_tags = torch.cat([state.decoded_tags, new_tags.view(1, B)], dim=0)
+            state.finished |= (new_tags == end_id)
+            
+            # Early exit if all sequences are done
+            if state.finished.all():
+                break
+                
+        AggProfiler().end("batched_ar_loop", self._prof)
+        
+        # Convert to per-sequence results
+        seqs = [state.decoded_tags[:, b].tolist() for b in range(B)]
+        
+        # BBox prediction - still per-item for now (could be batched later)
+        outputs = []
+        AggProfiler().begin("batched_bbox_decode", self._prof)
+        for b in range(B):
+            if self.model._bbox and len(state.tag_H_buf[b]) > 0:
+                outputs_class, outputs_coord = self.model._bbox_decoder.inference(
+                    enc_out_batch[b:b+1], 
+                    state.tag_H_buf[b]
+                )
+            else:
+                outputs_class = torch.empty(0, device=device)
+                outputs_coord = torch.empty(0, device=device)
+            
+            # Merge spanning bboxes
+            outputs_class, outputs_coord = self._merge_span_bboxes(
+                outputs_class, outputs_coord, state.bboxes_to_merge[b]
+            )
+            
+            outputs.append((seqs[b], outputs_class, outputs_coord))
+        AggProfiler().end("batched_bbox_decode", self._prof)
+        
+        return outputs
+    
+    def _predict_single(self, enc_out_batch: torch.Tensor, max_steps: int) -> List:
+        """Fallback to original single-item prediction"""
+        img = torch.zeros(1, 3, 448, 448, device=self.device)  # dummy, not used
+        seq, outputs_class, outputs_coord = self.model._predict(
+            img, max_steps, 1, False,
+            precomputed_enc=enc_out_batch
+        )
+        return [(seq, outputs_class, outputs_coord)]
+    
+    def _merge_span_bboxes(self, outputs_class, outputs_coord, bboxes_to_merge):
+        """Merge first and last bbox for each span"""
+        device = self.device
+        
+        outputs_class = outputs_class.to(device) if outputs_class is not None else torch.empty(0, device=device)
+        outputs_coord = outputs_coord.to(device) if outputs_coord is not None else torch.empty(0, device=device)
+        
+        outputs_class1 = []
+        outputs_coord1 = []
+        boxes_to_skip = []
+        
+        for box_ind in range(len(outputs_coord)):
+            box1 = outputs_coord[box_ind].to(device)
+            cls1 = outputs_class[box_ind].to(device)
+            
+            if box_ind in bboxes_to_merge:
+                box2_ind = bboxes_to_merge[box_ind]
+                if box2_ind >= 0 and box2_ind < len(outputs_coord):
+                    boxes_to_skip.append(box2_ind)
+                    box2 = outputs_coord[box2_ind].to(device)
+                    boxm = self.model.mergebboxes(box1, box2).to(device)
+                    outputs_coord1.append(boxm)
+                    outputs_class1.append(cls1)
+                else:
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
+            else:
+                if box_ind not in boxes_to_skip:
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
+        
+        if len(outputs_coord1) > 0:
+            outputs_coord1 = torch.stack(outputs_coord1)
+        else:
+            outputs_coord1 = torch.empty(0, device=device)
+            
+        if len(outputs_class1) > 0:
+            outputs_class1 = torch.stack(outputs_class1)
+        else:
+            outputs_class1 = torch.empty(0, device=device)
+        
+        return outputs_class1, outputs_coord1

@@ -39,7 +39,7 @@ if __name__ == '__main__':
         do_ocr=False,
         do_table_structure=True,
         images_scale=1.0,
-        accelerator_options=AcceleratorOptions(device="mps")
+        accelerator_options=AcceleratorOptions(device="cuda")
     )
 
     # ========================================
@@ -80,4 +80,4 @@ if __name__ == '__main__':
     markdown = conv_res.document.export_to_markdown()
     print(f"✓ Markdown length: {len(markdown)} chars")
 
-    print(f"{markdown}")
+    print(f"{markdown[0:10000]}")

@@ -77,6 +77,12 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
     def __init__(self, *args, use_sdpa: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         self.use_sdpa = use_sdpa
+        # Thresholds for when SDPA is beneficial
+        self.sdpa_min_work = {
+            'cuda': 512,  # Higher threshold on CUDA
+            'mps': 256,   # Lower threshold on MPS  
+            'cpu': 1024    # Much higher on CPU
+        }
 
     def forward(  # type: ignore
         self,
@@ -97,8 +103,18 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         # Only compute the next token (existing optimization)
         tgt_last_tok = tgt[-1:, :, :]   # [1,B,D]
+        
+        # Dynamically decide whether to use SDPA based on workload size
+        device_type = tgt.device.type
+        T_query = tgt_last_tok.size(0)  # 1 for last-token
+        T_key = tgt.size(0)
+        work_size = T_query * T_key
+        
+        # Use SDPA only if enabled AND workload is large enough
+        min_work = self.sdpa_min_work.get(device_type, 512)
+        use_sdpa_here = self.use_sdpa and (work_size >= min_work)
 
-        if self.use_sdpa:
+        if use_sdpa_here:
             # ---- Self-attention (query=last token, keys/vals=full tgt) ----
             # Causal mask is not needed because we only query the last position.
             tmp_tgt = mha_sdpa_forward(
@@ -126,7 +142,15 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         # ---- Cross-attention (if encoder memory is provided) ----
         if memory is not None:
-            if self.use_sdpa:
+            # Check workload size for cross-attention too
+            if memory is not None:
+                S_mem = memory.size(0)
+                cross_work_size = T_query * S_mem
+                use_sdpa_cross = self.use_sdpa and (cross_work_size >= min_work)
+            else:
+                use_sdpa_cross = False
+                
+            if use_sdpa_cross:
                 tmp_tgt = mha_sdpa_forward(
                     query=tgt_last_tok,
                     key=memory,

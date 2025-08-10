@@ -18,6 +18,7 @@ from bbox_decoder_optimized import BBoxDecoder
 from encoder04_rs import Encoder04
 from transformer_optimized import Tag_Transformer
 from optimization_utils import safe_autocast, prepare_model_for_infer, to_device_images, maybe_compile
+from batched_decoder import BatchedTableDecoder
 
 LOG_LEVEL = logging.WARN
 
@@ -95,6 +96,14 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._encoder_dim,
             self._dropout,
         ).to(device)
+        
+        # Create batched decoder wrapper
+        self._use_batched_decoder = os.environ.get('USE_BATCHED_DECODER', '1') == '1'
+        self._batched_decoder = BatchedTableDecoder(self, device)
+        if self._use_batched_decoder:
+            print(f"✅ Using BATCHED decoder (process multiple tables in parallel)")
+        else:
+            print(f"⚠️ Using SEQUENTIAL decoder (process tables one by one)")
 
     def _log(self):
         # Setup a custom logger
@@ -121,11 +130,11 @@ class TableModel04_rs(BaseModel, nn.Module):
         imgs: [B, 3, 448, 448]
         """
         batch_size = imgs.size(0)
-        batch_results = []
-
+        
         # Do the heavy lift ONCE
         with torch.inference_mode():
             self._encoder.eval()
+            self._tag_transformer.eval()
             
             # Check tensor device
             if str(self._device) == 'mps':
@@ -134,18 +143,27 @@ class TableModel04_rs(BaseModel, nn.Module):
                     torch.mps.synchronize()
             
             enc_out_batch = self._encoder(imgs)  # [B, H, W, C]
-
-        # Now loop per image but reuse its encoded features
-        for i in range(batch_size):
-            img_i = imgs[i:i + 1]  # keep batch dim
-            enc_i = enc_out_batch[i:i + 1].contiguous()  # [1, H, W, C]
-            seq, outputs_class, outputs_coord = self._predict(
-                img_i, max_steps, k, return_attention,
-                precomputed_enc=enc_i
-            )
-            batch_results.append((seq, outputs_class, outputs_coord))
-
-        return batch_results
+            
+            # Use batched decoder if enabled and batch size > 1
+            if self._use_batched_decoder and batch_size > 1:
+                print(f"🚀 Using batched decoder for B={batch_size} tables")
+                return self._batched_decoder.predict_batched(enc_out_batch, max_steps)
+            else:
+                if batch_size > 1:
+                    print(f"⚠️ Sequential decoder for B={batch_size} tables (batched disabled)")
+                else:
+                    print(f"📊 Processing single table (B=1)")
+                # Fall back to sequential processing
+                batch_results = []
+                for i in range(batch_size):
+                    img_i = imgs[i:i + 1]  # keep batch dim
+                    enc_i = enc_out_batch[i:i + 1].contiguous()  # [1, H, W, C]
+                    seq, outputs_class, outputs_coord = self._predict(
+                        img_i, max_steps, k, return_attention,
+                        precomputed_enc=enc_i
+                    )
+                    batch_results.append((seq, outputs_class, outputs_coord))
+                return batch_results
 
     def _predict(
             self,
