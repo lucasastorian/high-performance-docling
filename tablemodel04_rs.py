@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 #
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -81,7 +82,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._dec_layers,
             self._enc_image_size,
             n_heads=self._n_heads,
-            use_sdpa=True,  # Enable SDPA optimization
+            use_sdpa=os.environ.get('USE_SDPA', '1') == '1',  # Toggle via USE_SDPA env var
         ).to(device)
 
         self._bbox_decoder = BBoxDecoder(
