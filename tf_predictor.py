@@ -944,33 +944,76 @@ class TFPredictor:
 
         return table_crop, scaled_bbox, scale_factor
 
+    # def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
+    #     """
+    #     Convert a list of OpenCV images to a single batch tensor on the right device.
+    #     """
+    #     if not images:
+    #         return torch.empty(
+    #             0, 3, self._config["dataset"]["resized_image"], self._config["dataset"]["resized_image"]
+    #         ).to(self._device)
+    #
+    #     normalize = T.Normalize(
+    #         mean=self._config["dataset"]["image_normalization"]["mean"],
+    #         std=self._config["dataset"]["image_normalization"]["std"],
+    #     )
+    #     resized_size = self._config["dataset"]["resized_image"]
+    #     resize = T.Resize([resized_size, resized_size])
+    #
+    #     batch = []
+    #     for img in images:
+    #         img, _ = normalize(img, None)
+    #         img, _ = resize(img, None)
+    #         img = img.transpose(2, 1, 0)  # (C, W, H)
+    #         img = torch.FloatTensor(img / 255.0)
+    #         batch.append(img)
+    #
+    #     batch_tensor = torch.stack(batch, dim=0).to(self._device)
+    #
+    #     return batch_tensor
+
     def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
         """
-        Convert a list of OpenCV images to a single batch tensor on the right device.
+        Vectorized batch prep: HWC uint8/float -> CHW float32 on self._device,
+        resized to (S, S), normalized, channels_last. No per-image Python loop.
         """
+        S = self._config["dataset"]["resized_image"]
+        mean = self._config["dataset"]["image_normalization"]["mean"]
+        std = self._config["dataset"]["image_normalization"]["std"]
+
         if not images:
-            return torch.empty(
-                0, 3, self._config["dataset"]["resized_image"], self._config["dataset"]["resized_image"]
-            ).to(self._device)
+            return torch.empty(0, 3, S, S, device=self._device)
 
-        normalize = T.Normalize(
-            mean=self._config["dataset"]["image_normalization"]["mean"],
-            std=self._config["dataset"]["image_normalization"]["std"],
-        )
-        resized_size = self._config["dataset"]["resized_image"]
-        resize = T.Resize([resized_size, resized_size])
+        # 1) Stack once on CPU (no copies if arrays are contiguous)
+        #    shape: [B, H, W, C]; dtype: usually uint8 from cv2
+        x_np = np.stack(images, axis=0)
+        x = torch.from_numpy(x_np)  # CPU
 
-        batch = []
-        for img in images:
-            img, _ = normalize(img, None)
-            img, _ = resize(img, None)
-            img = img.transpose(2, 1, 0)  # (C, W, H)
-            img = torch.FloatTensor(img / 255.0)
-            batch.append(img)
+        # 2) HWC -> CHW, keep channel order (BGR stays BGR)
+        x = x.permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
 
-        batch_tensor = torch.stack(batch, dim=0).to(self._device)
+        # 3) Move to device and cast
+        x = x.to(self._device, non_blocking=True)
+        if x.dtype != torch.float32:
+            x = x.to(torch.float32)
 
-        return batch_tensor
+        # 4) Scale to [0,1]
+        x = x.div_(255.0)
+
+        # 5) Normalize on the SAME scale the model expects
+        #    If config uses 0..255 means/std (e.g., 123.675), scale them down.
+        m = torch.tensor(mean, device=self._device, dtype=torch.float32).view(1, 3, 1, 1)
+        s = torch.tensor(std, device=self._device, dtype=torch.float32).view(1, 3, 1, 1)
+        if float(m.max()) > 2.5 or float(s.max()) > 2.5:  # heuristic: 0..255 stats
+            m = m / 255.0
+            s = s / 255.0
+        x = (x - m) / s
+
+        # 6) Resize as a single op (bilinear, align_corners=False matches your path)
+        x = torch.nn.functional.interpolate(x, size=(S, S), mode="bilinear", align_corners=False)
+
+        # 7) Layout hint for convs
+        return x.contiguous(memory_format=torch.channels_last)
 
     def _normalize_model_batch_outputs(self, model_result):
         """
