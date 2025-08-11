@@ -329,30 +329,79 @@ class TableStructureModel(BasePageModel):
 
     def _get_table_tokens(self, page: Page, table_cluster: Any):
         """Returns all the tokens for a table - optimized without deep copies"""
-        sx = sy = self.scale  # 2.0
+        sx = sy = self.scale  # e.g., 2.0
 
-        # Table bbox already scaled to TF coords upstream in your code
-        tbl_box = [
-            round(table_cluster.bbox.l) * sx,
-            round(table_cluster.bbox.t) * sy,
-            round(table_cluster.bbox.r) * sx,
-            round(table_cluster.bbox.b) * sy,
-        ]
-        bbox = BoundingBox(l=tbl_box[0], t=tbl_box[1], r=tbl_box[2], b=tbl_box[3])
-        idx = page.token_index.query_tokens_in_bbox(bbox_scaled_tl=bbox, ios=0.8)
-        toks = page.token_index._tokens_np[idx]
+        # Page height in *scaled* coordinates
+        assert page.size is not None
+        Hs = page.size.height * sy
 
-        # build the exact dicts your predictor expects
-        # (no text unless you truly need it; you can add a parallel string store later)
-        return [
-            {
+        # --- 1) Build TL bbox for query (index is TL) ---
+        # cluster.bbox is BL; convert BL -> TL after scaling:
+        # BL (l,t,r,b) scaled: (l*s, t*s, r*s, b*s)
+        # TL.y = Hs - BL.y
+        bl_l = round(table_cluster.bbox.l) * sx
+        bl_t = round(table_cluster.bbox.t) * sy
+        bl_r = round(table_cluster.bbox.r) * sx
+        bl_b = round(table_cluster.bbox.b) * sy
+
+        tl_l = bl_l
+        tl_t = Hs - bl_b
+        tl_r = bl_r
+        tl_b = Hs - bl_t
+
+        from docling_core.types.doc import BoundingBox
+        tl_bbox = BoundingBox(l=tl_l, t=tl_t, r=tl_r, b=tl_b)
+        idx = page.token_index.query_tokens_in_bbox(bbox_scaled_tl=tl_bbox, ios=0.8)
+        if idx.size == 0:
+            return []  # avoid later 1-D empty array crashes downstream
+
+        toks = page.token_index._tokens_np[idx]  # TL coords stored in index
+
+        # --- 3) Convert tokens back to BL for downstream matcher ---
+        # TL->BL: bl_t = Hs - tl_b ; bl_b = Hs - tl_t
+        out = []
+        for t in toks:
+            tl_l_i = float(t['l']);
+            tl_t_i = float(t['t'])
+            tl_r_i = float(t['r']);
+            tl_b_i = float(t['b'])
+            out.append({
                 "id": int(t['id']),
-                "text": "",  # optional: attach later if needed
-                "bbox": {"l": float(t['l']), "t": float(t['t']),
-                         "r": float(t['r']), "b": float(t['b'])}
-            }
-            for t in toks
-        ]
+                "text": "",  # keep empty; attach later if needed
+                "bbox": {
+                    "l": tl_l_i,
+                    "t": Hs - tl_b_i,
+                    "r": tl_r_i,
+                    "b": Hs - tl_t_i,
+                },
+            })
+        return out
+
+        # sx = sy = self.scale  # 2.0
+        #
+        # # Table bbox already scaled to TF coords upstream in your code
+        # tbl_box = [
+        #     round(table_cluster.bbox.l) * sx,
+        #     round(table_cluster.bbox.t) * sy,
+        #     round(table_cluster.bbox.r) * sx,
+        #     round(table_cluster.bbox.b) * sy,
+        # ]
+        #
+        # bbox = BoundingBox(l=tbl_box[0], t=tbl_box[1], r=tbl_box[2], b=tbl_box[3])
+        # idx = page.token_index.query_tokens_in_bbox(bbox_scaled_tl=bbox, ios=0.8)
+        # toks = page.token_index._tokens_np[idx]
+        #
+        # # build the exact dicts your predictor expects
+        # # (no text unless you truly need it; you can add a parallel string store later)
+        # return [
+        #     {
+        #         "id": int(t['id']),
+        #         "text": "",  # optional: attach later if needed
+        #         "bbox": {"l": float(t['l']), "t": float(t['t']),
+        #                  "r": float(t['r']), "b": float(t['b'])}
+        #     }
+        #     for t in toks
+        # ]
 
         # sp = page._backend.get_segmented_page()
         # sp = page.parsed_page
@@ -392,7 +441,7 @@ class TableStructureModel(BasePageModel):
         #         }
         #     )
 
-        return tokens
+        # return tokens
 
     # def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
     #     timer = get_timing_collector()
