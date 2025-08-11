@@ -153,11 +153,8 @@ class CellMatcher:
         matches = {}
         matches_counter = 0
         if len(pdf_cells) > 0:
-            # Pass the page object and table_bbox to enable the fast index path
-            # The page object may be stored in iocr_page if available
-            page_obj = iocr_page.get("page", None)
             matches, matches_counter = self._intersection_over_pdf_match(
-                table_cells, pdf_cells, page=page_obj, table_bbox=table_bbox
+                table_cells, pdf_cells
             )
 
         self._log().debug("matches_counter: {}".format(matches_counter))
