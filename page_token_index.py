@@ -96,8 +96,9 @@ class PageTokenIndex:
         """
         Return candidate token indices by union of grid cells intersecting bbox.
         """
-        if self._grid_keys is None or self._grid_indptr is None or self._grid_postings is None:
-            # no grid → all tokens
+        if (self._grid_keys is None or self._grid_indptr is None or
+                self._grid_postings is None or self._tokens_np is None):
+            # No grid -> all tokens
             return np.arange(self._tokens_np.shape[0], dtype=np.int32)
 
         G = self._grid_cell
@@ -106,35 +107,60 @@ class PageTokenIndex:
         gx1 = int(rb // G)
         gy1 = int(bb // G)
 
-        # build the set of (gx,gy) covered
-        wanted = np.array([(gx, gy) for gx in range(gx0, gx1 + 1) for gy in range(gy0, gy1 + 1)], dtype=np.int32)
+        if gx1 < gx0 or gy1 < gy0:
+            return np.empty((0,), dtype=np.int32)
+
+        # Build the set of (gx,gy) covered
+        wanted = np.array([(gx, gy)
+                           for gx in range(gx0, gx1 + 1)
+                           for gy in range(gy0, gy1 + 1)],
+                          dtype=np.int32)
         if wanted.size == 0:
             return np.empty((0,), dtype=np.int32)
 
-        # find matches of wanted in self._grid_keys
-        # binary search by composing a single 64-bit key
-        pack = lambda a: (a[:, 0].astype(np.int64) << 32) ^ (a[:, 1].astype(np.int64) & 0xffffffff)
-        K = pack(self._grid_keys)
-        W = pack(wanted)
-        # for each wanted key, find it in K
-        # since K is sorted lex by construction, sort K if needed (it already is)
+        # Pack keys to 64-bit for a single searchsorted domain
+        def pack(a: np.ndarray) -> np.ndarray:
+            # a: (..., 2) int32, assumed non-negative
+            return (a[:, 0].astype(np.int64) << 32) | (a[:, 1].astype(np.int64) & 0xffffffff)
+
+        K = pack(self._grid_keys)  # sorted by construction
+        W = pack(wanted)  # not necessarily sorted, but we don’t need it sorted
+
+        # For each wanted key, find insertion position in K
         pos = np.searchsorted(K, W)
-        hits_mask = (pos < K.size) & (K[pos] == W)
-        pos = pos[hits_mask]
-        if pos.size == 0:
+
+        # IMPORTANT: mask out out-of-range BEFORE indexing K[pos]
+        in_bounds = (pos < K.size)
+        if not in_bounds.any():
             return np.empty((0,), dtype=np.int32)
 
-        # gather postings
-        starts = self._grid_indptr[pos]
-        ends = self._grid_indptr[pos + 1]
+        pos_ib = pos[in_bounds]
+        W_ib = W[in_bounds]
+
+        # Now safe to compare
+        is_hit = (K[pos_ib] == W_ib)
+        if not is_hit.any():
+            return np.empty((0,), dtype=np.int32)
+
+        hit_pos = pos_ib[is_hit]
+
+        starts = self._grid_indptr[hit_pos]
+        ends = self._grid_indptr[hit_pos + 1]
+
         total = int(np.sum(ends - starts))
+        if total == 0:
+            return np.empty((0,), dtype=np.int32)
+
         out = np.empty((total,), dtype=np.int32)
         off = 0
         for s, e in zip(starts, ends):
             n = e - s
             out[off:off + n] = self._grid_postings[s:e]
             off += n
-        # unique to dedup candidates from multiple cells
+
+        # Deduplicate in case bbox covers multiple grid cells that share tokens
+        if out.size <= 1:
+            return out
         return np.unique(out)
 
     def query_tokens_in_bbox(self, bbox_scaled_tl: BoundingBox, ios: float = 0.8) -> np.ndarray:

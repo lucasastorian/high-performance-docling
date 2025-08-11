@@ -5,7 +5,7 @@ from typing import Optional, Dict, List
 
 from docling_core.types.doc import TextCell, BoundingBox
 from docling.datamodel.base_models import Size, ConfigDict, SegmentedPdfPage, PagePredictions, AssembledUnit
-from token_index import PageTokenIndex
+from page_token_index import PageTokenIndex
 
 
 class Page(BaseModel):
