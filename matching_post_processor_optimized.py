@@ -518,112 +518,107 @@ class MatchingPostProcessor:
         return clean_table_cells
 
     def _deduplicate_cells(self, tab_columns, table_cells, iou_matches, ioc_matches):
-        r"""
-        7. step - OPTIMIZED
-        
-        De-duplicate columns using vectorized operations and proper global duplicate detection.
-        Now detects non-adjacent duplicates that the original missed.
-
-        Parameters
-        ----------
-        tab_columns : integer
-            Number of table columns
-        table_cells : list of dict
-        iou_matches : dictionary of lists of table_cells
-        ioc_matches : dictionary of lists of table_cells
-
-        Returns
-        -------
-        new_table_cells, new_matches, new_tab_columns
         """
-        # Build column->table_cell mapping efficiently 
-        col_to_tcells = [[] for _ in range(tab_columns)]
-        for cell in table_cells:
-            col_to_tcells[cell["column_id"]].append(cell["cell_id"])
-        
-        # Convert to sets for fast membership
-        col_tcell_sets = [set(tcells) for tcells in col_to_tcells]
-        
-        # Compute scores and PDF cells per column vectorized
-        pdf_cells_in_columns = []
-        total_score_in_columns = []
-        
-        for col in range(tab_columns):
-            column_table_cells = col_tcell_sets[col]
-            column_pdf_cells = set()
-            column_total_score = 0
-            
-            # Process IOU matches
-            for pdf_id, match_list in iou_matches.items():
-                for match in match_list:
-                    if match["table_cell_id"] in column_table_cells:
-                        score = match.get("iou") or match.get("iopdf", 0)
-                        column_total_score += score
-                        column_pdf_cells.add(pdf_id)
-            
-            # Process IOC matches  
-            for pdf_id, match_list in ioc_matches.items():
-                for match in match_list:
-                    if match["table_cell_id"] in column_table_cells:
-                        column_total_score += match["iopdf"]
-                        column_pdf_cells.add(pdf_id)
-            
-            pdf_cells_in_columns.append(column_pdf_cells)
-            total_score_in_columns.append(column_total_score)
-            
-            if self._log().isEnabledFor(logging.DEBUG):
-                self._log().debug(f"Column: {col}, Score: {column_total_score}, PDF cells: {len(column_pdf_cells)}")
-        
-        # Global duplicate detection using vectorized set operations
-        cols_to_eliminate = set()
-        
-        # Compare ALL column pairs, not just adjacent
-        for i in range(tab_columns):
-            for j in range(i + 1, tab_columns):
-                if i in cols_to_eliminate or j in cols_to_eliminate:
-                    continue
-                    
-                col_a_cells = pdf_cells_in_columns[i]
-                col_b_cells = pdf_cells_in_columns[j]
-                score_a = total_score_in_columns[i]
-                score_b = total_score_in_columns[j]
-                
-                if not col_a_cells:  # Empty column
-                    continue
-                    
-                # Vectorized intersection
-                intersection = col_a_cells & col_b_cells
-                overlap_pct = len(intersection) / len(col_a_cells)
-                
-                if self._log().isEnabledFor(logging.DEBUG):
-                    self._log().debug(f"Col {i} vs {j}: overlap={overlap_pct:.2f}, scores={score_a:.2f} vs {score_b:.2f}")
-                
-                # 60% overlap threshold for duplicate detection
-                if overlap_pct > 0.6:
-                    if score_a >= score_b:
-                        cols_to_eliminate.add(j)
+        De-duplicate structural columns using a single pass over matches (O(M)),
+        global duplicate detection, and proper column reindexing.
+        Returns: new_table_cells, new_matches (IOC-based), new_tab_columns
+        """
+        # 0) Maps
+        cell2col = {c["cell_id"]: c["column_id"] for c in table_cells}
+
+        # 1) Accumulate per-column scores and pdf hit-sets in ONE pass
+        pdf_sets = [set() for _ in range(tab_columns)]
+        col_score = [0.0] * tab_columns
+
+        def acc(matches, is_iou):
+            for pdf_id, mlist in matches.items():
+                for m in mlist:
+                    cid = m["table_cell_id"]
+                    col = cell2col.get(cid)
+                    if col is None or col >= tab_columns:
+                        continue
+                    if is_iou:
+                        s = m.get("iou", m.get("iopdf", 0.0))
                     else:
-                        cols_to_eliminate.add(i)
-        
-        cols_to_eliminate = list(cols_to_eliminate)
-        self._log().debug(f"Columns to eliminate: {cols_to_eliminate}")
-        
-        # Build removal set efficiently
-        removed_table_cell_ids = set()
-        for col_del in cols_to_eliminate:
-            removed_table_cell_ids.update(col_to_tcells[col_del])
-        
-        # Filter table cells and matches
-        new_table_cells = [cell for cell in table_cells if cell["cell_id"] not in removed_table_cell_ids]
-        
+                        s = m.get("iopdf", 0.0)
+                    col_score[col] += float(s)
+                    pdf_sets[col].add(pdf_id)
+
+        acc(iou_matches, True)
+        acc(ioc_matches, False)
+
+        # 2) Group identical pdf-sets first (cheap win)
+        from collections import defaultdict
+        group = defaultdict(list)
+        for col, s in enumerate(pdf_sets):
+            group[frozenset(s)].append(col)
+
+        to_eliminate = set()
+        for cols in group.values():
+            if len(cols) > 1:
+                # keep the highest score; kill the rest
+                keep = max(cols, key=lambda c: col_score[c])
+                for c in cols:
+                    if c != keep:
+                        to_eliminate.add(c)
+
+        # 3) Compare near-duplicates across different sets (global)
+        # Use Jaccard; fall back to containment if you prefer.
+        def jacc(a, b):
+            if not a and not b:  # both empty -> identical
+                return 1.0
+            inter = len(a & b)
+            union = len(a | b)
+            return inter / union if union else 0.0
+
+        THRESH = self._config.get("dup_col_jaccard", 0.6)
+        C = tab_columns
+        for i in range(C):
+            if i in to_eliminate:
+                continue
+            for j in range(i + 1, C):
+                if j in to_eliminate:
+                    continue
+                sim = jacc(pdf_sets[i], pdf_sets[j])
+                if sim >= THRESH:
+                    # eliminate the lower-score column; tie → keep lower index
+                    if (col_score[i], -i) >= (col_score[j], -j):
+                        to_eliminate.add(j)
+                    else:
+                        to_eliminate.add(i)
+                        break  # i is gone; stop comparing it
+
+        # 4) Build remap for surviving columns → 0..K-1
+        survivors = [c for c in range(C) if c not in to_eliminate]
+        col_remap = {old: new for new, old in enumerate(survivors)}
+
+        # 5) Filter table cells and reindex column_id
+        removed_cell_ids = set()
+        for oldcol in to_eliminate:
+            removed_cell_ids.update([c["cell_id"] for c in table_cells if c["column_id"] == oldcol])
+
+        new_table_cells = []
+        for c in table_cells:
+            oldcol = c["column_id"]
+            if oldcol in to_eliminate:
+                continue
+            nc = dict(c)
+            nc["column_id"] = col_remap[oldcol]
+            new_table_cells.append(nc)
+
+        # 6) Filter IOC matches (these feed your final assignment)
         new_matches = {}
-        for pdf_cell_id, pdf_cell_matches in ioc_matches.items():
-            new_cell_match = [match for match in pdf_cell_matches 
-                             if match["table_cell_id"] not in removed_table_cell_ids]
-            if new_cell_match:
-                new_matches[pdf_cell_id] = new_cell_match
-        
-        new_tab_columns = tab_columns - len(cols_to_eliminate)
+        for pdf_id, mlist in ioc_matches.items():
+            fl = []
+            for m in mlist:
+                cid = m["table_cell_id"]
+                if cid in removed_cell_ids:
+                    continue
+                fl.append(m)
+            if fl:
+                new_matches[pdf_id] = fl
+
+        new_tab_columns = len(survivors)
         return new_table_cells, new_matches, new_tab_columns
 
     def _do_final_asignment(self, table_cells, iou_matches, ioc_matches):
@@ -713,12 +708,15 @@ class MatchingPostProcessor:
         orphan_ids = pdf_ids[orphan_mask]
         orphan_bboxes = pdf_bboxes[orphan_mask]
         
-        # Process rows efficiently
+        # Process rows efficiently using precomputed by_row index
+        by_col, by_row, cell_classes = self._build_lookup_structures(table_cells)
+        
         row_assignments = {}
         for row_idx in range(tab_rows):
-            # Get row cells efficiently
-            row_cells = [c for c in table_cells if c["row_id"] == row_idx 
-                        and "rowspan_val" not in c and c.get("cell_class", 0) > 1]
+            # Get row cells efficiently using index
+            row_indices = by_row[row_idx] if row_idx < len(by_row) else []
+            row_cells = [table_cells[i] for i in row_indices 
+                        if "rowspan_val" not in table_cells[i] and cell_classes[i] > 1]
             
             if not row_cells:
                 continue
@@ -748,12 +746,13 @@ class MatchingPostProcessor:
                     if oid not in row_assignments or distances[i] < row_assignments[oid][1]:
                         row_assignments[oid] = (row_idx, distances[i])
         
-        # Process columns efficiently  
+        # Process columns efficiently using precomputed by_col index
         col_assignments = {}
         for col_idx in range(tab_cols):
-            # Get column cells efficiently
-            col_cells = [c for c in table_cells if c["column_id"] == col_idx
-                        and "colspan_val" not in c and c.get("cell_class", 0) > 1]
+            # Get column cells efficiently using index
+            col_indices = by_col[col_idx] if col_idx < len(by_col) else []
+            col_cells = [table_cells[i] for i in col_indices
+                        if "colspan_val" not in table_cells[i] and cell_classes[i] > 1]
             
             if not col_cells:
                 continue
@@ -832,6 +831,26 @@ class MatchingPostProcessor:
         # Simpler list comprehension
         return [c for c in pdf_cells if c["text"]]
 
+    def _build_lookup_structures(self, table_cells):
+        """Build reusable lookup structures to avoid repeated Python loops."""
+        # Index cells by column and row for fast access
+        by_col = [[] for _ in range(max((c["column_id"] for c in table_cells), default=-1) + 1)]
+        by_row = [[] for _ in range(max((c["row_id"] for c in table_cells), default=-1) + 1)]
+        
+        for i, cell in enumerate(table_cells):
+            by_col[cell["column_id"]].append(i)  # Store indices, not cell copies
+            by_row[cell["row_id"]].append(i)
+            
+        # Precompute cell class array for fast access
+        cell_classes = np.array([cell.get("cell_class", 0) for cell in table_cells], dtype=np.int16)
+        # Handle mixed string/int types
+        for i, cell in enumerate(table_cells):
+            cc = cell.get("cell_class", 0)
+            if isinstance(cc, str):
+                cell_classes[i] = int(cc)
+        
+        return by_col, by_row, cell_classes
+
     def process(self, matching_details, correct_overlapping_cells=False):
         r"""
         Do post processing, see details in the comments below
@@ -858,6 +877,9 @@ class MatchingPostProcessor:
         for k, v in raw_matches.items():
             key = int(k) if isinstance(k, str) else k
             matches[key] = v
+            
+        # Build lookup structures once
+        by_col, by_row, cell_classes = self._build_lookup_structures(table_cells)
 
         # ------------------------------------------------------------------------------------------
         # -1. If initial (IOU) matches are empty,
@@ -880,11 +902,8 @@ class MatchingPostProcessor:
         # ------------------------------------------------------------------------------------------
         # 0. Get minimal grid table dimension (cols/rows)
         tab_columns, tab_rows, max_cell_id = self._get_table_dimension(table_cells)
-        self._log().debug(
-            "COLS {}/ ROWS {}/ MAX CELL ID {}".format(
-                tab_columns, tab_rows, max_cell_id
-            )
-        )
+        if self._log().isEnabledFor(logging.DEBUG):
+            self._log().debug(f"COLS {tab_columns}/ ROWS {tab_rows}/ MAX CELL ID {max_cell_id}")
 
         good_table_cells = []
         bad_table_cells = []
@@ -896,17 +915,15 @@ class MatchingPostProcessor:
             g1, g2 = self._get_good_bad_cells_in_column(table_cells, col, matches)
             good_table_cells = g1
             bad_table_cells = g2
-            self._log().debug(
-                "COLUMN {}, Good table cells: {}".format(col, len(good_table_cells))
-            )
-            self._log().debug(
-                "COLUMN {}, Bad table cells: {}".format(col, len(bad_table_cells))
-            )
+            
+            if self._log().isEnabledFor(logging.DEBUG):
+                self._log().debug(f"COLUMN {col}, Good table cells: {len(good_table_cells)}")
+                self._log().debug(f"COLUMN {col}, Bad table cells: {len(bad_table_cells)}")
 
             # 2. Find alignment of good IOU cells per column
             alignment = self._find_alignment_in_column(good_table_cells)
-            self._log().debug("COLUMN {}, Alignment: {}".format(col, alignment))
-            # alignment = "left"
+            if self._log().isEnabledFor(logging.DEBUG):
+                self._log().debug(f"COLUMN {col}, Alignment: {alignment}")
 
             # 3. Get median (according to alignment) "bbox left/middle/right X"
             #    coordinate for good IOU cells, get median* cell size in a column.
@@ -915,7 +932,8 @@ class MatchingPostProcessor:
             # median_y = gm2
             median_width = gm3
             median_height = gm4
-            self._log().debug("Median good X = {}".format(median_x))
+            if self._log().isEnabledFor(logging.DEBUG):
+                self._log().debug(f"Median good X = {median_x}")
 
             # 4. Move bad cells to the median* (left/middle/right) good in a column
             # nc = self._move_cells_to_left_pos(bad_table_cells, median_x, True,
@@ -948,7 +966,8 @@ class MatchingPostProcessor:
         dedupl_table_cells = dd1
         dedupl_matches = dd2
 
-        self._log().debug("...")
+        if self._log().isEnabledFor(logging.DEBUG):
+            self._log().debug("Deduplication complete...")
 
         # 8. Do final assignment of table bbox to pdf cell based on saved scores,
         # preferring IOU over PDF Intersection, and higher Intersection over lower
