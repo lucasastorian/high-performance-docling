@@ -170,7 +170,7 @@ class TableStructureModel(BasePageModel):
     def __call__(self, conv_res: ConversionResult, page_batch: Iterable[Page]) -> Iterable[Page]:
         import time
         from table_timing_debug import get_timing_collector
-        
+
         t_full_start = time.perf_counter()
         timer = get_timing_collector()
 
@@ -214,7 +214,7 @@ class TableStructureModel(BasePageModel):
                     timer.start("prep_inputs:gather_tokens")
                     seen_ids = set()
                     aggregated_tokens = []
-                    
+
                     for table_cluster, tbl_box in in_tables:
                         table_tokens = self._get_table_tokens(page, table_cluster)
                         for tok in table_tokens:
@@ -242,7 +242,7 @@ class TableStructureModel(BasePageModel):
                     "image": page.get_image_np(scale=self.scale),
                 }
                 timer.end("prep_inputs:image_np")
-                
+
                 # Only add tokens if matching
                 if self.do_cell_matching:
                     page_input["tokens"] = aggregated_tokens
@@ -251,7 +251,7 @@ class TableStructureModel(BasePageModel):
                 table_bboxes_list.append(page_table_bboxes)
                 page_clusters_list.append(page_clusters)
                 batched_page_indexes.append(page_idx)
-        
+
         timer.end("prep_inputs")
 
         # If there is nothing to run, just yield the originals
@@ -288,7 +288,7 @@ class TableStructureModel(BasePageModel):
             for output, table_cluster in zip(page_outputs, clusters):
                 table = self._process_table_output(page, table_cluster, output)
                 page.predictions.tablestructure.table_map[table_cluster.id] = table
-        
+
         timer.end("assign_outputs")
 
         # Optional debug viz
@@ -329,47 +329,49 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page, table_cluster, ios=0.8):
-        # Ensure tokens are prebuilt
-        toks = page.tokens_np
-        if toks is None or toks.size == 0:
-            return []
+        bbox = table_cluster.bbox.to_top_left_origin(page.word_index.page_height)
+        return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
 
-        # Table bbox → TOP-LEFT origin (unscaled)
-        H = float(page.size.height)
-        tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H)
-        lb, tb, rb, bb = tbl_tl.l, tbl_tl.t, tbl_tl.r, tbl_tl.b
-
-        # Vectorized IOS filter
-        L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
-        inter_w = np.maximum(0.0, np.minimum(R, rb) - np.maximum(L, lb))
-        inter_h = np.maximum(0.0, np.minimum(B, bb) - np.maximum(T, tb))
-        inter = inter_w * inter_h
-        area = (R - L) * (B - T)
-        keep = inter >= (ios * area)
-
-        if not np.any(keep):
-            return []
-
-        idx = np.nonzero(keep)[0]
-        sel = toks[idx]
-
-        # Package for TF: scale now (cheap, one pass)
-        s = float(self.scale)
-        return [
-            {
-                "id": int(t['id']),
-                "text": "",  # keep light; attach later only if needed
-                "bbox": {
-                    "l": float(t['l'] * s),
-                    "t": float(t['t'] * s),
-                    "r": float(t['r'] * s),
-                    "b": float(t['b'] * s),
-                },
-            }
-            for t in sel
-        ]
-
-        # sp = page._backend.get_segmented_page()
+        # # Ensure tokens are prebuilt
+        # toks = page.tokens_np
+        # if toks is None or toks.size == 0:
+        #     return []
+        #
+        # # Table bbox → TOP-LEFT origin (unscaled)
+        # H = float(page.size.height)
+        # tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H)
+        # lb, tb, rb, bb = tbl_tl.l, tbl_tl.t, tbl_tl.r, tbl_tl.b
+        #
+        # # Vectorized IOS filter
+        # L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
+        # inter_w = np.maximum(0.0, np.minimum(R, rb) - np.maximum(L, lb))
+        # inter_h = np.maximum(0.0, np.minimum(B, bb) - np.maximum(T, tb))
+        # inter = inter_w * inter_h
+        # area = (R - L) * (B - T)
+        # keep = inter >= (ios * area)
+        #
+        # if not np.any(keep):
+        #     return []
+        #
+        # idx = np.nonzero(keep)[0]
+        # sel = toks[idx]
+        #
+        # # Package for TF: scale now (cheap, one pass)
+        # s = float(self.scale)
+        # return [
+        #     {
+        #         "id": int(t['id']),
+        #         "text": "",  # keep light; attach later only if needed
+        #         "bbox": {
+        #             "l": float(t['l'] * s),
+        #             "t": float(t['t'] * s),
+        #             "r": float(t['r'] * s),
+        #             "b": float(t['b'] * s),
+        #         },
+        #     }
+        #     for t in sel
+        # ]
+        #
         # sp = page.parsed_page
         # if sp is not None:
         #     tcells = sp.get_cells_in_bbox(
@@ -406,7 +408,7 @@ class TableStructureModel(BasePageModel):
         #             },
         #         }
         #     )
-
+        #
         # return tokens
 
     # def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
