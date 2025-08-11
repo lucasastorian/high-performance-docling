@@ -1,4 +1,5 @@
 import warnings
+import numpy as np
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, Any, Dict
@@ -328,47 +329,53 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page: Page, table_cluster):
-        """
-        Fast gather for TF preprocessing.
-        Returns list of {"id","text","bbox":{l,t,r,b}} in **TF coords, TL origin**, same as before.
-        """
-        idx = page.token_index  # built once per page
+        assert page.tokens_np is not None
+        toks = page.tokens_np
         sx = sy = self.scale
+        ios_thresh = 0.8
 
-        # table_cluster.bbox is page coords (TOP-LEFT origin) in *unscaled* units in your pipeline.
-        # Your original code multiplied by sx/sy. Keep exactly the same contract:
+        # Table bbox to TOP-LEFT, UNscaled
         tbl = table_cluster.bbox
-        l = tbl.l * sx;
-        t = tbl.t * sy;
-        r = tbl.r * sx;
-        b = tbl.b * sy
+        if getattr(tbl, "coord_origin", None) and tbl.coord_origin.name == "BOTTOMLEFT":
+            tbl = tbl.to_top_left_origin(page_height=page.size.height)
 
-        token_ids = idx.query_tokens_ios((l, t, r, b), ios=0.0)  # or ios=0.8 if you want tighter sets
-        if token_ids.size == 0:
+        lb, tb, rb, bb = float(tbl.l), float(tbl.t), float(tbl.r), float(tbl.b)
+
+        # 1) Fast AABB overlap mask (cheap comparisons)
+        L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
+        aabb = (R > lb) & (L < rb) & (B > tb) & (T < bb)
+        if not np.any(aabb):
             return []
 
-        toks = idx._tokens[token_ids]
-        texts = idx._texts
+        cand = toks[aabb]
+        Lc, Tc, Rc, Bc = cand['l'], cand['t'], cand['r'], cand['b']
 
-        # Build output without extra conversions
-        out = []
-        # Only include non-empty text (matches your original behavior)
-        for i, ti in enumerate(token_ids):
-            txt = texts[int(ti)]
-            if not txt:
-                continue
-            t = toks[i]
-            out.append({
+        # 2) Vectorized intersection-over-self
+        inter_w = np.maximum(0.0, np.minimum(Rc, rb) - np.maximum(Lc, lb))
+        inter_h = np.maximum(0.0, np.minimum(Bc, bb) - np.maximum(Tc, tb))
+        inter = inter_w * inter_h
+        area = (Rc - Lc) * (Bc - Tc)
+        keep = inter >= (ios_thresh * area)
+
+        if not np.any(keep):
+            return []
+
+        sel = cand[keep]
+
+        # 3) Build minimal dicts, scaled as before
+        return [
+            {
                 "id": int(t['id']),
-                "text": txt,
+                "text": "",  # fill later if needed
                 "bbox": {
-                    "l": float(t['l']),
-                    "t": float(t['t']),
-                    "r": float(t['r']),
-                    "b": float(t['b']),
-                }
-            })
-        return out
+                    "l": float(t['l'] * sx),
+                    "t": float(t['t'] * sy),
+                    "r": float(t['r'] * sx),
+                    "b": float(t['b'] * sy),
+                },
+            }
+            for t in sel
+        ]
 
         # sp = page._backend.get_segmented_page()
         # sp = page.parsed_page

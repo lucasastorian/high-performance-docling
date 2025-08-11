@@ -4,8 +4,10 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 
 from docling_core.types.doc import TextCell, BoundingBox
+from docling_core.types.doc.page import TextCellUnit
 from docling.datamodel.base_models import Size, ConfigDict, SegmentedPdfPage, PagePredictions, AssembledUnit
-from page_token_index import PageTokenIndex
+
+TOK_DTYPE = np.dtype([('id','i4'),('l','f4'),('t','f4'),('r','f4'),('b','f4')])
 
 
 class Page(BaseModel):
@@ -27,11 +29,13 @@ class Page(BaseModel):
     ] = {}  # Cache of images in different scales. By default it is cleared during assembling.
     _np_image_cache: dict[float, np.ndarray] = {}
 
-    token_index: Optional[PageTokenIndex] = None
+    tokens_np: np.array = None
 
-    def build_token_index(self):
-        self.token_index = PageTokenIndex(scale=2.0, page_height=self.size.height, page_width=self.size.width)
-        self.token_index.build(self.parsed_page, grid_cell=256)
+    # token_index: Optional[PageTokenIndex] = None
+    #
+    # def build_token_index(self):
+    #     self.token_index = PageTokenIndex(scale=2.0, page_height=self.size.height, page_width=self.size.width)
+    #     self.token_index.build(self.parsed_page, grid_cell=256)
 
     @property
     def cells(self) -> List[TextCell]:
@@ -85,3 +89,27 @@ class Page(BaseModel):
     @property
     def image(self) -> Optional[Image]:
         return self.get_image(scale=self._default_image_scale)
+
+
+def build_tokens_np(parsed_page, page_height: float):
+    # Prefer WORD cells; fallback to textline if empty
+    cells = parsed_page.get_cells_in_bbox(
+        cell_unit=TextCellUnit.WORD,
+        bbox=parsed_page.page_size.to_bounding_box(),  # full page
+        ios=0.0
+    ) or parsed_page.textline_cells
+
+    out = np.empty(len(cells), dtype=TOK_DTYPE)
+    k = 0
+    for c in cells:
+        text = c.text.strip()
+        if not text:
+            continue
+        bb = c.rect.to_top_left_origin(page_height=page_height).to_bounding_box()
+        out[k]['id'] = int(getattr(c, 'index', k))
+        out[k]['l']  = bb.l
+        out[k]['t']  = bb.t
+        out[k]['r']  = bb.r
+        out[k]['b']  = bb.b
+        k += 1
+    return np.ascontiguousarray(out[:k])

@@ -2,7 +2,7 @@ from typing import List
 from docling.datamodel.document import InputDocument
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 
-from page_model import Page
+from page_model import Page, build_tokens_np
 
 
 class LambdaPreprocessor:
@@ -34,7 +34,8 @@ class LambdaPreprocessor:
             _ = page.get_image_np(scale=self.images_scale)
 
             # Build the token index
-            page.build_token_index()
+            # page.build_token_index()
+            page.tokens_np = build_tokens_np(page.parsed_page, page.size.height)
 
             pages.append(page)
 
