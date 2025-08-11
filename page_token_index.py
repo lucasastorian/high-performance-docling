@@ -1,6 +1,7 @@
 # token_index_tf.py
 from dataclasses import dataclass
 import numpy as np
+from docling_core.types.doc import BoundingBox
 
 # (id, l,t,r,b) in **TF space** (scaled, top-left)
 TOK_DTYPE = np.dtype([
@@ -35,11 +36,18 @@ class PageTokenIndex:
         sx = sy = float(self.scale)
         H = float(self.page_height)
 
+        full_page_bbox = BoundingBox(
+            l=0.0, t=0.0, r=self.page_width, b=self.page_height  # TOP-LEFT origin
+        )
+
         cells = parsed_page.get_cells_in_bbox(
             cell_unit=TextCellUnit.WORD,
-            bbox=parsed_page.page_bbox,  # full page
+            bbox=full_page_bbox,
             ios=0.0,
-        ) or parsed_page.textline_cells
+        )
+
+        if not cells:
+            cells = parsed_page.textline_cells
 
         N = max(1024, len(cells))
         toks = np.empty(N, dtype=TOK_DTYPE)
