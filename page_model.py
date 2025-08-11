@@ -3,6 +3,7 @@ from PIL import Image
 from pydantic import BaseModel
 from typing import Optional, Dict, List
 
+from docling_core.types.doc import CoordOrigin
 from docling_core.types.doc import TextCell, BoundingBox
 from docling_core.types.doc.page import TextCellUnit
 from docling.datamodel.base_models import Size, ConfigDict, SegmentedPdfPage, PagePredictions, AssembledUnit
@@ -91,25 +92,46 @@ class Page(BaseModel):
         return self.get_image(scale=self._default_image_scale)
 
 
-def build_tokens_np(parsed_page, page_height: float):
-    # Prefer WORD cells; fallback to textline if empty
-    cells = parsed_page.get_cells_in_bbox(
-        cell_unit=TextCellUnit.WORD,
-        bbox=parsed_page.page_size.to_bounding_box(),  # full page
-        ios=0.0
-    ) or parsed_page.textline_cells
+def build_tokens_np(parsed_page, page_size) -> np.ndarray:
+    """
+    Build a page-wide tokens array in TOP-LEFT origin, UNscaled.
+    Works whether SegmentedPdfPage exposes get_cells() or only get_cells_in_bbox().
+    """
+    # 1) Fetch WORD cells page-wide
+    try:
+        # Newer API
+        cells = parsed_page.get_cells(cell_unit=TextCellUnit.WORD)
+    except TypeError:
+        # Older API expects a bbox
+        full = BoundingBox(
+            l=0.0, b=0.0, r=float(page_size.width), t=float(page_size.height),
+            coord_origin=CoordOrigin.BOTTOMLEFT
+        )
+        cells = parsed_page.get_cells_in_bbox(
+            cell_unit=TextCellUnit.WORD,
+            bbox=full,
+            ios=0.0
+        )
 
-    out = np.empty(len(cells), dtype=TOK_DTYPE)
+    if not cells:
+        # Fallback to textlines if WORDS are empty
+        cells = getattr(parsed_page, "textline_cells", [])
+
+    # 2) Pack into a compact NumPy struct
+    out = np.empty(max(1, len(cells)), dtype=TOK_DTYPE)
     k = 0
+    H = float(page_size.height)
+
     for c in cells:
-        text = c.text.strip()
+        text = (c.text or "").strip()
         if not text:
             continue
-        bb = c.rect.to_top_left_origin(page_height=page_height).to_bounding_box()
+        bb_tl = c.rect.to_top_left_origin(page_height=H).to_bounding_box()
         out[k]['id'] = int(getattr(c, 'index', k))
-        out[k]['l']  = bb.l
-        out[k]['t']  = bb.t
-        out[k]['r']  = bb.r
-        out[k]['b']  = bb.b
+        out[k]['l']  = float(bb_tl.l)
+        out[k]['t']  = float(bb_tl.t)
+        out[k]['r']  = float(bb_tl.r)
+        out[k]['b']  = float(bb_tl.b)
         k += 1
+
     return np.ascontiguousarray(out[:k])
