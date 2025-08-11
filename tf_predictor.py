@@ -993,52 +993,58 @@ class TFPredictor:
 
     def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
         """
-        Full-GPU batch prep with semantics equivalent to:
-          x = F.normalize(img, mean, std)  # (img - 255*mean)/std  in 0..255
-          x = cv2.resize(x, (S,S), INTER_LINEAR)
-          x = x.transpose(2,1,0)           # (C, W, H)
-          x = x / 255.0
-        which is identical to: ((img/255) - mean) / std, then resize, then (C,W,H).
+        Vectorized GPU batch preparation - processes all images in a single GPU operation.
+        Equivalent to: ((img/255) - mean) / std, then resize, then (C,W,H) layout.
         """
         S = self._config["dataset"]["resized_image"]
         if not images:
             return torch.empty(0, 3, S, S, device=self._device, dtype=torch.float32)
 
-        # mean/std are in 0..1 domain (ImageNet-style)
-        mean = torch.tensor(self._config["dataset"]["image_normalization"]["mean"],
-                            device=self._device, dtype=torch.float32).view(1, 1, 3)  # HWC broadcast
-        std = torch.tensor(self._config["dataset"]["image_normalization"]["std"],
-                           device=self._device, dtype=torch.float32).view(1, 1, 3)
-
-        out = torch.empty(len(images), 3, S, S, device=self._device, dtype=torch.float32)
-
-        for i, np_img in enumerate(images):
-            # Defensive channel handling: grayscale -> 3ch, drop alpha
+        # Pre-process images on CPU to ensure consistent shape
+        processed_images = []
+        max_h, max_w = 0, 0
+        
+        for np_img in images:
+            # Handle grayscale -> 3ch, drop alpha
             if np_img.ndim == 2:
                 np_img = np.repeat(np_img[..., None], 3, axis=-1)
             elif np_img.shape[-1] > 3:
                 np_img = np_img[..., :3]
-
-            # HWC uint8/float -> HWC float32 on GPU, scaled to [0,1]
-            t = torch.from_numpy(np_img).to(self._device)
-            if t.dtype != torch.float32:
-                t = t.to(torch.float32)
-            t = t / 255.0
-
-            # Normalize in 0..1 domain (equivalent to your (img - 255*mean)/std then /255 later)
-            t = (t - mean) / std  # HWC
-
-            # Resize to S×S (bilinear, align_corners=False ~ OpenCV INTER_LINEAR)
-            t = t.permute(2, 0, 1).unsqueeze(0)  # 1,C,H,W
-            t = F.interpolate(t, size=(S, S), mode="bilinear", align_corners=False)
-            t = t.squeeze(0)  # C,H,S
-
-            # Final layout quirk: (C, W, H) — keep it because the model was trained this way
-            t = t.permute(0, 2, 1)  # C,W,H
-
-            out[i].copy_(t)
-
-        return out.contiguous(memory_format=torch.channels_last)
+            processed_images.append(np_img)
+            max_h = max(max_h, np_img.shape[0])
+            max_w = max(max_w, np_img.shape[1])
+        
+        # Stack all images into a single numpy array with padding if needed
+        batch_np = np.zeros((len(images), max_h, max_w, 3), dtype=np.float32)
+        for i, img in enumerate(processed_images):
+            h, w = img.shape[:2]
+            batch_np[i, :h, :w, :] = img.astype(np.float32)
+        
+        # Single transfer to GPU with pinned memory for speed
+        batch_tensor = torch.from_numpy(batch_np).pin_memory().to(self._device, non_blocking=True)
+        
+        # Scale to [0,1]
+        batch_tensor = batch_tensor / 255.0
+        
+        # Prepare mean/std for broadcasting (B,H,W,C format)
+        mean = torch.tensor(self._config["dataset"]["image_normalization"]["mean"],
+                          device=self._device, dtype=torch.float32).view(1, 1, 1, 3)
+        std = torch.tensor(self._config["dataset"]["image_normalization"]["std"],
+                         device=self._device, dtype=torch.float32).view(1, 1, 1, 3)
+        
+        # Normalize all at once
+        batch_tensor = (batch_tensor - mean) / std
+        
+        # Convert to B,C,H,W for interpolation
+        batch_tensor = batch_tensor.permute(0, 3, 1, 2)
+        
+        # Single batched interpolation call
+        batch_tensor = F.interpolate(batch_tensor, size=(S, S), mode="bilinear", align_corners=False)
+        
+        # Convert to the quirky (B, C, W, H) layout the model expects
+        batch_tensor = batch_tensor.permute(0, 1, 3, 2)  # B,C,S,S -> B,C,S,S (W,H swap)
+        
+        return batch_tensor.contiguous(memory_format=torch.channels_last)
 
     def _normalize_model_batch_outputs(self, model_result):
         """
