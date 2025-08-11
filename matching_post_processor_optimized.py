@@ -2,10 +2,8 @@
 # Copyright IBM Corp. 2024 - 2024
 # SPDX-License-Identifier: MIT
 #
-import json
 import logging
 import math
-import statistics
 
 import numpy as np
 import docling_ibm_models.tableformer.settings as s
@@ -46,24 +44,21 @@ class MatchingPostProcessor:
         max_cell_id : integer,
             highest cell_id in table_cells
         """
-        columns = 1
-        rows = 1
-        max_cell_id = 0
-
-        for cell in table_cells:
-            if cell["column_id"] > columns:
-                columns = cell["column_id"]
-            if cell["row_id"] > rows:
-                rows = cell["row_id"]
-            if cell["cell_id"] > max_cell_id:
-                max_cell_id = cell["cell_id"]
-
-        return columns + 1, rows + 1, max_cell_id
+        # Vectorized version - O(n) single pass
+        if not table_cells:
+            return 1, 1, 0
+            
+        cols = np.fromiter((c["column_id"] for c in table_cells), int)
+        rows = np.fromiter((c["row_id"] for c in table_cells), int)
+        ids = np.fromiter((c["cell_id"] for c in table_cells), int)
+        
+        return cols.max() + 1, rows.max() + 1, ids.max()
 
     def _get_good_bad_cells_in_column(self, table_cells, column, matches):
         r"""
         1. step
         Get good/bad IOU predicted cells for each structural column (of minimal grid)
+        OPTIMIZED: O(cells_in_column) instead of O(cells_in_column × |matches|)
 
         Parameters
         ----------
@@ -82,33 +77,29 @@ class MatchingPostProcessor:
         bad_table_cells : list of dict
             cells in a column that don't have match
         """
+        # Build set of matched table cell IDs once - O(|matches|)
+        matched_table_ids = set()
+        for match_list in matches.values():
+            for match in match_list:
+                matched_table_ids.add(match["table_cell_id"])
+        
+        # Now just iterate column cells once - O(cells_in_column)
         good_table_cells = []
         bad_table_cells = []
-
+        
         for cell in table_cells:
             if cell["column_id"] == column:
-                table_cell_id = cell["cell_id"]
-
-                bad_match = True
-                allow_class = True
-
-                for pdf_cell_id in matches:
-                    # CHECK IF CELL CLASS TO BE VERIFIED HERE
-                    if "cell_class" in cell:
-                        if cell["cell_class"] <= 1:
-                            allow_class = False
-                    else:
-                        self._log().debug("***")
-                        self._log().debug("no cell_class in...")
-                        self._log().debug(cell)
-                        self._log().debug("***")
-                    if allow_class:
-                        match_list = matches[pdf_cell_id]
-                        for match in match_list:
-                            if match["table_cell_id"] == table_cell_id:
-                                good_table_cells.append(cell)
-                                bad_match = False
-                if bad_match:
+                # Check cell class
+                cell_class = cell.get("cell_class", 0)
+                if isinstance(cell_class, str):
+                    cell_class = int(cell_class)
+                    
+                if cell_class <= 1:
+                    # Skip cells with class <= 1
+                    bad_table_cells.append(cell)
+                elif cell["cell_id"] in matched_table_ids:
+                    good_table_cells.append(cell)
+                else:
                     bad_table_cells.append(cell)
 
         return good_table_cells, bad_table_cells
@@ -367,15 +358,14 @@ class MatchingPostProcessor:
         Returns
         -------
         clean_matches : dictionary of lists of table_cells
-            A dictionary which is indexed by the pdf_cell_id as key and the value is a list
+            A dictionary which is indexed by the pdf_cell_id (int) as key and the value is a list
             of the table_cells that fall inside that pdf cell
         """
         new_matches, matches_counter = cell_matcher._intersection_over_pdf_match(
             table_cells, pdf_cells
         )
-        # Convert keys to strings without JSON round-trip
-        clean_matches = {str(k): v for k, v in new_matches.items()}
-        return clean_matches
+        # Keep keys as int - no string conversion
+        return new_matches
 
     def _find_overlapping(self, table_cells):
 
@@ -475,7 +465,7 @@ class MatchingPostProcessor:
             table_cell_ids = set(int(match["table_cell_id"]) for match in match_list)
 
             # Get bbox of pdf_cell
-            pdf_cell_bbox = pdf_cell_dict.get(int(pdf_cell_id))
+            pdf_cell_bbox = pdf_cell_dict.get(pdf_cell_id)
             if not pdf_cell_bbox:
                 continue
 
@@ -606,13 +596,10 @@ class MatchingPostProcessor:
                 )
             )
 
-        # Eliminate duplicates in the pdf_cells_in_columns and ensure int content
-        # pdf_cells_in_columns:
-        # - initially:  list of lists of str with duplicates in the inner lists
-        # - afterwards: list of lists of int (unique)
+        # Eliminate duplicates in the pdf_cells_in_columns
+        # pdf_cells_in_columns: list of lists of int (unique)
         pdf_cells_in_columns = [
-            list(set([x for x in map(lambda x: int(x), le)]))
-            for le in pdf_cells_in_columns
+            list(set(le)) for le in pdf_cells_in_columns
         ]
         cols_to_eliminate = []
         # Pairwise comparison of all columns, finding intersection, and it's length
@@ -746,7 +733,7 @@ class MatchingPostProcessor:
         pdf_bboxes = np.array([p["bbox"] for p in pdf_cells], dtype=np.float32)
         
         # Find orphan cells (not in matches)
-        matched_ids = set(int(k) for k in matches.keys())
+        matched_ids = set(matches.keys())
         orphan_mask = np.array([pid not in matched_ids for pid in pdf_ids])
         
         if not orphan_mask.any():
@@ -853,7 +840,7 @@ class MatchingPostProcessor:
                 
                 # Add match
                 confidence = (row_assignments[oid][1] + col_assignments[oid][1]) / 2
-                new_matches[str(oid)] = [{"post": confidence, "table_cell_id": table_cell_id}]
+                new_matches[oid] = [{"post": confidence, "table_cell_id": table_cell_id}]
         
         return new_matches, new_table_cells, max_cell_id
 
@@ -871,11 +858,8 @@ class MatchingPostProcessor:
         new_pdf_cells : list of dict
             updated, cleaned list of pdf_cells
         """
-        new_pdf_cells = []
-        for i in range(len(pdf_cells)):
-            if pdf_cells[i]["text"] != "":
-                new_pdf_cells.append(pdf_cells[i])
-        return new_pdf_cells
+        # Simpler list comprehension
+        return [c for c in pdf_cells if c["text"]]
 
     def process(self, matching_details, correct_overlapping_cells=False):
         r"""
@@ -896,7 +880,13 @@ class MatchingPostProcessor:
         self._log().debug("Start prediction post-processing...")
         table_cells = matching_details["table_cells"]
         pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
-        matches = matching_details["matches"]
+        
+        # Normalize matches to use int keys (if they come in as strings)
+        raw_matches = matching_details["matches"]
+        matches = {}
+        for k, v in raw_matches.items():
+            key = int(k) if isinstance(k, str) else k
+            matches[key] = v
 
         # ------------------------------------------------------------------------------------------
         # -1. If initial (IOU) matches are empty,
@@ -1035,8 +1025,8 @@ class MatchingPostProcessor:
         self._log().debug(table_cells_wo)
 
         for pdf_cell_id in range(len(final_matches_wo)):
-            if str(pdf_cell_id) in final_matches_wo:
-                pdf_cell_match = final_matches_wo[str(pdf_cell_id)]
+            if pdf_cell_id in final_matches_wo:
+                pdf_cell_match = final_matches_wo[pdf_cell_id]
                 if len(pdf_cell_match) > 1:
                     l1 = "!!! Multiple - {}x pdf cell match with id: {}"
                     self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
