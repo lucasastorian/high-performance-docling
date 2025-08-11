@@ -29,12 +29,9 @@ class Page(BaseModel):
 
     token_index: Optional[PageTokenIndex] = None
 
-    def build_token_index(self, scale: float = 2.0, grid_cell: int = 256):
-        self.token_index = PageTokenIndex(
-            parsed_page=self.parsed_page,
-            size=self.size,
-        )
-        self.token_index.build(scale=scale, grid_cell=grid_cell)
+    def build_token_index(self):
+        self.token_index = PageTokenIndex(page_height=self.size.height, page_width=self.size.width)
+        self.token_index.build(self.parsed_page, grid_cell=256)
 
     @property
     def cells(self) -> List[TextCell]:
