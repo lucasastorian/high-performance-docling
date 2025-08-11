@@ -54,55 +54,43 @@ class MatchingPostProcessor:
         
         return cols.max() + 1, rows.max() + 1, ids.max()
 
-    def _get_good_bad_cells_in_column(self, table_cells, column, matches):
+    def _get_good_bad_cells_in_column(self, table_cells, column, matched_mask, by_col, cell_classes):
         r"""
-        1. step
-        Get good/bad IOU predicted cells for each structural column (of minimal grid)
-        OPTIMIZED: O(cells_in_column) instead of O(cells_in_column × |matches|)
+        1. step - FULLY OPTIMIZED
+        Get good/bad IOU predicted cells for each structural column using precomputed structures.
+        O(cells_in_column) with true vectorization (no hidden Python loops).
 
         Parameters
         ----------
         table_cells : list of dict
-            Each value is a dictionary with keys: "cell_id", "row_id", "column_id", "bbox", "label"
-        column : integer
-            Index of a column
-        matches : dictionary of lists of table_cells
-            A dictionary which is indexed by the pdf_cell_id as key and the value is a list
-            of the table_cells that fall inside that pdf cell
+        column : int
+        matched_mask : np.array - boolean mask for matched cell IDs
+        by_col : list of lists - precomputed column indices
+        cell_classes : np.array - precomputed cell classes
 
         Returns
         -------
-        good_table_cells : list of dict
-            cells in a column that have match
-        bad_table_cells : list of dict
-            cells in a column that don't have match
+        good_table_cells, bad_table_cells : list of dict
         """
-        # Build set of matched table cell IDs once - O(|matches|)
-        matched_table_ids = set()
-        for match_list in matches.values():
-            for match in match_list:
-                matched_table_ids.add(match["table_cell_id"])
+        # Get indices for this column
+        idxs = by_col[column] if column < len(by_col) else []
+        if not idxs:
+            return [], []
+            
+        # Vectorized operations on indices
+        ids = np.fromiter((table_cells[i]["cell_id"] for i in idxs), dtype=int)
+        cls = cell_classes[idxs]
         
-        # Now just iterate column cells once - O(cells_in_column)
-        good_table_cells = []
-        bad_table_cells = []
+        # True vectorization - O(k) pure NumPy indexing
+        allow = cls > 1
+        matched = matched_mask[ids]  # No Python loop!
+        good_mask = allow & matched
         
-        for cell in table_cells:
-            if cell["column_id"] == column:
-                # Check cell class
-                cell_class = cell.get("cell_class", 0)
-                if isinstance(cell_class, str):
-                    cell_class = int(cell_class)
-                    
-                if cell_class <= 1:
-                    # Skip cells with class <= 1
-                    bad_table_cells.append(cell)
-                elif cell["cell_id"] in matched_table_ids:
-                    good_table_cells.append(cell)
-                else:
-                    bad_table_cells.append(cell)
-
-        return good_table_cells, bad_table_cells
+        # Build result lists
+        good = [table_cells[i] for i, g in zip(idxs, good_mask) if g]
+        bad = [table_cells[i] for i, g in zip(idxs, good_mask) if not g]
+        
+        return good, bad
 
     def _delete_column_from_table(self, table_cells, column):
         r"""
@@ -368,7 +356,56 @@ class MatchingPostProcessor:
         return new_matches
 
     def _find_overlapping(self, table_cells):
-
+        """
+        OPTIMIZED: Use grid bucketing for O(n) overlap detection instead of O(n²).
+        """
+        if len(table_cells) < 64:  # Small tables: use simple approach
+            return self._find_overlapping_simple(table_cells)
+            
+        # Grid-based approach for larger tables
+        b = np.array([c["bbox"] for c in table_cells], dtype=np.float32)
+        if len(b) == 0:
+            return table_cells
+            
+        # Compute grid size based on median cell dimensions
+        w = np.median(b[:, 2] - b[:, 0])
+        h = np.median(b[:, 3] - b[:, 1])
+        gw = max(w, 1.0)
+        gh = max(h, 1.0)
+        
+        # Bucket cells by grid coordinates
+        buckets = {}
+        for i, (x1, y1, x2, y2) in enumerate(b):
+            ix1, ix2 = int(x1 // gw), int(x2 // gw)
+            iy1, iy2 = int(y1 // gh), int(y2 // gh)
+            # Add cell to all buckets it overlaps
+            for ix in range(ix1, ix2 + 1):
+                for iy in range(iy1, iy2 + 1):
+                    buckets.setdefault((ix, iy), []).append(i)
+        
+        def overlaps(i, j):
+            a, b = table_cells[i]["bbox"], table_cells[j]["bbox"]
+            return not (a[0] >= b[2] or a[2] <= b[0] or a[1] >= b[3] or a[3] <= b[1])
+        
+        # Only check pairs within same/adjacent buckets
+        seen = set()
+        for bucket_idxs in buckets.values():
+            for i in range(len(bucket_idxs)):
+                for j in range(i + 1, len(bucket_idxs)):
+                    idx_i, idx_j = bucket_idxs[i], bucket_idxs[j]
+                    pair = (min(idx_i, idx_j), max(idx_i, idx_j))
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    if overlaps(idx_i, idx_j):
+                        table_cells[idx_i], table_cells[idx_j] = self._correct_overlap(
+                            table_cells[idx_i], table_cells[idx_j]
+                        )
+        
+        return table_cells
+    
+    def _find_overlapping_simple(self, table_cells):
+        """Simple O(n²) overlap detection for small tables."""
         def correct_overlap(box1, box2):
             # Extract coordinates from the bounding boxes
             x1_min, y1_min, x1_max, y1_max = box1["bbox"]
@@ -419,7 +456,7 @@ class MatchingPostProcessor:
             ]
 
             return box1, box2
-
+        
         def do_boxes_overlap(box1, box2):
             B1 = box1["bbox"]
             B2 = box2["bbox"]
@@ -441,7 +478,7 @@ class MatchingPostProcessor:
                     if i != j:
                         if bboxes[i] != bboxes[j]:
                             if do_boxes_overlap(bboxes[i], bboxes[j]):
-                                bboxes[i], bboxes[j] = correct_overlap(
+                                bboxes[i], bboxes[j] = self._correct_overlap(
                                     bboxes[i], bboxes[j]
                                 )
 
@@ -449,73 +486,102 @@ class MatchingPostProcessor:
 
         overlapping_indexes, table_cells = find_overlapping_pairs_indexes(table_cells)
         return table_cells
+    
+    def _correct_overlap(self, box1, box2):
+        """Extract the overlap correction logic for reuse."""
+        # Extract coordinates from the bounding boxes
+        x1_min, y1_min, x1_max, y1_max = box1["bbox"]
+        x2_min, y2_min, x2_max, y2_max = box2["bbox"]
+
+        # Calculate the overlap in both x and y directions
+        overlap_x = min(x1_max, x2_max) - max(x1_min, x2_min)
+        overlap_y = min(y1_max, y2_max) - max(y1_min, y2_min)
+
+        # If there is no overlap, return the original boxes
+        if overlap_x <= 0 or overlap_y <= 0:
+            return box1, box2
+
+        # Decide how to push the boxes apart
+        if overlap_x < overlap_y:
+            # Push horizontally
+            if x1_min < x2_min:
+                # Move box1 to the left and box2 to the right
+                box1["bbox"][2] -= math.ceil(overlap_x / 2) + 2
+                box2["bbox"][0] += math.floor(overlap_x / 2)
+            else:
+                # Move box2 to the left and box1 to the right
+                box2["bbox"][2] -= math.ceil(overlap_x / 2) + 2
+                box1["bbox"][0] += math.floor(overlap_x / 2)
+        else:
+            # Push vertically
+            if y1_min < y2_min:
+                # Move box1 up and box2 down
+                box1["bbox"][3] -= math.ceil(overlap_y / 2) + 2
+                box2["bbox"][1] += math.floor(overlap_y / 2)
+            else:
+                # Move box2 up and box1 down
+                box2["bbox"][3] -= math.ceil(overlap_y / 2) + 2
+                box1["bbox"][1] += math.floor(overlap_y / 2)
+
+        # Fix coordinates if they got flipped
+        for box in [box1, box2]:
+            box["bbox"] = [
+                min(box["bbox"][0], box["bbox"][2]),
+                min(box["bbox"][1], box["bbox"][3]),
+                max(box["bbox"][0], box["bbox"][2]),
+                max(box["bbox"][1], box["bbox"][3]),
+            ]
+
+        return box1, box2
 
     def _align_table_cells_to_pdf(self, table_cells, pdf_cells, matches):
         """
         Align table cell bboxes with good matches to encapsulate matching pdf cells.
-        OPTIMIZED: Single-pass aggregation instead of two passes with Python dicts.
+        FULLY OPTIMIZED: True single-pass aggregation with no intermediate lists.
         """
         if not matches:
             return table_cells
             
-        # Build lookup dicts once
-        pdf_cell_dict = {pdf_cell["id"]: pdf_cell["bbox"] for pdf_cell in pdf_cells}
-        table_cell_dict = {cell["cell_id"]: cell for cell in table_cells}
+        # Build lookups
+        pdf_bbox = {p["id"]: p["bbox"] for p in pdf_cells}
+        cells = {c["cell_id"]: c for c in table_cells}
         
-        # Collect all (table_cell_id, pdf_bbox) pairs
-        cell_bbox_pairs = []
-        for pdf_cell_id, match_list in matches.items():
-            pdf_bbox = pdf_cell_dict.get(pdf_cell_id)
-            if not pdf_bbox:
+        # Single-pass aggregation: cell_id -> [minx, miny, maxx, maxy]
+        acc = {}
+        for pid, mlist in matches.items():
+            bb = pdf_bbox.get(pid)
+            if bb is None:
                 continue
                 
-            # Get unique table cell IDs for this PDF cell
-            table_cell_ids = set(match["table_cell_id"] for match in match_list)
-            
-            for cell_id in table_cell_ids:
-                if cell_id in table_cell_dict:
-                    cell_bbox_pairs.append((cell_id, pdf_bbox))
-        
-        if not cell_bbox_pairs:
-            return table_cells
-            
-        # Group by table cell ID and aggregate bboxes using NumPy
-        from collections import defaultdict
-        cell_to_bboxes = defaultdict(list)
-        for cell_id, bbox in cell_bbox_pairs:
-            cell_to_bboxes[cell_id].append(bbox)
-        
-        # Create final table cells with merged bboxes
-        clean_table_cells = []
-        for cell in table_cells:
-            cell_id = cell["cell_id"]
-            
-            if cell_id in cell_to_bboxes:
-                # This cell has matches - merge all PDF bboxes
-                bboxes = cell_to_bboxes[cell_id]
-                if len(bboxes) == 1:
-                    merged_bbox = list(bboxes[0])
-                else:
-                    # Vectorized bbox merging
-                    bbox_array = np.array(bboxes, dtype=np.float32)
-                    merged_bbox = [
-                        float(bbox_array[:, 0].min()),  # min x1
-                        float(bbox_array[:, 1].min()),  # min y1  
-                        float(bbox_array[:, 2].max()),  # max x2
-                        float(bbox_array[:, 3].max())   # max y2
-                    ]
+            seen = set()  # Avoid processing same table cell multiple times per PDF cell
+            for m in mlist:
+                cid = m["table_cell_id"]
+                if cid in seen or cid not in cells:
+                    continue
+                seen.add(cid)
                 
-                # Create aligned cell
-                new_cell = cell.copy()
-                new_cell["bbox"] = merged_bbox
-                if "cell_class" not in new_cell:
-                    new_cell["cell_class"] = 2  # Use int consistently
-                clean_table_cells.append(new_cell)
-            else:
-                # Cell has no matches - keep original
-                clean_table_cells.append(cell)
+                # Update accumulated bbox
+                if cid not in acc:
+                    acc[cid] = [bb[0], bb[1], bb[2], bb[3]]
+                else:
+                    a = acc[cid]
+                    a[0] = min(a[0], bb[0])  # min x1
+                    a[1] = min(a[1], bb[1])  # min y1
+                    a[2] = max(a[2], bb[2])  # max x2
+                    a[3] = max(a[3], bb[3])  # max y2
         
-        return clean_table_cells
+        # Build output in single pass
+        out = []
+        for c in table_cells:
+            if c["cell_id"] in acc:
+                nc = dict(c)
+                nc["bbox"] = acc[c["cell_id"]]
+                nc.setdefault("cell_class", 2)
+                out.append(nc)
+            else:
+                out.append(c)
+        
+        return out
 
     def _deduplicate_cells(self, tab_columns, table_cells, iou_matches, ioc_matches):
         """
@@ -682,10 +748,10 @@ class MatchingPostProcessor:
         return bbox_result
 
     def _pick_orphan_cells_vectorized(
-        self, tab_rows, tab_cols, max_cell_id, table_cells, pdf_cells, matches
+        self, tab_rows, tab_cols, max_cell_id, table_cells, pdf_cells, matches, by_col, by_row, cell_classes
     ):
         """
-        Optimized orphan cell detection using NumPy vectorization.
+        Optimized orphan cell detection using NumPy vectorization and precomputed structures.
         """
         new_matches = matches.copy()
         new_table_cells = table_cells.copy()
@@ -708,9 +774,7 @@ class MatchingPostProcessor:
         orphan_ids = pdf_ids[orphan_mask]
         orphan_bboxes = pdf_bboxes[orphan_mask]
         
-        # Process rows efficiently using precomputed by_row index
-        by_col, by_row, cell_classes = self._build_lookup_structures(table_cells)
-        
+        # Process rows efficiently using passed precomputed structures
         row_assignments = {}
         for row_idx in range(tab_rows):
             # Get row cells efficiently using index
@@ -779,19 +843,22 @@ class MatchingPostProcessor:
                     if oid not in col_assignments or distances[i] < col_assignments[oid][1]:
                         col_assignments[oid] = (col_idx, distances[i])
         
+        # Build lookup for existing (row_id, col_id) -> index for O(1) access
+        rc_to_idx = {(c["row_id"], c["column_id"]): i for i, c in enumerate(new_table_cells)}
+        
         # Create/update table cells for orphans
         for pdf_idx, (oid, bbox) in enumerate(zip(orphan_ids, orphan_bboxes)):
             if oid in row_assignments and oid in col_assignments:
                 row_id = row_assignments[oid][0]
                 col_id = col_assignments[oid][0]
                 
-                # Check if cell exists
-                existing = [c for c in new_table_cells 
-                           if c["row_id"] == row_id and c["column_id"] == col_id]
+                # O(1) lookup instead of O(n) scan
+                key = (row_id, col_id)
+                idx = rc_to_idx.get(key)
                 
-                if existing:
+                if idx is not None:
                     # Merge bbox
-                    cell = existing[0]
+                    cell = new_table_cells[idx]
                     cell["bbox"] = self._merge_two_bboxes(cell["bbox"], bbox.tolist())
                     table_cell_id = cell["cell_id"]
                 else:
@@ -805,6 +872,7 @@ class MatchingPostProcessor:
                         "row_id": row_id,
                         "cell_class": 2,
                     }
+                    rc_to_idx[key] = len(new_table_cells)  # Update lookup
                     new_table_cells.append(new_cell)
                     table_cell_id = max_cell_id
                 
@@ -828,8 +896,8 @@ class MatchingPostProcessor:
         new_pdf_cells : list of dict
             updated, cleaned list of pdf_cells
         """
-        # Simpler list comprehension
-        return [c for c in pdf_cells if c["text"]]
+        # Simpler list comprehension with safety for missing/None text
+        return [c for c in pdf_cells if c.get("text")]
 
     def _build_lookup_structures(self, table_cells):
         """Build reusable lookup structures to avoid repeated Python loops."""
@@ -841,13 +909,8 @@ class MatchingPostProcessor:
             by_col[cell["column_id"]].append(i)  # Store indices, not cell copies
             by_row[cell["row_id"]].append(i)
             
-        # Precompute cell class array for fast access
-        cell_classes = np.array([cell.get("cell_class", 0) for cell in table_cells], dtype=np.int16)
-        # Handle mixed string/int types
-        for i, cell in enumerate(table_cells):
-            cc = cell.get("cell_class", 0)
-            if isinstance(cc, str):
-                cell_classes[i] = int(cc)
+        # Precompute cell class array with proper type handling
+        cell_classes = np.array([int(cell.get("cell_class", 0)) for cell in table_cells], dtype=np.int16)
         
         return by_col, by_row, cell_classes
 
@@ -898,12 +961,20 @@ class MatchingPostProcessor:
             matches = self._run_intersection_match(
                 self._cell_matcher, table_cells, pdf_cells
             )
-
+        
         # ------------------------------------------------------------------------------------------
-        # 0. Get minimal grid table dimension (cols/rows)
+        # 0. Get minimal grid table dimension (cols/rows) - MOVED UP to get max_cell_id
         tab_columns, tab_rows, max_cell_id = self._get_table_dimension(table_cells)
         if self._log().isEnabledFor(logging.DEBUG):
             self._log().debug(f"COLS {tab_columns}/ ROWS {tab_rows}/ MAX CELL ID {max_cell_id}")
+        
+        # Build boolean mask for true vectorization AFTER max_cell_id is known
+        matched_mask = np.zeros(max_cell_id + 1, dtype=bool)
+        for match_list in matches.values():
+            for m in match_list:
+                cid = m["table_cell_id"]
+                if 0 <= cid <= max_cell_id:
+                    matched_mask[cid] = True
 
         good_table_cells = []
         bad_table_cells = []
@@ -912,7 +983,7 @@ class MatchingPostProcessor:
 
         # 1. Get good/bad IOU predicted cells for each structural column (of minimal grid)
         for col in range(tab_columns):
-            g1, g2 = self._get_good_bad_cells_in_column(table_cells, col, matches)
+            g1, g2 = self._get_good_bad_cells_in_column(table_cells, col, matched_mask, by_col, cell_classes)
             good_table_cells = g1
             bad_table_cells = g2
             
@@ -965,6 +1036,7 @@ class MatchingPostProcessor:
         )
         dedupl_table_cells = dd1
         dedupl_matches = dd2
+        new_tab_columns = dd3  # CRITICAL: Use the updated column count
 
         if self._log().isEnabledFor(logging.DEBUG):
             self._log().debug("Deduplication complete...")
@@ -982,23 +1054,28 @@ class MatchingPostProcessor:
             dedupl_table_cells, key=lambda k: k["cell_id"]
         )
 
-        if (
-            len(pdf_cells) > 300
-        ):  # For performance, skip this step if there are too many pdf_cells
+        # Make align cutoff configurable
+        ALIGN_CAP = int(self._config.get("align_pdf_cost_cap", 300))
+        if len(pdf_cells) > ALIGN_CAP:
+            # For performance, skip this step if there are too many pdf_cells
             aligned_table_cells2 = dedupl_table_cells_sorted
         else:
             aligned_table_cells2 = self._align_table_cells_to_pdf(
                 dedupl_table_cells_sorted, pdf_cells, final_matches
             )
 
-        # 9. Distance-match orphans - USE OPTIMIZED VERSION
+        # CRITICAL: Rebuild lookups for the FINAL table_cells (indices changed after dedup/align)
+        by_col2, by_row2, cell_classes2 = self._build_lookup_structures(aligned_table_cells2)
+
+        # 9. Distance-match orphans - USE OPTIMIZED VERSION with correct column count and structures
         po1, po2, po3 = self._pick_orphan_cells_vectorized(
             tab_rows,
-            tab_columns,
+            new_tab_columns,  # Use deduplicated column count
             max_cell_id,
             aligned_table_cells2,
             pdf_cells,
             final_matches,
+            by_col2, by_row2, cell_classes2  # Use correct structures for aligned cells
         )
         final_matches_wo = po1
         table_cells_wo = po2
@@ -1009,29 +1086,26 @@ class MatchingPostProcessor:
             if len(table_cells_wo) <= 300:  # For performance reasons
                 table_cells_wo = self._find_overlapping(table_cells_wo)
 
-        self._log().debug("*** final_matches_wo")
-        self._log().debug(final_matches_wo)
-        self._log().debug("*** table_cells_wo")
-        self._log().debug(table_cells_wo)
+        # Guard large debug dumps
+        if self._log().isEnabledFor(logging.DEBUG):
+            self._log().debug("*** final_matches_wo")
+            self._log().debug(final_matches_wo)
+            self._log().debug("*** table_cells_wo")
+            self._log().debug(table_cells_wo)
 
-        for pdf_cell_id in range(len(final_matches_wo)):
-            if pdf_cell_id in final_matches_wo:
-                pdf_cell_match = final_matches_wo[pdf_cell_id]
+        # Fixed: iterate actual items, not range
+        if self._log().isEnabledFor(logging.DEBUG):
+            for pdf_cell_id, pdf_cell_match in final_matches_wo.items():
                 if len(pdf_cell_match) > 1:
-                    l1 = "!!! Multiple - {}x pdf cell match with id: {}"
-                    self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
+                    self._log().info(f"!!! Multiple - {len(pdf_cell_match)}x pdf cell match with id: {pdf_cell_id}")
                 if pdf_cell_match:
                     tcellid = pdf_cell_match[0]["table_cell_id"]
                     for tcell in table_cells_wo:
                         if tcell["cell_id"] == tcellid:
                             mrow = tcell["row_id"]
                             mcol = tcell["column_id"]
-                            l2 = "pdf cell: {} -> row: {} | col:{}"
-                            self._log().debug(l2.format(pdf_cell_id, mrow, mcol))
-            else:
-                self._log().debug(
-                    "!!! pdf cell doesn't have match: {}".format(pdf_cell_id)
-                )
+                            self._log().debug(f"pdf cell: {pdf_cell_id} -> row: {mrow} | col: {mcol}")
+                            break
 
         matching_details["table_cells"] = table_cells_wo
         matching_details["matches"] = final_matches_wo
