@@ -81,6 +81,7 @@ class LayoutPredictor:
             blacklist_classes: Set[str] = set(),
             enable_timing: bool = False,
             enable_nms: bool = False,
+            max_batch_size: int = 16,
     ):
         """
         Provide the artifact path that contains the LayoutModel file
@@ -90,6 +91,7 @@ class LayoutPredictor:
         artifact_path: Path for the model torch file.
         device: (Optional) device to run the inference.
         num_threads: (Optional) Number of threads to run the inference if device = 'cpu'
+        max_batch_size: (Optional) Maximum batch size for processing images. Default 16.
 
         Raises
         ------
@@ -99,6 +101,7 @@ class LayoutPredictor:
         self._black_classes = blacklist_classes  # set(["Form", "Key-Value Region"])
         self._enable_timing = enable_timing
         self._enable_nms = enable_nms
+        self._max_batch_size = max_batch_size
 
         # Canonical classes
         self._labels = LayoutLabels()
@@ -251,18 +254,14 @@ class LayoutPredictor:
     ) -> List[List[dict]]:
         """
         Batch prediction for multiple images - more efficient than calling predict() multiple times.
+        Processes images in chunks of max_batch_size to optimize GPU memory usage.
 
         Returns a list of per-image predictions.
         """
         if not images:
             return []
 
-        # Performance timing (only if enabled to avoid synchronization overhead)
-        if self._enable_timing:
-            st = StageTimes()
-            wall_t0 = time.perf_counter()
-        
-        # Convert all images to RGB PIL format
+        # Convert all images to RGB PIL format first
         pil_images = []
         for img in images:
             if isinstance(img, Image.Image):
@@ -271,6 +270,33 @@ class LayoutPredictor:
                 pil_images.append(Image.fromarray(img).convert("RGB"))
             else:
                 raise TypeError("Not supported input image format")
+        
+        # Process in chunks if needed
+        if len(pil_images) > self._max_batch_size:
+            all_predictions = []
+            for i in range(0, len(pil_images), self._max_batch_size):
+                chunk = pil_images[i:i + self._max_batch_size]
+                chunk_preds = self._predict_batch_chunk(chunk)
+                all_predictions.extend(chunk_preds)
+            
+            if self._enable_timing:
+                _log.info(f"[layout.batch] Processed {len(pil_images)} images in {len(range(0, len(pil_images), self._max_batch_size))} chunks of size {self._max_batch_size}")
+            
+            return all_predictions
+        else:
+            # Process all at once if within batch size limit
+            return self._predict_batch_chunk(pil_images)
+    
+    def _predict_batch_chunk(
+            self, pil_images: List[Image.Image]
+    ) -> List[List[dict]]:
+        """
+        Process a single chunk of images (internal method).
+        """
+        # Performance timing (only if enabled to avoid synchronization overhead)
+        if self._enable_timing:
+            st = StageTimes()
+            wall_t0 = time.perf_counter()
 
         # Target sizes for postprocess (create on same device as model)
         target_sizes = torch.tensor([img.size[::-1] for img in pil_images], device=self._device)
