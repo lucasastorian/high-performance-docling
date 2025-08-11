@@ -329,43 +329,68 @@ class TableStructureModel(BasePageModel):
 
     def _get_table_tokens(self, page: Page, table_cluster: Any):
         """Returns all the tokens for a table - optimized without deep copies"""
-        # sp = page._backend.get_segmented_page()
-        sp = page.parsed_page
-        if sp is not None:
-            tcells = sp.get_cells_in_bbox(
-                cell_unit=TextCellUnit.WORD,
-                bbox=table_cluster.bbox,
-            )
-            if len(tcells) == 0:
-                # In case word-level cells yield empty
-                tcells = table_cluster.cells
-        else:
-            # Otherwise - we use normal (line/phrase) cells
-            tcells = table_cluster.cells
+        sx = sy = self.scale  # 2.0
 
-        tokens = []
-        sx = sy = self.scale  # Pre-compute scale factors
-        
-        for c in tcells:
-            # Only allow non empty strings (spaces) into the cells of a table
-            text = c.text.strip()
-            if not text:
-                continue
-                
-            # Direct bbox calculation without deep copy or intermediate objects
-            bb = c.rect.to_bounding_box()
-            tokens.append(
-                {
-                    "id": c.index,
-                    "text": text,
-                    "bbox": {
-                        "l": bb.l * sx,
-                        "t": bb.t * sy,
-                        "r": bb.r * sx,
-                        "b": bb.b * sy,
-                    },
-                }
-            )
+        # Table bbox already scaled to TF coords upstream in your code
+        tbl_box = [
+            round(table_cluster.bbox.l) * sx,
+            round(table_cluster.bbox.t) * sy,
+            round(table_cluster.bbox.r) * sx,
+            round(table_cluster.bbox.b) * sy,
+        ]
+        bbox = BoundingBox(l=tbl_box[0], t=tbl_box[1], r=tbl_box[2], b=tbl_box[3])
+        idx = page.token_index.query_tokens_in_bbox(bbox_scaled_tl=bbox, ios=0.8)
+        toks = page._tokens_np[idx]
+
+        # build the exact dicts your predictor expects
+        # (no text unless you truly need it; you can add a parallel string store later)
+        return [
+            {
+                "id": int(t['id']),
+                "text": "",  # optional: attach later if needed
+                "bbox": {"l": float(t['l']), "t": float(t['t']),
+                         "r": float(t['r']), "b": float(t['b'])}
+            }
+            for t in toks
+        ]
+
+        # sp = page._backend.get_segmented_page()
+        # sp = page.parsed_page
+        # if sp is not None:
+        #     tcells = sp.get_cells_in_bbox(
+        #         cell_unit=TextCellUnit.WORD,
+        #         bbox=table_cluster.bbox,
+        #     )
+        #     if len(tcells) == 0:
+        #         # In case word-level cells yield empty
+        #         tcells = table_cluster.cells
+        # else:
+        #     # Otherwise - we use normal (line/phrase) cells
+        #     tcells = table_cluster.cells
+        #
+        # tokens = []
+        # sx = sy = self.scale  # Pre-compute scale factors
+        #
+        # for c in tcells:
+        #     # Only allow non empty strings (spaces) into the cells of a table
+        #     text = c.text.strip()
+        #     if not text:
+        #         continue
+        #
+        #     # Direct bbox calculation without deep copy or intermediate objects
+        #     bb = c.rect.to_bounding_box()
+        #     tokens.append(
+        #         {
+        #             "id": c.index,
+        #             "text": text,
+        #             "bbox": {
+        #                 "l": bb.l * sx,
+        #                 "t": bb.t * sy,
+        #                 "r": bb.r * sx,
+        #                 "b": bb.b * sy,
+        #             },
+        #         }
+        #     )
 
         return tokens
 

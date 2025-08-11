@@ -5,6 +5,7 @@ from typing import Optional, Dict, List
 
 from docling_core.types.doc import TextCell, BoundingBox
 from docling.datamodel.base_models import Size, ConfigDict, SegmentedPdfPage, PagePredictions, AssembledUnit
+from token_index import PageTokenIndex
 
 
 class Page(BaseModel):
@@ -25,6 +26,8 @@ class Page(BaseModel):
         float, Image
     ] = {}  # Cache of images in different scales. By default it is cleared during assembling.
     _np_image_cache: dict[float, np.ndarray] = {}
+
+    token_index: PageTokenIndex(parsed_page=parsed_page, size=size)
 
     @property
     def cells(self) -> List[TextCell]:
