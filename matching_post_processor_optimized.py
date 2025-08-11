@@ -452,69 +452,69 @@ class MatchingPostProcessor:
 
     def _align_table_cells_to_pdf(self, table_cells, pdf_cells, matches):
         """
-        Align table cell bboxes with good matches to encapsulate matching pdf cells
+        Align table cell bboxes with good matches to encapsulate matching pdf cells.
+        OPTIMIZED: Single-pass aggregation instead of two passes with Python dicts.
         """
+        if not matches:
+            return table_cells
+            
+        # Build lookup dicts once
         pdf_cell_dict = {pdf_cell["id"]: pdf_cell["bbox"] for pdf_cell in pdf_cells}
         table_cell_dict = {cell["cell_id"]: cell for cell in table_cells}
-
-        # First pass - create initial new_table_cells with aligned bboxes
-        new_table_cells = []
-
+        
+        # Collect all (table_cell_id, pdf_bbox) pairs
+        cell_bbox_pairs = []
         for pdf_cell_id, match_list in matches.items():
-            # Extract unique table cell ids from match_list
-            table_cell_ids = set(int(match["table_cell_id"]) for match in match_list)
-
-            # Get bbox of pdf_cell
-            pdf_cell_bbox = pdf_cell_dict.get(pdf_cell_id)
-            if not pdf_cell_bbox:
+            pdf_bbox = pdf_cell_dict.get(pdf_cell_id)
+            if not pdf_bbox:
                 continue
-
-            # Process each unique table cell
+                
+            # Get unique table cell IDs for this PDF cell
+            table_cell_ids = set(match["table_cell_id"] for match in match_list)
+            
             for cell_id in table_cell_ids:
-                table_cell = table_cell_dict.get(cell_id)
-                if not table_cell:
-                    continue
-
-                # Create new table cell with aligned bbox
-                new_table_cell = table_cell.copy()
-                new_table_cell["bbox"] = list(pdf_cell_bbox)
-
-                # Set cell class
-                if "cell_class" not in new_table_cell:
-                    new_table_cell["cell_class"] = "2"
-
-                new_table_cells.append(new_table_cell)
-
-        # Second pass - aggregate bboxes for duplicate cells
-        cell_to_bboxes = {}
-        for cell in new_table_cells:
-            cell_id = cell["cell_id"]
-            if cell_id not in cell_to_bboxes:
-                cell_to_bboxes[cell_id] = []
-            cell_to_bboxes[cell_id].append(cell["bbox"])
-
-        # Create final clean table cells
+                if cell_id in table_cell_dict:
+                    cell_bbox_pairs.append((cell_id, pdf_bbox))
+        
+        if not cell_bbox_pairs:
+            return table_cells
+            
+        # Group by table cell ID and aggregate bboxes using NumPy
+        from collections import defaultdict
+        cell_to_bboxes = defaultdict(list)
+        for cell_id, bbox in cell_bbox_pairs:
+            cell_to_bboxes[cell_id].append(bbox)
+        
+        # Create final table cells with merged bboxes
         clean_table_cells = []
-        processed_ids = set()
-
-        for cell in new_table_cells:
+        for cell in table_cells:
             cell_id = cell["cell_id"]
-            if cell_id in processed_ids:
-                continue
-
-            bboxes = cell_to_bboxes[cell_id]
-            if len(bboxes) > 1:
-                # Merge bboxes
-                x1s = [bbox[0] for bbox in bboxes]
-                y1s = [bbox[1] for bbox in bboxes]
-                x2s = [bbox[2] for bbox in bboxes]
-                y2s = [bbox[3] for bbox in bboxes]
-
-                cell["bbox"] = [min(x1s), min(y1s), max(x2s), max(y2s)]
-
-            clean_table_cells.append(cell)
-            processed_ids.add(cell_id)
-
+            
+            if cell_id in cell_to_bboxes:
+                # This cell has matches - merge all PDF bboxes
+                bboxes = cell_to_bboxes[cell_id]
+                if len(bboxes) == 1:
+                    merged_bbox = list(bboxes[0])
+                else:
+                    # Vectorized bbox merging
+                    bbox_array = np.array(bboxes, dtype=np.float32)
+                    merged_bbox = [
+                        float(bbox_array[:, 0].min()),  # min x1
+                        float(bbox_array[:, 1].min()),  # min y1  
+                        float(bbox_array[:, 2].max()),  # max x2
+                        float(bbox_array[:, 3].max())   # max y2
+                    ]
+                
+                # Create aligned cell
+                new_cell = cell.copy()
+                new_cell["bbox"] = merged_bbox
+                if "cell_class" not in new_cell:
+                    new_cell["cell_class"] = 2  # Use int consistently
+                clean_table_cells.append(new_cell)
+            else:
+                # Cell has no matches - keep original
+                clean_table_cells.append(cell)
+        
         return clean_table_cells
 
     def _deduplicate_cells(self, tab_columns, table_cells, iou_matches, ioc_matches):
