@@ -15,7 +15,7 @@ def get_tableformer_keep_tokens() -> List[str]:
     # Special tokens (must be first for stable IDs)
     SPECIALS = ["<pad>", "<start>", "<end>", "<unk>"]
     
-    # OTSL table structure tags
+    # OTSL table structure tags - THESE ARE THE ONLY ONES ACTUALLY USED
     OTSL_TAGS = [
         "nl",     # newline
         "fcel",   # first cell
@@ -28,17 +28,10 @@ def get_tableformer_keep_tokens() -> List[str]:
         "srow",   # section row
     ]
     
-    # HTML tags used in conversion
-    HTML_TAGS = [
-        "<tr>", "</tr>",           # table row
-        "<td>", "</td>",           # table data cell
-        "<thead>", "</thead>",     # table header
-        "<tbody>", "</tbody>",     # table body
-        "rowspan", "colspan",      # span attributes
-        ">",                       # closing bracket for spans
-    ]
+    # The model doesn't use HTML tags directly - they're generated post-hoc
+    # from OTSL tags via otsl_to_html() function
     
-    return SPECIALS + OTSL_TAGS + HTML_TAGS
+    return SPECIALS + OTSL_TAGS
 
 
 def build_compact_maps(word_map: dict, keep_tokens: List[str]) -> Tuple[Dict, Dict, Dict]:
