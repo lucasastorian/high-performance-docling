@@ -34,7 +34,7 @@ class LambdaPreprocessor:
             _ = page.get_image_np(scale=self.images_scale)
 
             # Build the token index
-            page.token_index.build(scale=2.0, grid_cell=256)
+            page.build_token_index(scale=2.0, grid_cell=256)
 
             pages.append(page)
 
