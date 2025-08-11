@@ -92,36 +92,20 @@ class Page(BaseModel):
         return self.get_image(scale=self._default_image_scale)
 
 
-def build_tokens_np(parsed_page, page_size) -> np.ndarray:
+def build_tokens_np(parsed_page) -> np.ndarray:
     """
     Build a page-wide tokens array in TOP-LEFT origin, UNscaled.
-    Works whether SegmentedPdfPage exposes get_cells() or only get_cells_in_bbox().
+    Works with SegmentedPdfPage.iterate_cells(...)
     """
-    # 1) Fetch WORD cells page-wide
-    try:
-        # Newer API
-        cells = parsed_page.get_cells(cell_unit=TextCellUnit.WORD)
-    except TypeError:
-        # Older API expects a bbox
-        full = BoundingBox(
-            l=0.0, b=0.0, r=float(page_size.width), t=float(page_size.height),
-            coord_origin=CoordOrigin.BOTTOMLEFT
-        )
-        cells = parsed_page.get_cells_in_bbox(
-            cell_unit=TextCellUnit.WORD,
-            bbox=full,
-            ios=0.0
-        )
-
+    H = float(parsed_page.dimension.height)
+    cells_iter = parsed_page.iterate_cells(TextCellUnit.WORD)
+    # you can fall back to lines if necessary:
+    cells = list(cells_iter)
     if not cells:
-        # Fallback to textlines if WORDS are empty
-        cells = getattr(parsed_page, "textline_cells", [])
+        cells = list(parsed_page.iterate_cells(TextCellUnit.LINE))
 
-    # 2) Pack into a compact NumPy struct
     out = np.empty(max(1, len(cells)), dtype=TOK_DTYPE)
     k = 0
-    H = float(page_size.height)
-
     for c in cells:
         text = (c.text or "").strip()
         if not text:

@@ -328,50 +328,42 @@ class TableStructureModel(BasePageModel):
                in [DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX]
         ]
 
-    def _get_table_tokens(self, page: Page, table_cluster):
-        assert page.tokens_np is not None
+    def _get_table_tokens(self, page, table_cluster, ios=0.8):
+        # Ensure tokens are prebuilt
         toks = page.tokens_np
-        sx = sy = self.scale
-        ios_thresh = 0.8
-
-        # Table bbox to TOP-LEFT, UNscaled
-        tbl = table_cluster.bbox
-        if getattr(tbl, "coord_origin", None) and tbl.coord_origin.name == "BOTTOMLEFT":
-            tbl = tbl.to_top_left_origin(page_height=page.size.height)
-
-        lb, tb, rb, bb = float(tbl.l), float(tbl.t), float(tbl.r), float(tbl.b)
-
-        # 1) Fast AABB overlap mask (cheap comparisons)
-        L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
-        aabb = (R > lb) & (L < rb) & (B > tb) & (T < bb)
-        if not np.any(aabb):
+        if toks is None or toks.size == 0:
             return []
 
-        cand = toks[aabb]
-        Lc, Tc, Rc, Bc = cand['l'], cand['t'], cand['r'], cand['b']
+        # Table bbox → TOP-LEFT origin (unscaled)
+        H = float(page.size.height)
+        tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H).to_bounding_box()
+        lb, tb, rb, bb = tbl_tl.l, tbl_tl.t, tbl_tl.r, tbl_tl.b
 
-        # 2) Vectorized intersection-over-self
-        inter_w = np.maximum(0.0, np.minimum(Rc, rb) - np.maximum(Lc, lb))
-        inter_h = np.maximum(0.0, np.minimum(Bc, bb) - np.maximum(Tc, tb))
+        # Vectorized IOS filter
+        L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
+        inter_w = np.maximum(0.0, np.minimum(R, rb) - np.maximum(L, lb))
+        inter_h = np.maximum(0.0, np.minimum(B, bb) - np.maximum(T, tb))
         inter = inter_w * inter_h
-        area = (Rc - Lc) * (Bc - Tc)
-        keep = inter >= (ios_thresh * area)
+        area = (R - L) * (B - T)
+        keep = inter >= (ios * area)
 
         if not np.any(keep):
             return []
 
-        sel = cand[keep]
+        idx = np.nonzero(keep)[0]
+        sel = toks[idx]
 
-        # 3) Build minimal dicts, scaled as before
+        # Package for TF: scale now (cheap, one pass)
+        s = float(self.scale)
         return [
             {
                 "id": int(t['id']),
-                "text": "",  # fill later if needed
+                "text": "",  # keep light; attach later only if needed
                 "bbox": {
-                    "l": float(t['l'] * sx),
-                    "t": float(t['t'] * sy),
-                    "r": float(t['r'] * sx),
-                    "b": float(t['b'] * sy),
+                    "l": float(t['l'] * s),
+                    "t": float(t['t'] * s),
+                    "r": float(t['r'] * s),
+                    "b": float(t['b'] * s),
                 },
             }
             for t in sel

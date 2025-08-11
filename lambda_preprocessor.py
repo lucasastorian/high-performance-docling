@@ -35,7 +35,7 @@ class LambdaPreprocessor:
 
             # Build the token index
             # page.build_token_index()
-            page.tokens_np = build_tokens_np(page.parsed_page, page.size.height)
+            page.tokens_np = build_tokens_np(page.parsed_page)
 
             pages.append(page)
 
