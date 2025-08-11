@@ -993,58 +993,74 @@ class TFPredictor:
 
     def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
         """
-        Vectorized GPU batch preparation - processes all images in a single GPU operation.
-        Equivalent to: ((img/255) - mean) / std, then resize, then (C,W,H) layout.
+        Fully device-side prep (CUDA/MPS/CPU):
+          - stack/pad to NHWC uint8 on host
+          - single H2D (pinned + non_blocking on CUDA)
+          - on device: cast -> scale -> normalize -> resize
+          - return (B,C,W,H) float32 (channels_last)
         """
         S = self._config["dataset"]["resized_image"]
-        if not images:
-            return torch.empty(0, 3, S, S, device=self._device, dtype=torch.float32)
+        dev = torch.device(self._device) if isinstance(self._device, str) else self._device
 
-        # Pre-process images on CPU to ensure consistent shape
-        processed_images = []
-        max_h, max_w = 0, 0
-        
-        for np_img in images:
-            # Handle grayscale -> 3ch, drop alpha
-            if np_img.ndim == 2:
-                np_img = np.repeat(np_img[..., None], 3, axis=-1)
-            elif np_img.shape[-1] > 3:
-                np_img = np_img[..., :3]
-            processed_images.append(np_img)
-            max_h = max(max_h, np_img.shape[0])
-            max_w = max(max_w, np_img.shape[1])
-        
-        # Stack all images into a single numpy array with padding if needed
-        batch_np = np.zeros((len(images), max_h, max_w, 3), dtype=np.float32)
-        for i, img in enumerate(processed_images):
-            h, w = img.shape[:2]
-            batch_np[i, :h, :w, :] = img.astype(np.float32)
-        
-        # Single transfer to GPU with pinned memory for speed
-        batch_tensor = torch.from_numpy(batch_np).pin_memory().to(self._device, non_blocking=True)
-        
-        # Scale to [0,1]
-        batch_tensor = batch_tensor / 255.0
-        
-        # Prepare mean/std for broadcasting (B,H,W,C format)
-        mean = torch.tensor(self._config["dataset"]["image_normalization"]["mean"],
-                          device=self._device, dtype=torch.float32).view(1, 1, 1, 3)
-        std = torch.tensor(self._config["dataset"]["image_normalization"]["std"],
-                         device=self._device, dtype=torch.float32).view(1, 1, 1, 3)
-        
-        # Normalize all at once
-        batch_tensor = (batch_tensor - mean) / std
-        
-        # Convert to B,C,H,W for interpolation
-        batch_tensor = batch_tensor.permute(0, 3, 1, 2)
-        
-        # Single batched interpolation call
-        batch_tensor = F.interpolate(batch_tensor, size=(S, S), mode="bilinear", align_corners=False)
-        
-        # Convert to the quirky (B, C, W, H) layout the model expects
-        batch_tensor = batch_tensor.permute(0, 1, 3, 2)  # B,C,S,S -> B,C,S,S (W,H swap)
-        
-        return batch_tensor.contiguous(memory_format=torch.channels_last)
+        # Empty
+        if not images:
+            return torch.empty(0, 3, S, S, device=dev, dtype=torch.float32)
+
+        # ---- CPU: normalize shapes & stack uint8 NHWC once ----
+        proc = []
+        max_h = max_w = 0
+        for img in images:
+            a = img
+            if a.ndim == 2:
+                a = np.repeat(a[..., None], 3, axis=-1)
+            elif a.shape[-1] > 3:
+                a = a[..., :3]
+            a = np.ascontiguousarray(a, dtype=np.uint8)
+            proc.append(a)
+            h, w = a.shape[:2]
+            if h > max_h: max_h = h
+            if w > max_w: max_w = w
+
+        B = len(proc)
+        batch_np = np.zeros((B, max_h, max_w, 3), dtype=np.uint8)
+        for i, a in enumerate(proc):
+            h, w = a.shape[:2]
+            batch_np[i, :h, :w, :] = a
+
+        # ---- Single host->device move (pin + non_blocking on CUDA) ----
+        t = torch.from_numpy(batch_np)  # CPU uint8
+        if dev.type == "cuda":
+            if not t.is_pinned():
+                t = t.pin_memory()
+            t = t.to(dev, non_blocking=True)  # GPU uint8
+            work_dtype = torch.float16  # fast on CUDA
+        else:
+            t = t.to(dev)  # MPS/CPU uint8
+            work_dtype = torch.float32  # safer on MPS/CPU
+
+        # ---- Device: cast/scale/normalize/resize in batch ----
+        t = t.to(dtype=work_dtype)  # [B,H,W,3]
+        t = t / 255  # [0,1]
+        mean = torch.tensor(
+            self._config["dataset"]["image_normalization"]["mean"],
+            device=dev, dtype=work_dtype
+        ).view(1, 1, 1, 3)
+        std = torch.tensor(
+            self._config["dataset"]["image_normalization"]["std"],
+            device=dev, dtype=work_dtype
+        ).view(1, 1, 1, 3)
+        t = (t - mean) / std  # [B,H,W,3]
+
+        t = t.permute(0, 3, 1, 2)  # [B,3,H,W]
+        t = torch.nn.functional.interpolate(
+            t, size=(S, S), mode="bilinear", align_corners=False
+        )  # [B,3,S,S]
+
+        # Model expects (B,C,W,H)
+        t = t.permute(0, 1, 3, 2)  # [B,3,S,S] (W,H swapped)
+
+        # Output float32 (let AMP/autocast downcast during model forward)
+        return t.to(dtype=torch.float32).contiguous(memory_format=torch.channels_last)
 
     def _normalize_model_batch_outputs(self, model_result):
         """
