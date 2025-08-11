@@ -996,48 +996,37 @@ class TFPredictor:
         if not images:
             return torch.empty(0, 3, S, S, device=self._device, dtype=torch.float32)
 
-        # --- cache these in __init__ ideally ---
-        mean = getattr(self, "_norm_mean", None)
-        std = getattr(self, "_norm_std", None)
-        if mean is None:
+        # cache once in __init__ ideally
+        if not hasattr(self, "_norm_mean"):
             m = torch.tensor(self._config["dataset"]["image_normalization"]["mean"], dtype=torch.float32)
             s = torch.tensor(self._config["dataset"]["image_normalization"]["std"], dtype=torch.float32)
-            # NCHW broadcast
-            self._norm_mean = mean = m.view(1, 3, 1, 1).to(self._device)
-            self._norm_std = std = s.view(1, 3, 1, 1).to(self._device)
-        else:
-            std = self._norm_std
+            self._norm_mean = m.view(1, 3, 1, 1).to(self._device)
+            self._norm_std = s.view(1, 3, 1, 1).to(self._device)
 
-        # --- CPU side: clean channels & stack once ---
-        cleaned = []
-        for np_img in images:
-            if np_img.ndim == 2:
-                np_img = np.repeat(np_img[..., None], 3, axis=-1)
-            elif np_img.shape[-1] > 3:
-                np_img = np_img[..., :3]
-            cleaned.append(torch.from_numpy(np_img))  # CPU tensor, zero-copy
+        # CPU: channel-fix + resize to SxS using OpenCV (INTER_LINEAR)
+        resized = []
+        for im in images:
+            if im.ndim == 2:
+                im = np.repeat(im[..., None], 3, axis=-1)
+            elif im.shape[-1] > 3:
+                im = im[..., :3]
+            # W,H order in cv2
+            r = cv2.resize(im, (S, S), interpolation=cv2.INTER_LINEAR)
+            resized.append(torch.from_numpy(r))  # CPU uint8
 
-        # Stack NHWC uint8 on CPU, pin, and one async H->D copy
-        cpu_b = torch.stack(cleaned, dim=0)  # (N,H,W,C), uint8
-        cpu_b = cpu_b.pin_memory() if torch.cuda.is_available() else cpu_b
-        b = cpu_b.to(self._device, dtype=torch.float32, non_blocking=True)  # (N,H,W,C)
-        b = b / 255.0
+        cpu_b = torch.stack(resized, dim=0)  # (N,S,S,3)
+        if torch.cuda.is_available():
+            cpu_b = cpu_b.pin_memory()
 
-        # NHWC -> NCHW once
-        b = b.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)
+        # one async copy, then normalize on GPU
+        x = cpu_b.to(self._device, dtype=torch.float32, non_blocking=True) / 255.0
+        x = x.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)  # NCHW
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+            x = (x - self._norm_mean) / self._norm_std  # (N,3,S,S)
 
-        # Mixed precision helps interpolate + normalize (keeps output as fp32 if needed)
-        use_amp = torch.cuda.is_available()
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            b = (b - mean) / std  # (N,3,H,W)
-            b = torch.nn.functional.interpolate(
-                b, size=(S, S), mode="bilinear", align_corners=False
-            )  # (N,3,S,S)
-
-        # Final layout quirk: (C,W,H). Do a single swap of H<->W at the end.
-        b = b.to(dtype=torch.float32, copy=False)
-        b = b.transpose(-1, -2).contiguous()  # (N,3,S,S) but interpreted as (C,W,H) per-sample
-        return b
+        # final quirk: (C,W,H) per sample (swap H<->W once)
+        x = x.to(torch.float32, copy=False).transpose(-1, -2).contiguous()
+        return x
     #
     # def _prepare_image_batch(self, images: list[np.ndarray]) -> torch.Tensor:
     #     """
