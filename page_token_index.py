@@ -14,6 +14,7 @@ TOK_DTYPE = np.dtype([
 
 @dataclass
 class PageTokenIndex:
+
     scale: float
     page_height: float
     page_width: float

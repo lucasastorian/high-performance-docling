@@ -30,7 +30,7 @@ class Page(BaseModel):
     token_index: Optional[PageTokenIndex] = None
 
     def build_token_index(self):
-        self.token_index = PageTokenIndex(page_height=self.size.height, page_width=self.size.width)
+        self.token_index = PageTokenIndex(scale=2.0, page_height=self.size.height, page_width=self.size.width)
         self.token_index.build(self.parsed_page, grid_cell=256)
 
     @property
