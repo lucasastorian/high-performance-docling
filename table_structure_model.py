@@ -336,7 +336,7 @@ class TableStructureModel(BasePageModel):
 
         # Table bbox → TOP-LEFT origin (unscaled)
         H = float(page.size.height)
-        tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H).to_bounding_box()
+        tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H)
         lb, tb, rb, bb = tbl_tl.l, tbl_tl.t, tbl_tl.r, tbl_tl.b
 
         # Vectorized IOS filter
