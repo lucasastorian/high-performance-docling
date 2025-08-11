@@ -150,13 +150,21 @@ class TFPredictor:
             
         self._model = prepare_model_for_infer(self._model, device_obj)
         
-        # Try to compile for extra speed (optional)
-        if device == "cuda" or device.startswith("cuda:"):
+        # Try CUDA graphs for extra speed on GPU
+        self._use_cuda_graphs = os.environ.get('USE_CUDA_GRAPHS', '1') == '1'
+        if (device == "cuda" or device.startswith("cuda:")) and self._use_cuda_graphs:
             try:
-                self._model = torch.compile(self._model, mode="max-autotune", fullgraph=False)
-                self._log().info("Model compiled successfully for GPU")
+                from graph_model_wrapper import enable_cuda_graphs
+                wrapper = enable_cuda_graphs(self)
+                self._log().info("CUDA Graphs enabled for inference")
             except Exception as e:
-                self._log().info(f"torch.compile not available or failed: {e}")
+                self._log().info(f"CUDA Graphs not available: {e}")
+                # Fallback to torch.compile
+                try:
+                    self._model = torch.compile(self._model, mode="max-autotune", fullgraph=False)
+                    self._log().info("Model compiled successfully for GPU")
+                except Exception as e2:
+                    self._log().info(f"torch.compile not available or failed: {e2}")
         self._prof = config["predict"].get("profiling", False)
         self._profiling_agg_window = config["predict"].get("profiling_agg_window", None)
         if self._profiling_agg_window is not None:
