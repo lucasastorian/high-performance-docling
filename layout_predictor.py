@@ -81,7 +81,7 @@ class LayoutPredictor:
             blacklist_classes: Set[str] = set(),
             enable_timing: bool = False,
             enable_nms: bool = False,
-            max_batch_size: int = 16,
+            max_batch_size: int = 128,
     ):
         """
         Provide the artifact path that contains the LayoutModel file
@@ -91,7 +91,7 @@ class LayoutPredictor:
         artifact_path: Path for the model torch file.
         device: (Optional) device to run the inference.
         num_threads: (Optional) Number of threads to run the inference if device = 'cpu'
-        max_batch_size: (Optional) Maximum batch size for processing images. Default 16.
+        max_batch_size: (Optional) Maximum batch size for processing images. Default 128.
 
         Raises
         ------
