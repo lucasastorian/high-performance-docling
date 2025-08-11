@@ -462,21 +462,29 @@ class CellMatcher:
             page_bboxes_list1.append(page_bbox1)
         return page_bboxes_list1
 
-    def _intersection_over_pdf_match(self, table_cells, pdf_cells):
+    def _intersection_over_pdf_match(self, table_cells, pdf_cells, page=None,
+                                      table_bbox=None, ios_prefilter=1e-6,
+                                      max_elems=20_000_000):
         r"""
-        Compute Intersection between table cells and pdf cells,
-        match 1 pdf cell with highest intersection with only 1 table cell.
-
-        First compute and cache the areas for all involved bboxes.
-        Then compute the pairwise intersections
+        Vectorized IoPDF between table_cells and tokens restricted to the table area.
+        If `page.word_index` is available and `table_bbox` is given, we use it to pull
+        only relevant tokens; otherwise we use the provided `pdf_cells` list.
 
         Parameters
         ----------
         table_cells : list of dict
             Each value is a dictionary with keys: "cell_id", "row_id", "column_id", "bbox", "label"
-
         pdf_cells : list of dict
             Each element of the list is a dictionary which should have the keys: "id", "bbox"
+        page : Page, optional
+            Page object with word_index for fast token retrieval
+        table_bbox : list of 4, optional
+            Table bounding box to filter tokens from page index
+        ios_prefilter : float
+            Minimum IoS for prefiltering tokens from page index
+        max_elems : int
+            Maximum elements for chunking to control memory usage
+
         Returns
         -------
         dictionary of lists of table_cells
@@ -485,62 +493,131 @@ class CellMatcher:
         int
             Number of total matches
         """
-        pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells])
-        pdf_bboxes_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
-            pdf_bboxes[:, 3] - pdf_bboxes[:, 1]
-        )
+        # Fast exit
+        if not table_cells:
+            return {}, 0
 
-        # key: pdf_cell_id, value: list of TableCell that fall inside that pdf_cell
+        # --- Choose token source (prefer index + table crop) ---
+        use_index = (page is not None and getattr(page, "word_index", None) is not None 
+                    and table_bbox is not None)
+        
+        if use_index:
+            wi = page.word_index
+            # Get candidate tokens that overlap the TABLE bbox
+            cand = wi.query_bbox_idx(table_bbox[0], table_bbox[1], 
+                                     table_bbox[2], table_bbox[3], ios=ios_prefilter)
+            if cand.size == 0:
+                return {}, 0
+            Lp, Tp, Rp, Bp = wi.l[cand], wi.t[cand], wi.r[cand], wi.b[cand]
+            P_ids = wi.id_arr[cand]
+            P_area = wi.area[cand]
+        else:
+            # Use provided cropped pdf_cells list
+            if not pdf_cells:
+                return {}, 0
+            # Ensure 2D shape
+            pdf_boxes = np.asarray([p["bbox"] for p in pdf_cells], dtype=np.float32)
+            if pdf_boxes.ndim != 2 or pdf_boxes.shape[1] != 4:
+                return {}, 0
+            Lp = pdf_boxes[:, 0]
+            Tp = pdf_boxes[:, 1]
+            Rp = pdf_boxes[:, 2]
+            Bp = pdf_boxes[:, 3]
+            P_ids = np.asarray([int(p["id"]) for p in pdf_cells], dtype=np.int64)
+            P_area = np.maximum((Rp - Lp) * (Bp - Tp), 1e-6)
+
+        # Table boxes
+        T = np.asarray([tc["bbox"] for tc in table_cells], dtype=np.float32)
+        if T.ndim != 2 or T.shape[1] != 4:
+            return {}, 0
+        Lt, Tt, Rt, Bt = T[:, 0], T[:, 1], T[:, 2], T[:, 3]
+
+        Nt = T.shape[0]
+        Np = Lp.shape[0]
+        if Nt == 0 or Np == 0:
+            return {}, 0
+
+        # --- Chunk to cap memory if needed ---
+        # We'll form ~5 float32 matrices of size Nt*chunk
+        chunk = max(1, int(max_elems // max(Nt, 1)))
         matches = {}
         matches_counter = 0
 
-        # Compute Intersections and build matches
-        for i, table_cell in enumerate(table_cells):
-            table_cell_id = table_cell["cell_id"]
-            t_bbox = table_cell["bbox"]
+        for ps in range(0, Np, chunk):
+            pe = min(Np, ps + chunk)
+            Lpc = Lp[ps:pe]
+            Tpc = Tp[ps:pe]
+            Rpc = Rp[ps:pe]
+            Bpc = Bp[ps:pe]
+            Apc = P_area[ps:pe]
+            Pidc = P_ids[ps:pe]
 
-            for j, pdf_cell in enumerate(pdf_cells):
-                pdf_cell_id = pdf_cell["id"]
-                p_bbox = pdf_cell["bbox"]
+            # Broadcast intersections: shapes (Nt, pe-ps)
+            inter_l = np.maximum(Lt[:, None], Lpc[None, :])
+            inter_t = np.maximum(Tt[:, None], Tpc[None, :])
+            inter_r = np.minimum(Rt[:, None], Rpc[None, :])
+            inter_b = np.minimum(Bt[:, None], Bpc[None, :])
 
-                # Compute intersection
-                i_bbox = find_intersection(t_bbox, p_bbox)
-                if i_bbox is None:
-                    continue
+            inter_w = np.maximum(0.0, inter_r - inter_l)
+            inter_h = np.maximum(0.0, inter_b - inter_t)
+            inter = inter_w * inter_h
 
-                # Compute IOU and filter on threshold
-                i_bbox_area = (i_bbox[2] - i_bbox[0]) * (i_bbox[3] - i_bbox[1])
-                iopdf = 0
-                if float(pdf_bboxes_areas[j]) > 0:
-                    iopdf = i_bbox_area / float(pdf_bboxes_areas[j])
+            iopdf = inter / (Apc[None, :] + 1e-6)
 
-                if iopdf > 0:
-                    match = {"table_cell_id": table_cell_id, "iopdf": iopdf}
-                    if pdf_cell_id not in matches:
-                        matches[pdf_cell_id] = [match]
+            # Find non-zero matches
+            ti, pj = np.nonzero(iopdf > 0.0)
+            if ti.size == 0:
+                continue
+
+            # Scatter into the expected dict form
+            for k in range(ti.size):
+                i = int(ti[k])  # table cell index
+                j = int(pj[k])  # local token index within chunk
+                pdf_id = int(Pidc[j])
+                ent = {
+                    "table_cell_id": int(table_cells[i]["cell_id"]),
+                    "iopdf": float(iopdf[i, j])
+                }
+                
+                lst = matches.get(pdf_id)
+                if lst is None:
+                    matches[pdf_id] = [ent]
+                    matches_counter += 1
+                else:
+                    # Check for duplicates (shouldn't happen but being safe)
+                    duplicate = False
+                    for existing in lst:
+                        if existing["table_cell_id"] == ent["table_cell_id"]:
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        lst.append(ent)
                         matches_counter += 1
-                    else:
-                        # Check if the same match was not already counted
-                        if match not in matches[pdf_cell_id]:
-                            matches[pdf_cell_id].append(match)
-                            matches_counter += 1
+
         return matches, matches_counter
 
-    def _iou_match(self, table_cells, pdf_cells):
+    def _iou_match(self, table_cells, pdf_cells, page=None, table_bbox=None,
+                   ios_prefilter=1e-6, max_elems=20_000_000):
         r"""
-        Use Intersection over Union to decide the matching between table cells and pdf cells
-
-        First compute and cache the areas for all involved bboxes.
-        Then compute the pairwise intersections and IOUs and keep those pairs that exceed the IOU
-        threshold
+        Vectorized IoU matching between table cells and pdf cells.
+        If `page.word_index` is available and `table_bbox` is given, we use it to pull
+        only relevant tokens; otherwise we use the provided `pdf_cells` list.
 
         Parameters
         ----------
         table_cells : list of dict
             Each value is a dictionary with keys: "cell_id", "row_id", "column_id", "bbox", "label"
-
         pdf_cells : list of dict
-            Each element of the list is a dictionary which should have the keys: "id", "bbox"
+            Each element of the list is a dictionary which should have the keys: "id", "bbox", "text"
+        page : Page, optional
+            Page object with word_index for fast token retrieval
+        table_bbox : list of 4, optional
+            Table bounding box to filter tokens from page index
+        ios_prefilter : float
+            Minimum IoS for prefiltering tokens from page index
+        max_elems : int
+            Maximum elements for chunking to control memory usage
+
         Returns
         -------
         dictionary of lists of table_cells
@@ -549,57 +626,102 @@ class CellMatcher:
         int
             Number of total matches
         """
-        table_bboxes = np.asarray([t["bbox"] for t in table_cells])
-        pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells])
+        # Fast exit
+        if not table_cells:
+            return {}, 0
 
-        # Cache the areas for table bboxes and pdf bboxes
-        table_bboxes_areas = (table_bboxes[:, 2] - table_bboxes[:, 0]) * (
-            table_bboxes[:, 3] - table_bboxes[:, 1]
-        )
+        # --- Choose token source (prefer index + table crop) ---
+        use_index = (page is not None and getattr(page, "word_index", None) is not None 
+                    and table_bbox is not None)
+        
+        if use_index:
+            wi = page.word_index
+            # Get candidate tokens that overlap the TABLE bbox
+            cand = wi.query_bbox_idx(table_bbox[0], table_bbox[1], 
+                                     table_bbox[2], table_bbox[3], ios=ios_prefilter)
+            if cand.size == 0:
+                return {}, 0
+            Lp, Tp, Rp, Bp = wi.l[cand], wi.t[cand], wi.r[cand], wi.b[cand]
+            P_ids = wi.id_arr[cand]
+            P_area = wi.area[cand]
+            P_texts = [wi.texts[int(i)] for i in cand]
+        else:
+            # Use provided cropped pdf_cells list
+            if not pdf_cells:
+                return {}, 0
+            # Ensure 2D shape
+            pdf_boxes = np.asarray([p["bbox"] for p in pdf_cells], dtype=np.float32)
+            if pdf_boxes.ndim != 2 or pdf_boxes.shape[1] != 4:
+                return {}, 0
+            Lp = pdf_boxes[:, 0]
+            Tp = pdf_boxes[:, 1]
+            Rp = pdf_boxes[:, 2]
+            Bp = pdf_boxes[:, 3]
+            P_ids = np.asarray([int(p["id"]) for p in pdf_cells], dtype=np.int64)
+            P_area = np.maximum((Rp - Lp) * (Bp - Tp), 1e-6)
+            P_texts = [p.get("text", "") for p in pdf_cells]
 
-        pdf_bboxes_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
-            pdf_bboxes[:, 3] - pdf_bboxes[:, 1]
-        )
+        # Table boxes
+        T = np.asarray([tc["bbox"] for tc in table_cells], dtype=np.float32)
+        if T.ndim != 2 or T.shape[1] != 4:
+            return {}, 0
+        Lt, Tt, Rt, Bt = T[:, 0], T[:, 1], T[:, 2], T[:, 3]
+        T_area = np.maximum((Rt - Lt) * (Bt - Tt), 1e-6)
 
-        # key: pdf_cell_id, value: list of TableCell that fall inside that pdf_cell
+        Nt = T.shape[0]
+        Np = Lp.shape[0]
+        if Nt == 0 or Np == 0:
+            return {}, 0
+
+        # --- Chunk to cap memory if needed ---
+        chunk = max(1, int(max_elems // max(Nt, 1)))
         matches = {}
         matches_counter = 0
 
-        # Compute IOUs and build matches
-        for i, table_cell in enumerate(table_cells):
-            table_cell_id = table_cell["cell_id"]
-            t_bbox = table_cell["bbox"]
+        for ps in range(0, Np, chunk):
+            pe = min(Np, ps + chunk)
+            Lpc = Lp[ps:pe]
+            Tpc = Tp[ps:pe]
+            Rpc = Rp[ps:pe]
+            Bpc = Bp[ps:pe]
+            Apc = P_area[ps:pe]
+            Pidc = P_ids[ps:pe]
 
-            for j, pdf_cell in enumerate(pdf_cells):
-                pdf_cell_id = pdf_cell["id"]
-                pdf_cell_text = pdf_cell["text"]
-                p_bbox = pdf_cell["bbox"]
+            # Broadcast intersections: shapes (Nt, pe-ps)
+            inter_l = np.maximum(Lt[:, None], Lpc[None, :])
+            inter_t = np.maximum(Tt[:, None], Tpc[None, :])
+            inter_r = np.minimum(Rt[:, None], Rpc[None, :])
+            inter_b = np.minimum(Bt[:, None], Bpc[None, :])
 
-                # Compute intersection
-                i_bbox = find_intersection(t_bbox, p_bbox)
-                if i_bbox is None:
-                    continue
+            inter_w = np.maximum(0.0, inter_r - inter_l)
+            inter_h = np.maximum(0.0, inter_b - inter_t)
+            inter = inter_w * inter_h
 
-                # Compute IOU and filter on threshold
-                i_bbox_area = (i_bbox[2] - i_bbox[0]) * (i_bbox[3] - i_bbox[1])
-                iou = 0
-                div_area = float(
-                    table_bboxes_areas[i] + pdf_bboxes_areas[j] - i_bbox_area
-                )
-                if div_area > 0:
-                    iou = i_bbox_area / div_area
-                if iou < self._iou_thres:
-                    continue
+            # IoU = intersection / (area1 + area2 - intersection)
+            union = T_area[:, None] + Apc[None, :] - inter
+            iou = np.where(union > 0, inter / union, 0.0)
 
-                if pdf_cell_id not in matches:
-                    matches[pdf_cell_id] = []
+            # Find matches above threshold
+            ti, pj = np.nonzero(iou >= self._iou_thres)
+            if ti.size == 0:
+                continue
 
+            # Scatter into the expected dict form
+            for k in range(ti.size):
+                i = int(ti[k])  # table cell index
+                j = int(pj[k])  # local token index within chunk
+                global_j = ps + j  # global pdf token index
+                pdf_id = int(Pidc[j])
+                
+                if pdf_id not in matches:
+                    matches[pdf_id] = []
+                
                 match = {
-                    "table_cell_id": table_cell_id,
-                    "iou": iou,
-                    "text": pdf_cell_text,
+                    "table_cell_id": int(table_cells[i]["cell_id"]),
+                    "iou": float(iou[i, j]),
+                    "text": P_texts[global_j] if P_texts else "",
                 }
-                matches[pdf_cell_id].append(match)
+                matches[pdf_id].append(match)
                 matches_counter += 1
 
         return matches, matches_counter
