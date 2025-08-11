@@ -340,7 +340,7 @@ class TableStructureModel(BasePageModel):
         ]
         bbox = BoundingBox(l=tbl_box[0], t=tbl_box[1], r=tbl_box[2], b=tbl_box[3])
         idx = page.token_index.query_tokens_in_bbox(bbox_scaled_tl=bbox, ios=0.8)
-        toks = page._tokens_np[idx]
+        toks = page.token_index._tokens_np[idx]
 
         # build the exact dicts your predictor expects
         # (no text unless you truly need it; you can add a parallel string store later)
