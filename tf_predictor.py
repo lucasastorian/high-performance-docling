@@ -150,6 +150,25 @@ class TFPredictor:
             
         self._model = prepare_model_for_infer(self._model, device_obj)
         
+        # Prune vocabulary for faster decoding
+        self._use_vocab_pruning = os.environ.get('USE_VOCAB_PRUNING', '1') == '1'
+        if self._use_vocab_pruning:
+            try:
+                from vocab_pruner import prune_decoder_vocab
+                self._model, pruned_word_map = prune_decoder_vocab(
+                    self._model, 
+                    self._word_map,
+                    device=device_obj
+                )
+                # Update our word map with pruned version
+                self._word_map = pruned_word_map
+                self._init_data["word_map"] = pruned_word_map
+                # Rebuild reverse map
+                self._rev_word_map = {v: k for k, v in pruned_word_map["word_map_tag"].items()}
+                self._log().info("Vocabulary pruning enabled for decoder")
+            except Exception as e:
+                self._log().info(f"Vocabulary pruning not available: {e}")
+        
         # Try CUDA graphs for extra speed on GPU
         self._use_cuda_graphs = os.environ.get('USE_CUDA_GRAPHS', '1') == '1'
         if (device == "cuda" or device.startswith("cuda:")) and self._use_cuda_graphs:
