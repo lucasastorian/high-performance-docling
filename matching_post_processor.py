@@ -7,6 +7,7 @@ import logging
 import math
 import statistics
 
+import numpy as np
 import docling_ibm_models.tableformer.settings as s
 
 from tf_cell_matcher import CellMatcher
@@ -374,15 +375,11 @@ class MatchingPostProcessor:
             A dictionary which is indexed by the pdf_cell_id as key and the value is a list
             of the table_cells that fall inside that pdf cell
         """
-        new_matches = {}
-        clean_matches = {}
         new_matches, matches_counter = cell_matcher._intersection_over_pdf_match(
             table_cells, pdf_cells
         )
-        clean_matches = new_matches
-        # Convert to JSON and back to have string keys in the dictionary
-        clean_matches_string = json.dumps(clean_matches)
-        clean_matches = json.loads(clean_matches_string)
+        # Convert keys to strings without JSON round-trip
+        clean_matches = {str(k): v for k, v in new_matches.items()}
         return clean_matches
 
     def _find_overlapping(self, table_cells):
