@@ -329,7 +329,7 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page, table_cluster, ios=0.8):
-        bbox = table_cluster.bbox.to_top_left_origin(page.word_index.page_height)
+        bbox = table_cluster.bbox.to_top_left_origin(page.word_index.H)
         return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
 
         # # Ensure tokens are prebuilt
