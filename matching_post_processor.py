@@ -256,13 +256,13 @@ class MatchingPostProcessor:
                 self._log().debug(cell)
 
         if len(coords_x) > 0:
-            median_x = statistics.median(coords_x)
+            median_x = float(np.median(coords_x))
         if len(coords_y) > 0:
-            median_y = statistics.median(coords_y)
+            median_y = float(np.median(coords_y))
         if len(widths) > 0:
-            median_width = statistics.median(widths)
+            median_width = float(np.median(widths))
         if len(heights) > 0:
-            median_height = statistics.median(heights)
+            median_height = float(np.median(heights))
         return median_x, median_y, median_width, median_height
 
     def _move_cells_to_left_pos(
@@ -296,63 +296,58 @@ class MatchingPostProcessor:
             Cells in a column
             Each value is a dictionary with keys: "cell_id", "row_id", "column_id", "bbox", "label"
         """
-        new_table_cells = []
+        if not cells:
+            return []
 
-        for cell in cells:
-            new_cell = {
-                "bbox": [],
-                "cell_id": 0,
-                "column_id": 0,
-                "label": "",
-                "row_id": 0,
-                "cell_class": 0,
-            }
-            x1 = cell["bbox"][0]
-            y1 = cell["bbox"][1]
-            x2 = cell["bbox"][2]
-            y2 = cell["bbox"][3]
-            original_width = x2 - x1
-            # original_height = y2 - y1
+        # Vectorized bbox computation
+        b = np.asarray([c["bbox"] for c in cells], dtype=np.float32)
+        x1, y1, x2, y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+        widths = x2 - x1
 
-            # Move to left by default
-            new_x1 = median_x
-            new_y1 = y1
-            new_x2 = median_x + original_width
+        # Determine target width based on rescale
+        if rescale:
+            target_w = float(median_width)
+            new_y2 = y1 + float(median_height)
+        else:
+            target_w = widths
             new_y2 = y2
 
-            if rescale:
-                new_x2 = median_x + median_width
-                # Next line does vertical resizing of BBOX:
-                new_y2 = y1 + median_height
+        # Default alignment is "left"
+        new_x1 = np.full_like(widths, float(median_x))
+        new_x2 = new_x1 + target_w
+        new_y1 = y1
 
-            # Move to middle
-            if alignment == "middle":
-                # TODO
-                new_x1 = median_x - (original_width / 2)
-                new_x2 = new_x1 + original_width
-                if rescale:
-                    new_x1 = median_x - (median_width / 2)
-                    new_x2 = median_x + (median_width / 2)
+        # Adjust for "middle" alignment
+        if alignment == "middle":
+            new_x1 = float(median_x) - (target_w / 2.0)
+            new_x2 = new_x1 + target_w
 
-            # Move to right
-            if alignment == "right":
-                new_x1 = median_x - original_width
-                new_x2 = median_x
-                if rescale:
-                    new_x1 = median_x - median_width
+        # Adjust for "right" alignment
+        elif alignment == "right":
+            new_x1 = float(median_x) - target_w
+            new_x2 = np.full_like(widths, float(median_x))
 
-            new_cell["bbox"] = [new_x1, new_y1, new_x2, new_y2]
-            new_cell["cell_id"] = cell["cell_id"]
-            new_cell["column_id"] = cell["column_id"]
-            new_cell["label"] = cell["label"]
-            new_cell["row_id"] = cell["row_id"]
-            new_cell["cell_class"] = cell["cell_class"]
-            # Add spans if present
+        # Stack into new bbox array
+        new_b = np.stack([new_x1, new_y1, new_x2, new_y2], axis=1)
+
+        # Rebuild dicts with updated bbox (single pass)
+        new_table_cells = []
+        for i, cell in enumerate(cells):
+            new_cell = {
+                "bbox": new_b[i].tolist(),
+                "cell_id": cell["cell_id"],
+                "column_id": cell["column_id"],
+                "label": cell.get("label", ""),
+                "row_id": cell["row_id"],
+                "cell_class": cell.get("cell_class", 0),
+            }
+            # Preserve optional spans if present
             if "rowspan_val" in cell:
                 new_cell["rowspan_val"] = cell["rowspan_val"]
             if "colspan_val" in cell:
                 new_cell["colspan_val"] = cell["colspan_val"]
             new_table_cells.append(new_cell)
+        
         return new_table_cells
 
     def _run_intersection_match(self, cell_matcher, table_cells, pdf_cells):
