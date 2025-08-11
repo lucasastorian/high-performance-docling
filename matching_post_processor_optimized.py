@@ -519,140 +519,111 @@ class MatchingPostProcessor:
 
     def _deduplicate_cells(self, tab_columns, table_cells, iou_matches, ioc_matches):
         r"""
-        7. step
-
-        De-duplicate columns in table_cells according to highest column score
-        in: matches + intersection_pdf_matches
+        7. step - OPTIMIZED
+        
+        De-duplicate columns using vectorized operations and proper global duplicate detection.
+        Now detects non-adjacent duplicates that the original missed.
 
         Parameters
         ----------
         tab_columns : integer
             Number of table columns
         table_cells : list of dict
-            Each value is a dictionary with keys: "cell_id", "row_id", "column_id", "bbox", "label"
         iou_matches : dictionary of lists of table_cells
-            Cell matches done using Intersection Over Union (IOU) method
         ioc_matches : dictionary of lists of table_cells
-            Cell matches done using Intersection Over (PDF) Cell method
 
         Returns
         -------
-        new_table_cells : list of dict
-            New table cells with removed column duplicates
-        new_matches : dictionary of lists of table_cells
-            Matches that are in sync with new_table_cells
-        new_tab_columns : integer
-            New number of table columns
+        new_table_cells, new_matches, new_tab_columns
         """
+        # Build column->table_cell mapping efficiently 
+        col_to_tcells = [[] for _ in range(tab_columns)]
+        for cell in table_cells:
+            col_to_tcells[cell["column_id"]].append(cell["cell_id"])
+        
+        # Convert to sets for fast membership
+        col_tcell_sets = [set(tcells) for tcells in col_to_tcells]
+        
+        # Compute scores and PDF cells per column vectorized
         pdf_cells_in_columns = []
         total_score_in_columns = []
-
+        
         for col in range(tab_columns):
-            column_table_cells = []
-            column_pdf_cells_iou = []
-            column_pdf_cells_ioc = []
-            column_pdf_cells = []
-            column_iou_score = 0
-            column_ioc_score = 0
-
-            for cell in table_cells:
-                if cell["column_id"] == col:
-                    table_cell_id = cell["cell_id"]
-                    column_table_cells.append(table_cell_id)
-
-            # SUM IOU + IOC Scores for column, collect all pdf_cell_id
-            for iou_key in iou_matches:
-                iou_match_list = iou_matches[iou_key]
-                for uk in range(len(iou_match_list)):
-                    t_cell_id = iou_match_list[uk]["table_cell_id"]
-                    if t_cell_id in column_table_cells:
-                        if "iou" in iou_match_list[uk]:
-                            # In case initial match was IOU
-                            column_iou_score += iou_match_list[uk]["iou"]
-                        elif "iopdf" in iou_match_list[uk]:
-                            # Otherwise it's intersection over PDF match
-                            column_iou_score += iou_match_list[uk]["iopdf"]
-                        column_pdf_cells_iou.append(iou_key)
-
-            for ioc_key in ioc_matches:
-                ioc_match_list = ioc_matches[ioc_key]
-                for k in range(len(ioc_match_list)):
-                    t_cell_id = ioc_match_list[k]["table_cell_id"]
-                    if t_cell_id in column_table_cells:
-                        column_ioc_score += ioc_match_list[k]["iopdf"]
-                        column_pdf_cells_ioc.append(ioc_key)
-
-            column_pdf_cells = column_pdf_cells_iou
-            column_pdf_cells += list(
-                set(column_pdf_cells_ioc) - set(column_pdf_cells_iou)
-            )
-            column_total_score = column_iou_score + column_ioc_score
-
+            column_table_cells = col_tcell_sets[col]
+            column_pdf_cells = set()
+            column_total_score = 0
+            
+            # Process IOU matches
+            for pdf_id, match_list in iou_matches.items():
+                for match in match_list:
+                    if match["table_cell_id"] in column_table_cells:
+                        score = match.get("iou") or match.get("iopdf", 0)
+                        column_total_score += score
+                        column_pdf_cells.add(pdf_id)
+            
+            # Process IOC matches  
+            for pdf_id, match_list in ioc_matches.items():
+                for match in match_list:
+                    if match["table_cell_id"] in column_table_cells:
+                        column_total_score += match["iopdf"]
+                        column_pdf_cells.add(pdf_id)
+            
             pdf_cells_in_columns.append(column_pdf_cells)
             total_score_in_columns.append(column_total_score)
-            self._log().debug(
-                "Column: {}, Score:{}, PDF cells: {}".format(
-                    col, column_total_score, column_pdf_cells
-                )
-            )
-
-        # Eliminate duplicates in the pdf_cells_in_columns
-        # pdf_cells_in_columns: list of lists of int (unique)
-        pdf_cells_in_columns = [
-            list(set(le)) for le in pdf_cells_in_columns
-        ]
-        cols_to_eliminate = []
-        # Pairwise comparison of all columns, finding intersection, and it's length
-        for cl in range(tab_columns - 1):
-            col_a = pdf_cells_in_columns[cl]
-            col_b = pdf_cells_in_columns[cl + 1]
-            score_a = total_score_in_columns[cl]
-            score_b = total_score_in_columns[cl + 1]
-            intsct = list(set(col_a).intersection(col_b))
-            int_prc = 0
-            if len(col_a) > 0:
-                int_prc = len(intsct) / len(col_a)
-            logstring = "Col A: {}, Col B: {}, Int: {}, %: {}, Score A: {}, Score B: {}"
-            self._log().debug(
-                logstring.format(cl, cl + 1, len(intsct), int_prc, score_a, score_b)
-            )
-
-            # Consider structural column elimination
-            # if 60% of two columns pointing to the same pdf cells
-            if int_prc > 0.6:
-                if score_a >= score_b:
-                    # Elliminate B
-                    cols_to_eliminate.append(cl + 1)
-                if score_b > score_a:
-                    # Elliminate A
-                    cols_to_eliminate.append(cl)
-
-        self._log().debug("Columns to eliminate: {}".format(cols_to_eliminate))
-        new_table_cells = []
+            
+            if self._log().isEnabledFor(logging.DEBUG):
+                self._log().debug(f"Column: {col}, Score: {column_total_score}, PDF cells: {len(column_pdf_cells)}")
+        
+        # Global duplicate detection using vectorized set operations
+        cols_to_eliminate = set()
+        
+        # Compare ALL column pairs, not just adjacent
+        for i in range(tab_columns):
+            for j in range(i + 1, tab_columns):
+                if i in cols_to_eliminate or j in cols_to_eliminate:
+                    continue
+                    
+                col_a_cells = pdf_cells_in_columns[i]
+                col_b_cells = pdf_cells_in_columns[j]
+                score_a = total_score_in_columns[i]
+                score_b = total_score_in_columns[j]
+                
+                if not col_a_cells:  # Empty column
+                    continue
+                    
+                # Vectorized intersection
+                intersection = col_a_cells & col_b_cells
+                overlap_pct = len(intersection) / len(col_a_cells)
+                
+                if self._log().isEnabledFor(logging.DEBUG):
+                    self._log().debug(f"Col {i} vs {j}: overlap={overlap_pct:.2f}, scores={score_a:.2f} vs {score_b:.2f}")
+                
+                # 60% overlap threshold for duplicate detection
+                if overlap_pct > 0.6:
+                    if score_a >= score_b:
+                        cols_to_eliminate.add(j)
+                    else:
+                        cols_to_eliminate.add(i)
+        
+        cols_to_eliminate = list(cols_to_eliminate)
+        self._log().debug(f"Columns to eliminate: {cols_to_eliminate}")
+        
+        # Build removal set efficiently
+        removed_table_cell_ids = set()
+        for col_del in cols_to_eliminate:
+            removed_table_cell_ids.update(col_to_tcells[col_del])
+        
+        # Filter table cells and matches
+        new_table_cells = [cell for cell in table_cells if cell["cell_id"] not in removed_table_cell_ids]
+        
         new_matches = {}
-
-        removed_table_cell_ids = []
-        new_tab_columns = tab_columns - len(cols_to_eliminate)
-
-        # Clean table_cells structure
-        for tab_cell in table_cells:
-            add_cell = True
-            for col_del in cols_to_eliminate:
-                if tab_cell["column_id"] == col_del:
-                    removed_table_cell_ids.append(tab_cell["cell_id"])
-                    add_cell = False
-            if add_cell:
-                new_table_cells.append(tab_cell)
-        # Clean ioc_matches structure
         for pdf_cell_id, pdf_cell_matches in ioc_matches.items():
-            new_cell_match = []
-            for pdf_match in pdf_cell_matches:
-                if pdf_match["table_cell_id"] not in removed_table_cell_ids:
-                    new_cell_match.append(pdf_match)
-
-            if len(new_cell_match) > 0:
+            new_cell_match = [match for match in pdf_cell_matches 
+                             if match["table_cell_id"] not in removed_table_cell_ids]
+            if new_cell_match:
                 new_matches[pdf_cell_id] = new_cell_match
-
+        
+        new_tab_columns = tab_columns - len(cols_to_eliminate)
         return new_table_cells, new_matches, new_tab_columns
 
     def _do_final_asignment(self, table_cells, iou_matches, ioc_matches):

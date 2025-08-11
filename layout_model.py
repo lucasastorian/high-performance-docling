@@ -215,15 +215,6 @@ class LayoutModel(BasePageModel):
             t_c1 = time.perf_counter()
             t_clusters_acc += (t_c1 - t_c0)
 
-            # Optional visualization (raw)
-            if settings.debug.visualize_raw_layout:
-                t_v0 = time.perf_counter()
-                self.draw_clusters_and_cells_side_by_side(
-                    conv_res, page, clusters, mode_prefix="raw"
-                )
-                t_v1 = time.perf_counter()
-                t_visual_acc += (t_v1 - t_v0)
-
             # 3) Postprocess (merging, RO heuristics, header/footer, etc.)
             t_p0 = time.perf_counter()
             processed_clusters, processed_cells = LayoutPostprocessor(
@@ -251,16 +242,6 @@ class LayoutModel(BasePageModel):
 
             # Save final layout predictions
             page.predictions.layout = LayoutPrediction(clusters=processed_clusters)
-
-            # Optional visualization (postprocessed)
-            if settings.debug.visualize_layout:
-                t_v0 = time.perf_counter()
-                self.draw_clusters_and_cells_side_by_side(
-                    conv_res, page, processed_clusters, mode_prefix="postprocessed"
-                )
-                t_v1 = time.perf_counter()
-                t_visual_acc += (t_v1 - t_v0)
-
             # Yield the page
             yield page
 
