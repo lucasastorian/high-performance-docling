@@ -140,46 +140,9 @@ class LayoutPredictor:
                 # Avoid per-batch layout conversions
                 self._model.to(memory_format=torch.channels_last)
                 
-                # ----- Torch-TRT via torch.compile (env gated) -----
-                self._use_torch_compile_trt = os.getenv("USE_TRT", "").lower() in ("1", "true", "yes")
-                
-                # Keep a fallback handle to the eager model
-                self._pt_model = self._model
-                
-                # Hold TRT engine separately 
-                self._pt_model = self._model            # FP32 eager model
-                self._trt_module = None
-                self._trt_max_bs = 64
-                
-                if self._use_torch_compile_trt:
-                    try:
-                        import torch_tensorrt as trt
-                        
-                        # Build TRT from FP32 model without mutating it
-                        self._trt_module = trt.compile(
-                            self._pt_model,                     # keep PT untouched
-                            ir="dynamo",
-                            inputs=[trt.Input(
-                                min_shape=(1, 3, 640, 640),
-                                opt_shape=(64, 3, 640, 640),
-                                max_shape=(64, 3, 640, 640),       # cap to avoid pathological tactics
-                                dtype=torch.float16
-                            )],
-                            enabled_precisions={torch.float16},
-                            workspace_size=2 << 30,
-                            truncate_long_and_double=True,
-                        )
-                        
-                        _log.info(f"Manual TensorRT compilation complete (max_batch=64, precision=FP16)")
-                    except ImportError:
-                        _log.warning("torch_tensorrt not available, falling back to PyTorch")
-                        self._use_torch_compile_trt = False
-                    except Exception as e:
-                        _log.warning(f"TensorRT compilation failed: {e}, falling back to PyTorch")
-                        self._use_torch_compile_trt = False
-                        self._trt_module = None
-            else:
-                self._use_torch_compile_trt = False
+                # ----- Always use torch.compile with Inductor -----
+                self._model = torch.compile(self._model, dynamic=True, mode="max-autotune")
+                _log.info("Model compiled with Inductor backend (FP32, dynamic=True, mode=max-autotune)")
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -305,33 +268,10 @@ class LayoutPredictor:
                     pixel_values = pixel_values.to(self._device)
 
         with timer.time_section('predict'):
-            # Choose backend based on batch size and availability
-            bsz = pixel_values.shape[0]
-            use_trt = (self._trt_module is not None) and (bsz <= self._trt_max_bs)
-            
-            # Layout helps both paths
+            # Always use channels_last for better performance
             pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
             
-            # Match dtype/device to chosen backend
-            if use_trt:
-                want_dtype = torch.float16
-                mod = self._trt_module
-            else:
-                want_dtype = next(self._pt_model.parameters()).dtype  # likely torch.float32
-                mod = self._pt_model
-            
-            if pixel_values.dtype != want_dtype:
-                pixel_values = pixel_values.to(want_dtype)
-            if pixel_values.device != next(self._pt_model.parameters()).device:
-                pixel_values = pixel_values.to(self._device, non_blocking=True)
-            
-            # Safe execute with permanent fallback if TRT explodes
-            try:
-                outputs = mod(pixel_values=pixel_values)
-            except Exception as e:
-                _log.warning(f"TRT path failed at runtime: {e}. Using PT model for this call and disabling TRT.")
-                self._trt_module = None
-                outputs = self._pt_model(pixel_values=pixel_values.to(next(self._pt_model.parameters()).dtype))
+            outputs = self._model(pixel_values=pixel_values)
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
