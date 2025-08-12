@@ -38,7 +38,6 @@ class CudaTimer:
     
     def __enter__(self):
         if self.enabled:
-            torch.cuda.synchronize()
             self.start_event.record()
         else:
             self.t0 = time.perf_counter()
