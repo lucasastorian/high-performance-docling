@@ -140,23 +140,12 @@ class GPUPreprocessor(nn.Module):
         
         batch_gpu = batch_cpu.to(self.device, non_blocking=True)
         
-        # Rescale if needed
-        if self.do_rescale:
-            if is_u8:
-                batch_gpu = batch_gpu.to(self.dtype)
-                batch_gpu = batch_gpu.mul_(self.rescale_factor)
-            else:
-                # Float input: detect range ~[0,255] vs [0,1]
-                if batch_gpu.dtype.is_floating_point:
-                    # Heuristic: if max>1.5, assume 0..255 range
-                    needs_rescale = (batch_gpu.max().item() > 1.5)
-                    batch_gpu = batch_gpu.to(self.dtype)
-                    if needs_rescale:
-                        batch_gpu.mul_(self.rescale_factor)
-                else:
-                    batch_gpu = batch_gpu.to(self.dtype)
-        else:
-            batch_gpu = batch_gpu.to(self.dtype)
+        # Convert to target dtype
+        batch_gpu = batch_gpu.to(self.dtype)
+        
+        # Rescale if needed (simpler, no sync)
+        if self.do_rescale and is_u8:
+            batch_gpu.mul_(self.rescale_factor)
         
         # Apply resize
         batch_resized = self.resize_op(batch_gpu)
@@ -328,11 +317,11 @@ class GPUPreprocessorV2(nn.Module):
         
         if stream_compute:
             with torch.cuda.stream(stream_compute):
-                # Convert to float and rescale if needed
+                # Convert to float
+                batch_float = batch_gpu.to(self.dtype)
+                # Rescale if needed (in-place for efficiency)
                 if self.do_rescale:
-                    batch_float = batch_gpu.to(self.dtype) * self.rescale_factor
-                else:
-                    batch_float = batch_gpu.to(self.dtype)
+                    batch_float.mul_(self.rescale_factor)
                 
                 # Resize (internally converts to NCHW and back)
                 batch_resized = self.resize_op(batch_float)
@@ -347,10 +336,9 @@ class GPUPreprocessorV2(nn.Module):
                 batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
         else:
             # CPU path
+            batch_float = batch_gpu.to(self.dtype)
             if self.do_rescale:
-                batch_float = batch_gpu.to(self.dtype) * self.rescale_factor
-            else:
-                batch_float = batch_gpu.to(self.dtype)
+                batch_float.mul_(self.rescale_factor)
             
             batch_resized = self.resize_op(batch_float)
             
