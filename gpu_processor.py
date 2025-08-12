@@ -13,7 +13,7 @@ from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
-from optimized.layout.layout_model import LayoutModel
+from standard.layout.layout_model import LayoutModel
 from standard.table_structure_model import TableStructureModel
 from optimized.table.table_timing_debug import print_timing_summary
 from table_regression_runner import TableRegressionRunner, Tolerances
@@ -125,7 +125,7 @@ class GPUProcessor:
             f"total: {fmt_secs(t_all)}"
         )
 
-        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="compare")
+        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="baseline")
 
         return pages_with_tables
 
