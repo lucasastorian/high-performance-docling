@@ -150,11 +150,8 @@ class LayoutPredictor:
                     try:
                         import torch_tensorrt  # ensure installed, version-matched to torch
                         
-                        # precision: fp16 widely supported; use bf16 on Hopper only if desired
-                        prec = os.getenv("DOCLING_TRT_PREC", "fp16").lower()
-                        self._trt_dtype = (
-                            torch.bfloat16 if (prec == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
-                        )
+                        # Always use FP32 for this conv-heavy model
+                        self._trt_dtype = torch.float32
                         
                         # Backend options (safe defaults)
                         trt_opts = {
