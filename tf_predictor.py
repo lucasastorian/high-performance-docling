@@ -16,7 +16,6 @@ from datetime import datetime
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from safetensors.torch import load_model
 from optimization_utils import enable_fast_backends, safe_autocast, prepare_model_for_infer
 
