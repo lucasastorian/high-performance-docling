@@ -168,6 +168,58 @@ class IntervalTree:
         return result
 
 
+class GridIndex:
+    """Fast spatial grid for dense regular cluster overlap queries."""
+    
+    def __init__(self, page_w: float, page_h: float, bin_w: float, bin_h: float):
+        # Guard rails
+        self.bin_w = max(bin_w, 1e-6)
+        self.bin_h = max(bin_h, 1e-6)
+        self.nx = max(1, int(page_w / self.bin_w))
+        self.ny = max(1, int(page_h / self.bin_h))
+        self.cells: Dict[Tuple[int, int], List[int]] = defaultdict(list)  # (ix,iy) -> [cluster_ids]
+        self._seen_in_cell: Set[Tuple[int, int, int]] = set()  # (ix,iy,id) de-dupe
+        self.boxes: Dict[int, Tuple[float, float, float, float]] = {}  # id -> (l,t,r,b)
+        self.areas: Dict[int, float] = {}
+
+    def _ix_range(self, l: float, r: float) -> range:
+        ix0 = int(l / self.bin_w)
+        ix1 = int((max(r - 1e-9, l)) / self.bin_w)
+        ix0 = max(0, min(ix0, self.nx - 1))
+        ix1 = max(0, min(ix1, self.nx - 1))
+        return range(ix0, ix1 + 1)
+
+    def _iy_range(self, t: float, b: float) -> range:
+        iy0 = int(t / self.bin_h)
+        iy1 = int((max(b - 1e-9, t)) / self.bin_h)
+        iy0 = max(0, min(iy0, self.ny - 1))
+        iy1 = max(0, min(iy1, self.ny - 1))
+        return range(iy0, iy1 + 1)
+
+    def insert(self, cid: int, l: float, t: float, r: float, b: float):
+        self.boxes[cid] = (l, t, r, b)
+        self.areas[cid] = max(0.0, (r - l)) * max(0.0, (b - t))
+        if r <= l or b <= t:
+            return
+        for ix in self._ix_range(l, r):
+            for iy in self._iy_range(t, b):
+                key = (ix, iy)
+                # Avoid duplicates when a cluster straddles many cells
+                sig = (ix, iy, cid)
+                if sig not in self._seen_in_cell:
+                    self.cells[key].append(cid)
+                    self._seen_in_cell.add(sig)
+
+    def candidates(self, l: float, t: float, r: float, b: float) -> Set[int]:
+        if r <= l or b <= t:
+            return set()
+        cands = set()
+        for ix in self._ix_range(l, r):
+            for iy in self._iy_range(t, b):
+                cands.update(self.cells.get((ix, iy), ()))
+        return cands
+
+
 class LayoutPostprocessor:
     """Postprocesses layout predictions by cleaning up clusters and mapping cells."""
 
@@ -324,25 +376,26 @@ class LayoutPostprocessor:
                     if cluster.cells or cluster.label == DocItemLabel.FORMULA
                 ]
 
-        # Handle orphaned cells
-        with self.timer.time_section("find_unassigned"):
-            unassigned = self._find_unassigned_cells(clusters)
-            if unassigned and self.options.create_orphan_clusters:
-                next_id = max((c.id for c in self.all_clusters), default=0) + 1
-                orphan_clusters = []
-                for i, cell in enumerate(unassigned):
-                    conf = cell.confidence
+        # Handle orphaned cells (only if we're creating orphan clusters)
+        if self.options.create_orphan_clusters:
+            with self.timer.time_section("find_unassigned"):
+                unassigned = self._find_unassigned_cells(clusters)
+                if unassigned:
+                    next_id = max((c.id for c in self.all_clusters), default=0) + 1
+                    orphan_clusters = []
+                    for i, cell in enumerate(unassigned):
+                        conf = cell.confidence
 
-                    orphan_clusters.append(
-                        Cluster(
-                            id=next_id + i,
-                            label=DocItemLabel.TEXT,
-                            bbox=cell.to_bounding_box(),
-                            confidence=conf,
-                            cells=[cell],
+                        orphan_clusters.append(
+                            Cluster(
+                                id=next_id + i,
+                                label=DocItemLabel.TEXT,
+                                bbox=cell.to_bounding_box(),
+                                confidence=conf,
+                                cells=[cell],
+                            )
                         )
-                    )
-                clusters.extend(orphan_clusters)
+                    clusters.extend(orphan_clusters)
 
         # Iterative refinement
         with self.timer.time_section("iterative_refinement"):
@@ -565,39 +618,97 @@ class LayoutPostprocessor:
         params = self.OVERLAP_PARAMS[cluster_type]
 
         if cluster_type == "regular":
-            # Fast path for regular clusters: R-tree only + tuple optimizations
-            inter = spatial_index.spatial_index.intersection
-            boxes = {c.id: c.bbox.as_tuple() for c in clusters}
-            areas = {c.id: c.bbox.area() for c in clusters}
-            ovlp_thr = overlap_threshold - self.epsilon
-            cont_thr = containment_threshold - self.epsilon
-            
-            def overlaps(a, b):
-                """Inline tuple math for overlap check."""
-                l1, t1, r1, b1 = boxes[a]
-                l2, t2, r2, b2 = boxes[b]
-                l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
-                iw = r - l; ih = b - t
-                if iw <= 0 or ih <= 0:
-                    return False
-                interA = iw * ih
-                aa, bb = areas[a], areas[b]
-                if interA / aa >= cont_thr or interA / bb >= cont_thr:
-                    return True
-                return interA / (aa + bb - interA) >= ovlp_thr
-            
-            for c in clusters:
-                cid = c.id
-                l1, t1, r1, b1 = boxes[cid]
-                # Compute candidates once, already filtered > cid
-                cands = {oid for oid in inter((l1, t1, r1, b1)) if oid > cid and oid in valid_clusters}
-                # Quick AABB reject using tuples (no object attr hits)
-                for oid in cands:
-                    l2, t2, r2, b2 = boxes[oid]
-                    if l2 >= r1 or r2 <= l1 or t2 >= b1 or b2 <= t1:
-                        continue
-                    if overlaps(cid, oid):
-                        uf.union(cid, oid)
+            # Small cluster count: use simple O(N²) pairwise
+            if len(clusters) < 20:
+                boxes = {c.id: c.bbox.as_tuple() for c in clusters}
+                areas = {c.id: c.bbox.area() for c in clusters}
+                ovlp_thr = overlap_threshold - self.epsilon
+                cont_thr = containment_threshold - self.epsilon
+                
+                def overlaps(a: int, b: int) -> bool:
+                    l1, t1, r1, b1 = boxes[a]
+                    l2, t2, r2, b2 = boxes[b]
+                    l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
+                    iw = r - l; ih = b - t
+                    if iw <= 0.0 or ih <= 0.0:
+                        return False
+                    interA = iw * ih
+                    aa, bb = areas[a], areas[b]
+                    if aa > 0.0 and interA / aa >= cont_thr: return True
+                    if bb > 0.0 and interA / bb >= cont_thr: return True
+                    denom = aa + bb - interA
+                    return denom > 0.0 and (interA / denom) >= ovlp_thr
+                
+                # Simple pairwise check
+                cluster_ids = [c.id for c in clusters]
+                for i, cid in enumerate(cluster_ids):
+                    for oid in cluster_ids[i+1:]:
+                        if cid not in valid_clusters or oid not in valid_clusters:
+                            continue
+                        if overlaps(cid, oid):
+                            uf.union(cid, oid)
+            else:
+                # Grid bucketing for dense pages
+                boxes = {c.id: c.bbox.as_tuple() for c in clusters}
+                areas = {c.id: c.bbox.area() for c in clusters}
+
+                # Page size or extents
+                if self.page_size is not None:
+                    page_w, page_h = self.page_size.width, self.page_size.height
+                else:
+                    # Fallback to cluster extents
+                    min_l = min(l for (l, _, _, _) in boxes.values())
+                    min_t = min(t for (_, t, _, _) in boxes.values())
+                    max_r = max(r for (_, _, r, _) in boxes.values())
+                    max_b = max(b for (_, _, _, b) in boxes.values())
+                    page_w = max_r - min_l
+                    page_h = max_b - min_t
+
+                # Median w/h of regular clusters
+                ws = sorted((r - l) for (l, t, r, b) in boxes.values() if r > l)
+                hs = sorted((b - t) for (l, t, r, b) in boxes.values() if b > t)
+                med_w = ws[len(ws) // 2] if ws else max(1.0, page_w / 12.0)
+                med_h = hs[len(hs) // 2] if hs else max(1.0, page_h / 24.0)
+
+                bin_w = max(page_w / 60.0, 1.5 * med_w)  # Clamp to keep bins reasonable
+                bin_h = max(page_h / 60.0, 1.5 * med_h)
+
+                grid = GridIndex(page_w, page_h, bin_w, bin_h)
+                for cid, (l, t, r, b) in boxes.items():
+                    grid.insert(cid, l, t, r, b)
+
+                ovlp_thr = overlap_threshold - self.epsilon
+                cont_thr = containment_threshold - self.epsilon
+
+                def overlaps(a: int, b: int) -> bool:
+                    l1, t1, r1, b1 = boxes[a]
+                    l2, t2, r2, b2 = boxes[b]
+                    l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
+                    iw = r - l; ih = b - t
+                    if iw <= 0.0 or ih <= 0.0:
+                        return False
+                    interA = iw * ih
+                    aa, bb = areas[a], areas[b]
+                    # Containment shortcut
+                    if aa > 0.0 and interA / aa >= cont_thr: return True
+                    if bb > 0.0 and interA / bb >= cont_thr: return True
+                    denom = aa + bb - interA
+                    return denom > 0.0 and (interA / denom) >= ovlp_thr
+
+                # Union only within shared grid cells
+                for c in clusters:
+                    cid = c.id
+                    l1, t1, r1, b1 = boxes[cid]
+                    # Candidate set is tiny now
+                    for oid in grid.candidates(l1, t1, r1, b1):
+                        if oid <= cid or oid not in valid_clusters:
+                            continue
+                        # Quick AABB reject by tuples
+                        l2, t2, r2, b2 = boxes[oid]
+                        if l2 >= r1 or r2 <= l1 or t2 >= b1 or b2 <= t1:
+                            continue
+                        if overlaps(cid, oid):
+                            uf.union(cid, oid)
         else:
             # Keep existing logic for picture/wrapper clusters
             for cluster in clusters:
@@ -739,8 +850,8 @@ class LayoutPostprocessor:
                 if overlap_ratio > best_overlap:
                     best_overlap = overlap_ratio
                     best_cluster = cluster
-                    # Fast break when we find perfect overlap
-                    if best_overlap >= 0.999:
+                    # Fast break when we find very good overlap
+                    if best_overlap >= 0.95:
                         break
 
             if best_cluster is not None:
