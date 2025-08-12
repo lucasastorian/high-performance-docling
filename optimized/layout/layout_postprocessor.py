@@ -12,7 +12,7 @@ from rtree import index
 from docling.datamodel.base_models import BoundingBox, Cluster, Page
 from docling.datamodel.pipeline_options import LayoutOptions
 
-from optimized.layout.table_timing_debug import get_timing_collector
+from optimized.table.table_timing_debug import get_timing_collector
 
 _log = logging.getLogger(__name__)
 
