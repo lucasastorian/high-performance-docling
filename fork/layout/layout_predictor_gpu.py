@@ -168,11 +168,14 @@ class LayoutPredictor:
                             "truncate_long_and_double": True,
                         }
                         
+                        # Cast model weights to FP16 to match input dtype
+                        self._model = self._model.to(dtype=self._trt_dtype)
+                        
                         # Wrap the model. kwargs preserved (e.g., pixel_values=...)
                         self._model = torch.compile(self._model, backend="tensorrt", options=trt_opts)
                         
                         # Optional warmup to prebuild engines for common batch sizes
-                        warm_batches = [1, 64, 128]
+                        warm_batches = [1, 32, 64]
                         _log.info(f"Warming up TensorRT compilation for batch sizes: {warm_batches}")
                         for b in warm_batches:
                             try:
@@ -317,12 +320,14 @@ class LayoutPredictor:
                     pixel_values = pixel_values.to(self._device)
 
         with timer.time_section('predict'):
-            # Friendly to both eager and TRT partitions
-            if self._device.type == "cuda" and self._use_torch_compile_trt:
-                pixel_values = pixel_values.to(dtype=self._trt_dtype)
-                pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
+            # Always use channels_last for better performance
+            pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
             
-            outputs = self._model(pixel_values=pixel_values)  # works for eager & compiled
+            # Cast to FP16 when using TensorRT
+            if self._use_torch_compile_trt:
+                pixel_values = pixel_values.to(dtype=self._trt_dtype)
+            
+            outputs = self._model(pixel_values=pixel_values)
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
