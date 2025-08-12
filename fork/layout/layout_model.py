@@ -23,6 +23,8 @@ from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
 
+from fork.layout.layout_predictor import LayoutPredictor
+
 _log = logging.getLogger(__name__)
 
 
@@ -53,8 +55,6 @@ class LayoutModel(BasePageModel):
         accelerator_options: AcceleratorOptions,
         options: LayoutOptions,
     ):
-        from docling_ibm_models.layoutmodel.layout_predictor import LayoutPredictor
-
         self.options = options
 
         device = decide_device(accelerator_options.device)
