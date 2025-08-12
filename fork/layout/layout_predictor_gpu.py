@@ -146,29 +146,27 @@ class LayoutPredictor:
                 # Keep a fallback handle to the eager model
                 self._pt_model = self._model
                 
+                # Hold TRT engine separately 
+                self._pt_model = self._model            # FP32 eager model
+                self._trt_module = None
+                self._trt_max_bs = 64
+                
                 if self._use_torch_compile_trt:
                     try:
                         import torch_tensorrt as trt
                         
-                        # Use FP16 for TensorRT
-                        self._trt_dtype = torch.float16
-                        
-                        # Cast model weights to FP16
-                        self._model = self._model.to(dtype=self._trt_dtype)
-                        
-                        # Manual TensorRT compilation with explicit batch limits
-                        self._pt_model = self._model  # keep original for fallback
-                        self._model = trt.compile(
-                            self._pt_model,
+                        # Build TRT from FP32 model without mutating it
+                        self._trt_module = trt.compile(
+                            self._pt_model,                     # keep PT untouched
                             ir="dynamo",
                             inputs=[trt.Input(
                                 min_shape=(1, 3, 640, 640),
                                 opt_shape=(64, 3, 640, 640),
-                                max_shape=(64, 3, 640, 640),  # cap max batch to avoid pathological tactics
+                                max_shape=(64, 3, 640, 640),       # cap to avoid pathological tactics
                                 dtype=torch.float16
                             )],
                             enabled_precisions={torch.float16},
-                            workspace_size=2 << 30,  # 2 GB
+                            workspace_size=2 << 30,
                             truncate_long_and_double=True,
                         )
                         
@@ -179,6 +177,7 @@ class LayoutPredictor:
                     except Exception as e:
                         _log.warning(f"TensorRT compilation failed: {e}, falling back to PyTorch")
                         self._use_torch_compile_trt = False
+                        self._trt_module = None
             else:
                 self._use_torch_compile_trt = False
 
@@ -270,13 +269,6 @@ class LayoutPredictor:
         if not images:
             return []
 
-        # Chunk large batches for TensorRT safety
-        safe_max = 64
-        if self._use_torch_compile_trt and len(images) > safe_max:
-            out = []
-            for i in range(0, len(images), safe_max):
-                out.extend(self.predict_batch(images[i:i+safe_max]))
-            return out
 
         # Convert all images to RGB PIL format for consistency
         pil_images = []
@@ -313,14 +305,33 @@ class LayoutPredictor:
                     pixel_values = pixel_values.to(self._device)
 
         with timer.time_section('predict'):
-            # Always use channels_last for better performance
+            # Choose backend based on batch size and availability
+            bsz = pixel_values.shape[0]
+            use_trt = (self._trt_module is not None) and (bsz <= self._trt_max_bs)
+            
+            # Layout helps both paths
             pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
             
-            # Cast to FP16 when using TensorRT
-            if self._use_torch_compile_trt:
-                pixel_values = pixel_values.to(dtype=self._trt_dtype)
+            # Match dtype/device to chosen backend
+            if use_trt:
+                want_dtype = torch.float16
+                mod = self._trt_module
+            else:
+                want_dtype = next(self._pt_model.parameters()).dtype  # likely torch.float32
+                mod = self._pt_model
             
-            outputs = self._model(pixel_values=pixel_values)
+            if pixel_values.dtype != want_dtype:
+                pixel_values = pixel_values.to(want_dtype)
+            if pixel_values.device != next(self._pt_model.parameters()).device:
+                pixel_values = pixel_values.to(self._device, non_blocking=True)
+            
+            # Safe execute with permanent fallback if TRT explodes
+            try:
+                outputs = mod(pixel_values=pixel_values)
+            except Exception as e:
+                _log.warning(f"TRT path failed at runtime: {e}. Using PT model for this call and disabling TRT.")
+                self._trt_module = None
+                outputs = self._pt_model(pixel_values=pixel_values.to(next(self._pt_model.parameters()).dtype))
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
