@@ -261,8 +261,18 @@ class LayoutPredictor:
                 else:
                     pixel_values = pixel_values.to(self._device)
 
+        # Step 1: BF16 AMP toggle (enabled by default)
+        use_bf16_amp = (
+            self._device.type == "cuda" and
+            torch.cuda.is_bf16_supported()
+        )
+        
         with timer.time_section('predict'):
-            outputs = self._model(pixel_values=pixel_values)
+            if use_bf16_amp:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    outputs = self._model(pixel_values=pixel_values)
+            else:
+                outputs = self._model(pixel_values=pixel_values)
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
