@@ -40,7 +40,7 @@ class LayoutPredictor:
         device: str = "cpu",
         num_threads: int = 4,
         base_threshold: float = 0.3,
-        blacklist_classes: Set[str] = set(),
+        blacklist_classes: Optional[Set[str]] = None,
         use_gpu_preprocess: bool = True,
         gpu_preprocess_version: int = 1,  # 1 or 2
     ):
@@ -60,7 +60,7 @@ class LayoutPredictor:
         FileNotFoundError when the model's torch file is missing
         """
         # Blacklisted classes
-        self._black_classes = blacklist_classes
+        self._black_classes = blacklist_classes if blacklist_classes is not None else set()
 
         # Canonical classes
         self._labels = LayoutLabels()
