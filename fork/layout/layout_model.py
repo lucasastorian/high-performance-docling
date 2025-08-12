@@ -19,12 +19,12 @@ from docling.datamodel.settings import settings
 from docling.models.base_model import BasePageModel
 from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
-from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
 
 # from fork.layout.layout_predictor import LayoutPredictor
 from fork.layout.layout_predictor_gpu import LayoutPredictor
+from fork.layout.layout_postprocessor import LayoutPostprocessor
 
 _log = logging.getLogger(__name__)
 

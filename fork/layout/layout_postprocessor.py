@@ -11,6 +11,7 @@ from rtree import index
 
 from docling.datamodel.base_models import BoundingBox, Cluster, Page
 from docling.datamodel.pipeline_options import LayoutOptions
+from fork.timers import _CPUTimer
 
 _log = logging.getLogger(__name__)
 
@@ -90,14 +91,11 @@ class SpatialClusterIndex:
             bbox2: BoundingBox,
             overlap_threshold: float,
             containment_threshold: float,
+            epsilon: float = 0.0,
     ) -> bool:
         """Check if two bboxes overlap sufficiently."""
         if bbox1.area() <= 0 or bbox2.area() <= 0:
             return False
-
-        # Apply epsilon for compatibility mode to handle floating point precision issues
-        compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
-        epsilon = 1e-4 if compat_mode else 0.0
 
         iou = bbox1.intersection_over_union(bbox2)
         containment1 = bbox1.intersection_over_self(bbox2)
@@ -219,6 +217,10 @@ class LayoutPostprocessor:
         ]
         self.special_clusters = [c for c in clusters if c.label in self.SPECIAL_TYPES]
 
+        # Cache compatibility mode settings to avoid repeated env lookups
+        self.compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
+        self.epsilon = 1e-4 if self.compat_mode else 0.0
+
         # Build spatial indices once
         self.regular_index = SpatialClusterIndex(self.regular_clusters)
         self.picture_index = SpatialClusterIndex(
@@ -229,156 +231,194 @@ class LayoutPostprocessor:
         )
 
     def postprocess(self) -> Tuple[List[Cluster], List[TextCell]]:
-        """Main processing pipeline."""
-        self.regular_clusters = self._process_regular_clusters()
-        self.special_clusters = self._process_special_clusters()
+        """Main processing pipeline with comprehensive timing."""
+        timer = _CPUTimer()
+        
+        with timer.time_section("postprocess_total"):
+            with timer.time_section("process_regular"):
+                self.regular_clusters = self._process_regular_clusters(timer)
+            
+            with timer.time_section("process_special"):
+                self.special_clusters = self._process_special_clusters(timer)
 
-        # Remove regular clusters that are included in wrappers
-        contained_ids = {
-            child.id
-            for wrapper in self.special_clusters
-            if wrapper.label in self.SPECIAL_TYPES
-            for child in wrapper.children
-        }
-        self.regular_clusters = [
-            c for c in self.regular_clusters if c.id not in contained_ids
-        ]
+            # Remove regular clusters that are included in wrappers
+            with timer.time_section("filter_contained"):
+                contained_ids = {
+                    child.id
+                    for wrapper in self.special_clusters
+                    if wrapper.label in self.SPECIAL_TYPES
+                    for child in wrapper.children
+                }
+                self.regular_clusters = [
+                    c for c in self.regular_clusters if c.id not in contained_ids
+                ]
 
-        # Combine and sort final clusters
-        final_clusters = self._sort_clusters(
-            self.regular_clusters + self.special_clusters, mode="id"
+            # Combine and sort final clusters
+            with timer.time_section("sort_final"):
+                final_clusters = self._sort_clusters(
+                    self.regular_clusters + self.special_clusters, mode="id"
+                )
+                for cluster in final_clusters:
+                    cluster.cells = self._sort_cells(cluster.cells)
+                    # Also sort cells in children if any
+                    for child in cluster.children:
+                        child.cells = self._sort_cells(child.cells)
+
+            with timer.time_section("finalize_page"):
+                assert self.page.parsed_page is not None
+                self.page.parsed_page.textline_cells = self.cells
+                self.page.parsed_page.has_lines = len(self.cells) > 0
+        
+        timer.finalize()
+        
+        # Log detailed timing breakdown
+        _log.debug(
+            "layout-postprocess(ms): total=%.1f, regular=%.1f, special=%.1f, "
+            "filter=%.1f, sort_final=%.1f, finalize=%.1f",
+            timer.get_time("postprocess_total"),
+            timer.get_time("process_regular"),
+            timer.get_time("process_special"),
+            timer.get_time("filter_contained"),
+            timer.get_time("sort_final"),
+            timer.get_time("finalize_page"),
         )
-        for cluster in final_clusters:
-            cluster.cells = self._sort_cells(cluster.cells)
-            # Also sort cells in children if any
-            for child in cluster.children:
-                child.cells = self._sort_cells(child.cells)
-
-        assert self.page.parsed_page is not None
-        self.page.parsed_page.textline_cells = self.cells
-        self.page.parsed_page.has_lines = len(self.cells) > 0
 
         return final_clusters, self.cells
 
-    def _process_regular_clusters(self) -> List[Cluster]:
-        """Process regular clusters with iterative refinement."""
-        clusters = [
-            c
-            for c in self.regular_clusters
-            if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
-        ]
-
-        # Apply label remapping
-        for cluster in clusters:
-            if cluster.label in self.LABEL_REMAPPING:
-                cluster.label = self.LABEL_REMAPPING[cluster.label]
-
-        # Initial cell assignment
-        clusters = self._assign_cells_to_clusters(clusters)
-
-        # Remove clusters with no cells (if keep_empty_clusters is False),
-        # but always keep clusters with label DocItemLabel.FORMULA
-        if not self.options.keep_empty_clusters:
+    def _process_regular_clusters(self, timer: _CPUTimer) -> List[Cluster]:
+        """Process regular clusters with iterative refinement and detailed timing."""
+        with timer.time_section("filter_regular"):
             clusters = [
-                cluster
-                for cluster in clusters
-                if cluster.cells or cluster.label == DocItemLabel.FORMULA
+                c
+                for c in self.regular_clusters
+                if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
             ]
 
-        # Handle orphaned cells
-        unassigned = self._find_unassigned_cells(clusters)
-        if unassigned and self.options.create_orphan_clusters:
-            next_id = max((c.id for c in self.all_clusters), default=0) + 1
-            orphan_clusters = []
-            for i, cell in enumerate(unassigned):
-                conf = cell.confidence
+            # Apply label remapping
+            for cluster in clusters:
+                if cluster.label in self.LABEL_REMAPPING:
+                    cluster.label = self.LABEL_REMAPPING[cluster.label]
 
-                orphan_clusters.append(
-                    Cluster(
-                        id=next_id + i,
-                        label=DocItemLabel.TEXT,
-                        bbox=cell.to_bounding_box(),
-                        confidence=conf,
-                        cells=[cell],
+        # Initial cell assignment
+        with timer.time_section("assign_cells"):
+            clusters = self._assign_cells_to_clusters(clusters)
+
+        with timer.time_section("filter_empty"):
+            # Remove clusters with no cells (if keep_empty_clusters is False),
+            # but always keep clusters with label DocItemLabel.FORMULA
+            if not self.options.keep_empty_clusters:
+                clusters = [
+                    cluster
+                    for cluster in clusters
+                    if cluster.cells or cluster.label == DocItemLabel.FORMULA
+                ]
+
+        # Handle orphaned cells
+        with timer.time_section("find_unassigned"):
+            unassigned = self._find_unassigned_cells(clusters)
+            if unassigned and self.options.create_orphan_clusters:
+                next_id = max((c.id for c in self.all_clusters), default=0) + 1
+                orphan_clusters = []
+                for i, cell in enumerate(unassigned):
+                    conf = cell.confidence
+
+                    orphan_clusters.append(
+                        Cluster(
+                            id=next_id + i,
+                            label=DocItemLabel.TEXT,
+                            bbox=cell.to_bounding_box(),
+                            confidence=conf,
+                            cells=[cell],
+                        )
                     )
-                )
-            clusters.extend(orphan_clusters)
+                clusters.extend(orphan_clusters)
 
         # Iterative refinement
-        prev_count = len(clusters) + 1
-        for _ in range(3):  # Maximum 3 iterations
-            if prev_count == len(clusters):
-                break
-            prev_count = len(clusters)
-            clusters = self._adjust_cluster_bboxes(clusters)
-            clusters = self._remove_overlapping_clusters(clusters, "regular")
+        with timer.time_section("iterative_refinement"):
+            prev_count = len(clusters) + 1
+            for iteration in range(3):  # Maximum 3 iterations
+                if prev_count == len(clusters):
+                    break
+                prev_count = len(clusters)
+                
+                with timer.time_section(f"adjust_bboxes_iter{iteration}"):
+                    clusters = self._adjust_cluster_bboxes(clusters)
+                
+                with timer.time_section(f"overlaps_regular_iter{iteration}"):
+                    clusters = self._remove_overlapping_clusters(clusters, "regular")
 
         return clusters
 
-    def _process_special_clusters(self) -> List[Cluster]:
-        special_clusters = [
-            c
-            for c in self.special_clusters
-            if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
-        ]
-
-        special_clusters = self._handle_cross_type_overlaps(special_clusters)
-
-        # Calculate page area from known page size
-        assert self.page_size is not None
-        page_area = self.page_size.width * self.page_size.height
-        if page_area > 0:
-            # Filter out full-page pictures
+    def _process_special_clusters(self, timer: _CPUTimer) -> List[Cluster]:
+        with timer.time_section("filter_special"):
             special_clusters = [
-                cluster
-                for cluster in special_clusters
-                if not (
-                        cluster.label == DocItemLabel.PICTURE
-                        and cluster.bbox.area() / page_area > 0.90
-                )
+                c
+                for c in self.special_clusters
+                if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
             ]
 
-        for special in special_clusters:
-            contained = []
-            for cluster in self.regular_clusters:
-                containment = cluster.bbox.intersection_over_self(special.bbox)
-                if containment > 0.8:
-                    contained.append(cluster)
+        with timer.time_section("cross_type_overlaps"):
+            special_clusters = self._handle_cross_type_overlaps(special_clusters)
 
-            if contained:
-                # Sort contained clusters by minimum cell ID:
-                contained = self._sort_clusters(contained, mode="id")
-                special.children = contained
-
-                # Adjust bbox only for Form and Key-Value-Region, not Table or Picture
-                if special.label in [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]:
-                    special.bbox = BoundingBox(
-                        l=min(c.bbox.l for c in contained),
-                        t=min(c.bbox.t for c in contained),
-                        r=max(c.bbox.r for c in contained),
-                        b=max(c.bbox.b for c in contained),
+        with timer.time_section("filter_full_page_pictures"):
+            # Calculate page area from known page size
+            assert self.page_size is not None
+            page_area = self.page_size.width * self.page_size.height
+            if page_area > 0:
+                # Filter out full-page pictures
+                special_clusters = [
+                    cluster
+                    for cluster in special_clusters
+                    if not (
+                            cluster.label == DocItemLabel.PICTURE
+                            and cluster.bbox.area() / page_area > 0.90
                     )
+                ]
 
-                # Collect all cells from children
-                all_cells = []
-                for child in contained:
-                    all_cells.extend(child.cells)
-                special.cells = self._deduplicate_cells(all_cells)
-                special.cells = self._sort_cells(special.cells)
+        with timer.time_section("assign_children"):
+            for special in special_clusters:
+                contained = []
+                for cluster in self.regular_clusters:
+                    containment = cluster.bbox.intersection_over_self(special.bbox)
+                    if containment > 0.8:
+                        contained.append(cluster)
 
-        picture_clusters = [
-            c for c in special_clusters if c.label == DocItemLabel.PICTURE
-        ]
-        picture_clusters = self._remove_overlapping_clusters(
-            picture_clusters, "picture"
-        )
+                if contained:
+                    # Sort contained clusters by minimum cell ID:
+                    contained = self._sort_clusters(contained, mode="id")
+                    special.children = contained
 
-        wrapper_clusters = [
-            c for c in special_clusters if c.label in self.WRAPPER_TYPES
-        ]
-        wrapper_clusters = self._remove_overlapping_clusters(
-            wrapper_clusters, "wrapper"
-        )
+                    # Adjust bbox only for Form and Key-Value-Region, not Table or Picture
+                    if special.label in [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]:
+                        special.bbox = BoundingBox(
+                            l=min(c.bbox.l for c in contained),
+                            t=min(c.bbox.t for c in contained),
+                            r=max(c.bbox.r for c in contained),
+                            b=max(c.bbox.b for c in contained),
+                        )
+
+                    # Collect all cells from children
+                    all_cells = []
+                    for child in contained:
+                        all_cells.extend(child.cells)
+                    special.cells = self._deduplicate_cells(all_cells)
+                    special.cells = self._sort_cells(special.cells)
+
+        with timer.time_section("overlaps_picture"):
+            picture_clusters = [
+                c for c in special_clusters if c.label == DocItemLabel.PICTURE
+            ]
+            picture_clusters = self._remove_overlapping_clusters(
+                picture_clusters, "picture"
+            )
+
+        with timer.time_section("overlaps_wrapper"):
+            wrapper_clusters = [
+                c for c in special_clusters if c.label in self.WRAPPER_TYPES
+            ]
+            wrapper_clusters = self._remove_overlapping_clusters(
+                wrapper_clusters, "wrapper"
+            )
 
         return picture_clusters + wrapper_clusters
 
@@ -520,6 +560,7 @@ class LayoutPostprocessor:
                         valid_clusters[other_id].bbox,
                         overlap_threshold,
                         containment_threshold,
+                        self.epsilon,  # Use cached epsilon
                 ):
                     uf.union(cluster.id, other_id)
 
@@ -575,41 +616,61 @@ class LayoutPostprocessor:
 
     def _deduplicate_cells(self, cells: List[TextCell]) -> List[TextCell]:
         """Ensure each cell appears only once, maintaining order of first appearance."""
-        seen_ids = set()
-        unique_cells = []
+        if not cells:
+            return []
+        # Use dict.fromkeys for stable, fast deduplication by cell index
+        seen = {}
+        result = []
         for cell in cells:
-            if cell.index not in seen_ids:
-                seen_ids.add(cell.index)
-                unique_cells.append(cell)
-        return unique_cells
+            if cell.index not in seen:
+                seen[cell.index] = True
+                result.append(cell)
+        return result
 
     def _assign_cells_to_clusters(
             self, clusters: List[Cluster], min_overlap: float = 0.2
     ) -> List[Cluster]:
-        """Assign cells to best overlapping cluster."""
+        """Assign cells to best overlapping cluster using R-tree optimization."""
+        # Initialize clusters and track first cell index for fast sorting
         for cluster in clusters:
             cluster.cells = []
+            cluster.first_cell_index = sys.maxsize
 
+        # Local handles for speed
+        rtree_idx = self.regular_index.spatial_index
+        id_to_cluster = {c.id: c for c in clusters}
+
+        # Cache cell bboxes once to avoid repeated conversions
+        valid_cells = []
+        cell_bboxes = []
         for cell in self.cells:
-            if not cell.text.strip():
-                continue
+            if cell.text.strip():
+                cell_bbox = cell.rect.to_bounding_box()
+                if cell_bbox.area() > 0:
+                    valid_cells.append(cell)
+                    cell_bboxes.append(cell_bbox)
 
+        # Assign each cell to best overlapping cluster
+        for cell, cell_bbox in zip(valid_cells, cell_bboxes):
             best_overlap = min_overlap
             best_cluster = None
 
-            for cluster in clusters:
-                if cell.rect.to_bounding_box().area() <= 0:
+            # Query only candidate clusters whose bbox intersects the cell bbox  
+            for cluster_id in rtree_idx.intersection(cell_bbox.as_tuple()):
+                cluster = id_to_cluster.get(cluster_id)
+                if cluster is None:
                     continue
-
-                overlap_ratio = cell.rect.to_bounding_box().intersection_over_self(
-                    cluster.bbox
-                )
+                    
+                overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
                 if overlap_ratio > best_overlap:
                     best_overlap = overlap_ratio
                     best_cluster = cluster
 
             if best_cluster is not None:
                 best_cluster.cells.append(cell)
+                # Track first cell index for fast sorting later
+                if cell.index < best_cluster.first_cell_index:
+                    best_cluster.first_cell_index = cell.index
 
         # Deduplicate cells in each cluster after assignment
         for cluster in clusters:
@@ -632,23 +693,30 @@ class LayoutPostprocessor:
             if not cluster.cells:
                 continue
 
-            cells_bbox = BoundingBox(
-                l=min(cell.rect.to_bounding_box().l for cell in cluster.cells),
-                t=min(cell.rect.to_bounding_box().t for cell in cluster.cells),
-                r=max(cell.rect.to_bounding_box().r for cell in cluster.cells),
-                b=max(cell.rect.to_bounding_box().b for cell in cluster.cells),
-            )
+            # Compute cell bbox coordinates in one pass to avoid repeated conversions
+            cell_coords = []
+            for cell in cluster.cells:
+                cell_bbox = cell.rect.to_bounding_box()
+                cell_coords.append((cell_bbox.l, cell_bbox.t, cell_bbox.r, cell_bbox.b))
+            
+            if cell_coords:
+                min_l = min(coords[0] for coords in cell_coords)
+                min_t = min(coords[1] for coords in cell_coords)
+                max_r = max(coords[2] for coords in cell_coords)
+                max_b = max(coords[3] for coords in cell_coords)
+                
+                cells_bbox = BoundingBox(l=min_l, t=min_t, r=max_r, b=max_b)
 
-            if cluster.label == DocItemLabel.TABLE:
-                # For tables, take union of current bbox and cells bbox
-                cluster.bbox = BoundingBox(
-                    l=min(cluster.bbox.l, cells_bbox.l),
-                    t=min(cluster.bbox.t, cells_bbox.t),
-                    r=max(cluster.bbox.r, cells_bbox.r),
-                    b=max(cluster.bbox.b, cells_bbox.b),
-                )
-            else:
-                cluster.bbox = cells_bbox
+                if cluster.label == DocItemLabel.TABLE:
+                    # For tables, take union of current bbox and cells bbox
+                    cluster.bbox = BoundingBox(
+                        l=min(cluster.bbox.l, cells_bbox.l),
+                        t=min(cluster.bbox.t, cells_bbox.t),
+                        r=max(cluster.bbox.r, cells_bbox.r),
+                        b=max(cluster.bbox.b, cells_bbox.b),
+                    )
+                else:
+                    cluster.bbox = cells_bbox
 
         return clusters
 
@@ -664,11 +732,9 @@ class LayoutPostprocessor:
             return sorted(
                 clusters,
                 key=lambda cluster: (
-                    (
-                        min(cell.index for cell in cluster.cells)
-                        if cluster.cells
-                        else sys.maxsize
-                    ),
+                    # Use cached first_cell_index if available, else compute
+                    getattr(cluster, "first_cell_index", 
+                            min((cell.index for cell in cluster.cells), default=sys.maxsize)),
                     cluster.bbox.t,
                     cluster.bbox.l,
                 ),
