@@ -11,7 +11,7 @@ from docling_core.types.doc import DocItemLabel
 from PIL import Image
 
 from docling.datamodel.accelerator_options import AcceleratorOptions
-from docling.datamodel.base_models import BoundingBox, Cluster, LayoutPrediction, Page
+from docling.datamodel.base_models import BoundingBox, LayoutPrediction, Page
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_V2, LayoutModelConfig
 from docling.datamodel.pipeline_options import LayoutOptions
@@ -25,6 +25,7 @@ from docling.utils.visualization import draw_clusters
 # from fork.layout.layout_predictor import LayoutPredictor
 from fork.layout.layout_predictor_gpu import LayoutPredictor
 from fork.layout.layout_postprocessor import LayoutPostprocessor
+from fork.layout.cluster import Cluster
 
 _log = logging.getLogger(__name__)
 
