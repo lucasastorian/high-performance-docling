@@ -140,9 +140,15 @@ class LayoutPredictor:
                 # Avoid per-batch layout conversions
                 self._model.to(memory_format=torch.channels_last)
                 
-                # ----- Always use torch.compile with Inductor -----
-                self._model = torch.compile(self._model, dynamic=True, mode="max-autotune")
-                _log.info("Model compiled with Inductor backend (FP32, dynamic=True, mode=max-autotune)")
+                # ----- Configure torch.compile with reasonable settings -----
+                from torch._inductor import config as ind_cfg
+                ind_cfg.max_autotune_gemm = False
+                ind_cfg.coordinate_descent_tuning = False
+                ind_cfg.triton.cudagraphs = True  # fixed batch/shape friendly
+                
+                # Use fixed batch compilation for better optimization
+                self._model = torch.compile(self._model, dynamic=False, fullgraph=True, mode="reduce-overhead")
+                _log.info("Model compiled with Inductor backend (FP32, dynamic=False, mode=reduce-overhead)")
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -232,6 +238,21 @@ class LayoutPredictor:
         if not images:
             return []
 
+        # Pad to fixed batch sizes for better optimization
+        original_count = len(images)
+        if original_count <= 16:
+            target_batch = 16
+        elif original_count <= 32:
+            target_batch = 32
+        elif original_count <= 64:
+            target_batch = 64
+        else:
+            target_batch = 128
+        
+        # Pad with the last image if needed
+        if original_count < target_batch:
+            padding_needed = target_batch - original_count
+            images = images + [images[-1]] * padding_needed
 
         # Convert all images to RGB PIL format for consistency
         pil_images = []
@@ -340,7 +361,8 @@ class LayoutPredictor:
 
             all_predictions.append(predictions)
 
-        return all_predictions
+        # Return only original results (trim padding)
+        return all_predictions[:original_count]
 
     @torch.inference_mode()
     def predict(self, orig_img: Union[Image.Image, np.ndarray]) -> Iterable[dict]:
