@@ -8,7 +8,7 @@ import math
 import numpy as np
 import docling_ibm_models.tableformer.settings as s
 
-from tf_cell_matcher import CellMatcher
+from optimized.table.tf_cell_matcher import CellMatcher
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
