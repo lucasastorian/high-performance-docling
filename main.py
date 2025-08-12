@@ -57,7 +57,7 @@ if __name__ == '__main__':
     print("-" * 40)
     # Use context manager for automatic cleanup
     with GPUProcessor(pipeline_options) as gpu_processor:
-        processed_pages = gpu_processor.process_all_pages(input_doc, preprocessed_pages)
+        processed_pages = gpu_processor.process_all_pages(url=pdf_url, input_doc=input_doc, pages=preprocessed_pages)
 
     # ========================================
     # PHASE 3: Document Assembly
@@ -82,9 +82,10 @@ if __name__ == '__main__':
     print(f"✓ Markdown length: {len(markdown)} chars")
 
     print(f"{markdown[0:40000]}")
-    
+
     # Final cleanup
     import torch
+
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print("\n✓ Final GPU memory cleanup complete")
