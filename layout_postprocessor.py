@@ -328,19 +328,27 @@ class LayoutPostprocessor:
         ids = np.fromiter((c.id for c in clusters), dtype=np.int64, count=len(clusters))
         boxes = np.asarray([c.bbox.as_tuple() for c in clusters], dtype=np.float32)
 
-        # tiny, order-insensitive signature for membership (hash + len)
+        # FNV-1a 64-bit constants
+        FNV_OFFSET = 0xcbf29ce484222325  # 14695981039346656037
+        FNV_PRIME = 0x100000001b3       # 1099511628211
+        MASK64 = (1 << 64) - 1
+
+        # Order-insensitive signature for membership (hash + len)
         sig = np.empty((len(clusters), 2), dtype=np.uint64)
         for i, c in enumerate(clusters):
             if not c.cells:
-                sig[i, 0] = 0;
-                sig[i, 1] = 0;
+                sig[i, 0] = 0
+                sig[i, 1] = 0
                 continue
+            
             sig[i, 1] = len(c.cells)
-            h = np.uint64(1469598103934665603)  # FNV-1a 64-bit
-            for v in (x.index for x in c.cells[:128]):  # cap for speed
-                h ^= np.uint64(np.int64(v));
-                h *= np.uint64(1099511628211)
-            sig[i, 0] = h
+            h = FNV_OFFSET
+            # Cap loop for speed (128 items max)
+            for v in (x.index for x in c.cells[:128]):
+                h ^= int(v) & MASK64
+                h = (h * FNV_PRIME) & MASK64  # Wrap without NumPy overflow warnings
+            sig[i, 0] = np.uint64(h)
+        
         return ids, boxes, sig
 
     def _converged(self, prev_ids, prev_boxes, cur_ids, cur_boxes, page_w, page_h, eps_ratio=0.002):

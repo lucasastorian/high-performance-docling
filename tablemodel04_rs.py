@@ -26,7 +26,7 @@ class TableModel04_rs(BaseModel, nn.Module):
     Optimized to avoid GPU->CPU sync in hot paths, and to minimize tensor churn.
     """
 
-    def __init__(self, config, init_data, device):
+    def __init__(self, config, init_data, device: str):
         super(TableModel04_rs, self).__init__(config, init_data, device)
 
         self._prof = False
@@ -147,7 +147,7 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # Optional: AMP (bfloat16) – measure before keeping enabled permanently.
         use_amp = os.environ.get("USE_AMP", "1") == "1"
-        cm = torch.autocast(device_type=self._device.type, dtype=torch.bfloat16) if use_amp else torch.cpu.amp.autocast(enabled=False)
+        cm = torch.autocast(device_type=self._device, dtype=torch.bfloat16) if use_amp else torch.cpu.amp.autocast(enabled=False)
 
         with cm:
             enc_out_batch = self._encoder(imgs)  # [B, H, W, C]
