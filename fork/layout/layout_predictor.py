@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from transformers import AutoModelForObjectDetection
+from transformers import AutoModelForObjectDetection, RTDetrImageProcessor
 
 from docling_ibm_models.layoutmodel.labels import LayoutLabels
 from fork.layout.image_processing_rt_detr import OptimizedRTDetrImageProcessor
@@ -79,7 +79,11 @@ class LayoutPredictor:
             raise FileNotFoundError(f"Missing model config file: {self._model_config}")
 
         # Load model and move to device
-        self._image_processor = OptimizedRTDetrImageProcessor.from_json_file(
+        self._optimized_image_processor = OptimizedRTDetrImageProcessor.from_json_file(
+            self._processor_config
+        )
+
+        self._image_postprocessor = RTDetrImageProcessor.from_json_file(
             self._processor_config
         )
 
@@ -110,7 +114,7 @@ class LayoutPredictor:
             "safe_tensors_file": self._st_fn,
             "device": self._device.type,
             "num_threads": self._num_threads,
-            "image_size": self._image_processor.size,
+            "image_size": self._optimized_image_processor.size,
             "threshold": self._threshold,
         }
         return info
@@ -143,12 +147,12 @@ class LayoutPredictor:
             raise TypeError("Not supported input image format")
 
         target_sizes = torch.tensor([page_img.size[::-1]])
-        inputs = self._image_processor(images=[page_img], return_tensors="pt").to(
+        inputs = self._optimized_image_processor(images=[page_img], return_tensors="pt").to(
             self._device
         )
         outputs = self._model(**inputs)
         results: List[Dict[str, Tensor]] = (
-            self._image_processor.post_process_object_detection(
+            self._image_postprocessor.post_process_object_detection(
                 outputs,
                 target_sizes=target_sizes,
                 threshold=self._threshold,
@@ -201,7 +205,7 @@ class LayoutPredictor:
         # 2) Preprocess with the ORIGINAL HF processor (exact math preserved)
         #    NOTE: this builds CPU tensors; we'll pin & async-copy below.
         t_preprocess_start = time.perf_counter()
-        inputs = self._image_processor(images=pil_images, return_tensors="pt")
+        inputs = self._optimized_image_processor(images=pil_images, return_tensors="pt")
         pixel_values = inputs["pixel_values"]  # [B,3,H’,W’] on CPU
         if self._device.type == "cuda":
             pixel_values = pixel_values.pin_memory().to(
@@ -223,7 +227,7 @@ class LayoutPredictor:
         t_rtdetr_postprocess_start = time.perf_counter()
         target_sizes = torch.tensor([im.size[::-1] for im in pil_images], dtype=torch.long)
         # HF helper expects model-device tensors; it handles device moves internally.
-        results_list = self._image_processor.post_process_object_detection(
+        results_list = self._image_postprocessor.post_process_object_detection(
             outputs, target_sizes=target_sizes, threshold=self._threshold
         )
         self._t_rtdetr_postprocess = time.perf_counter() - t_rtdetr_postprocess_start
