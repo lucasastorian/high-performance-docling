@@ -23,8 +23,8 @@ from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
 
-# from fork.layout.layout_predictor import LayoutPredictor
-from fork.layout.layout_predictor_gpu import LayoutPredictor
+from fork.layout.layout_predictor import LayoutPredictor
+# from fork.layout.layout_predictor_gpu import LayoutPredictor
 
 _log = logging.getLogger(__name__)
 
@@ -86,8 +86,8 @@ class LayoutModel(BasePageModel):
             artifact_path=str(artifacts_path),
             device=device,
             num_threads=accelerator_options.num_threads,
-            use_gpu_preprocess=True,
-            gpu_preprocess_version=1
+            # use_gpu_preprocess=True,
+            # gpu_preprocess_version=1
         )
 
     @staticmethod
