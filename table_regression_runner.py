@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json, hashlib, os
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -95,6 +96,40 @@ def _hash_table(canon: Dict[str, Any]) -> str:
             h.update(cell["token"].encode(errors="ignore"))
     return h.hexdigest()[:16]
 
+def _stable_table_id(canon: Dict[str, Any]) -> str:
+    """Generate stable ID based on content, not detection order."""
+    h = hashlib.sha256()
+    h.update(str(canon["page_no"]).encode())
+    h.update(str(canon["num_rows"]).encode())
+    h.update(str(canon["num_cols"]).encode())
+    # Sort cells to ensure stable ordering
+    cell_sigs = []
+    for cell in canon["cells"]:
+        cell_sigs.append(f'{cell["sr"]},{cell["sc"]},{cell["er"]},{cell["ec"]}')
+    cell_sigs.sort()
+    for sig in cell_sigs:
+        h.update(sig.encode())
+    return h.hexdigest()[:8]
+
+def _table_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Compute structural similarity between tables (0.0 to 1.0)."""
+    if a["page_no"] != b["page_no"]:
+        return 0.0
+    if a["num_rows"] != b["num_rows"] or a["num_cols"] != b["num_cols"]:
+        return 0.0
+    
+    # Compare cell grid structure (ignore bboxes/tokens for stability)
+    a_cells = {(c["sr"], c["sc"], c["er"], c["ec"]) for c in a["cells"]}
+    b_cells = {(c["sr"], c["sc"], c["er"], c["ec"]) for c in b["cells"]}
+    
+    if not a_cells or not b_cells:
+        return 1.0 if a_cells == b_cells else 0.0
+    
+    # Jaccard similarity on cell indices
+    intersection = len(a_cells & b_cells)
+    union = len(a_cells | b_cells)
+    return intersection / union if union > 0 else 0.0
+
 def _serialize_doc(doc_id: str, pages: List[Any]) -> Dict[str, Any]:
     tables = []
     for p in pages:
@@ -106,11 +141,82 @@ def _serialize_doc(doc_id: str, pages: List[Any]) -> Dict[str, Any]:
         "doc_id": doc_id,
         "page_no": t["page_no"],
         "table_id": t["id"],
+        "stable_id": _stable_table_id(t),
         "hash": _hash_table(t),
         "table": t
     } for t in tables]
     entries.sort(key=lambda e: (e["page_no"], str(e["table_id"])))
     return {"doc_id": doc_id, "tables": entries}
+
+# -------------- Matching ----------------
+
+def _match_tables(baseline_tables: List[Dict], current_tables: List[Dict]) -> Tuple[List[Tuple[Dict, Dict]], List[Dict], List[Dict]]:
+    """
+    Robust two-stage table matching to avoid false ADDED/REMOVED due to ID instability.
+    
+    Returns:
+        (matched_pairs, unmatched_baseline, unmatched_current)
+    """
+    # Group by page
+    
+    b_by_page = defaultdict(list)
+    c_by_page = defaultdict(list)
+    
+    for t in baseline_tables:
+        b_by_page[t["page_no"]].append(t)
+    for t in current_tables:
+        c_by_page[t["page_no"]].append(t)
+    
+    matched_pairs = []
+    unmatched_baseline = []
+    unmatched_current = []
+    
+    # Process each page independently
+    for page_no in sorted(set(b_by_page.keys()) | set(c_by_page.keys())):
+        b_tables = b_by_page.get(page_no, [])
+        c_tables = c_by_page.get(page_no, [])
+        
+        # Stage A: Exact match by stable_id (fast path)
+        b_by_stable = {t.get("stable_id", f"legacy_{t['table_id']}"): t for t in b_tables}
+        c_by_stable = {t.get("stable_id", f"legacy_{t['table_id']}"): t for t in c_tables}
+        
+        b_unused = list(b_tables)
+        c_unused = list(c_tables)
+        
+        # Match by stable_id first
+        for stable_id in set(b_by_stable.keys()) & set(c_by_stable.keys()):
+            b_table = b_by_stable[stable_id]
+            c_table = c_by_stable[stable_id]
+            matched_pairs.append((b_table, c_table))
+            if b_table in b_unused:
+                b_unused.remove(b_table)
+            if c_table in c_unused:
+                c_unused.remove(c_table)
+        
+        # Stage B: Greedy matching by similarity for unmatched tables
+        while b_unused and c_unused:
+            best_pair = None
+            best_score = 0.0
+            
+            for b_table in b_unused:
+                for c_table in c_unused:
+                    score = _table_similarity(b_table["table"], c_table["table"])
+                    if score > best_score and score >= 0.98:  # High threshold for grid match
+                        best_score = score
+                        best_pair = (b_table, c_table)
+            
+            if best_pair:
+                matched_pairs.append(best_pair)
+                b_unused.remove(best_pair[0])
+                c_unused.remove(best_pair[1])
+            else:
+                break  # No more good matches
+        
+        # Remaining tables are truly unmatched
+        unmatched_baseline.extend(b_unused)
+        unmatched_current.extend(c_unused)
+    
+    return matched_pairs, unmatched_baseline, unmatched_current
 
 # -------------- Diffs -------------------
 
@@ -198,25 +304,31 @@ class TableRegressionRunner:
         with open(base_path, "r", encoding="utf-8") as f:
             baseline = json.load(f)
 
-        # quick hash match first
-        def idx(m): return {(e["page_no"], str(e["table_id"])): e for e in m["tables"]}
-        bidx, cidx = idx(baseline), idx(payload)
+        # Robust table matching to avoid false ADDED/REMOVED from ID instability
+        matched_pairs, unmatched_baseline, unmatched_current = _match_tables(
+            baseline["tables"], payload["tables"]
+        )
+        
         diffs: List[str] = []
-
-        for key in sorted(set(bidx.keys()) | set(cidx.keys())):
-            be, ce = bidx.get(key), cidx.get(key)
-            if be is None:
-                diffs.append(f"p{key[0]} table {key[1]}: ADDED")
-                continue
-            if ce is None:
-                diffs.append(f"p{key[0]} table {key[1]}: REMOVED")
-                continue
-            if be["hash"] == ce["hash"]:
-                continue
-            # deep compare
-            msgs = _compare_tables(be["table"], ce["table"], self.tol)
+        
+        # Compare matched pairs
+        for b_entry, c_entry in matched_pairs:
+            if b_entry["hash"] == c_entry["hash"]:
+                continue  # Identical, skip detailed comparison
+            
+            # Deep compare the tables
+            msgs = _compare_tables(b_entry["table"], c_entry["table"], self.tol)
             for m in msgs:
-                diffs.append(f"p{key[0]} table {key[1]}: {m}")
+                # Use original table_id for display, but note they're matched by structure
+                display_id = f"{b_entry['table_id']}->{c_entry['table_id']}" if b_entry['table_id'] != c_entry['table_id'] else b_entry['table_id']
+                diffs.append(f"p{b_entry['page_no']} table {display_id}: {m}")
+        
+        # Report truly unmatched tables
+        for b_entry in unmatched_baseline:
+            diffs.append(f"p{b_entry['page_no']} table {b_entry['table_id']}: REMOVED (no structural match)")
+        
+        for c_entry in unmatched_current:
+            diffs.append(f"p{c_entry['page_no']} table {c_entry['table_id']}: ADDED (no structural match)")
 
         # always write current
         with open(curr_path, "w", encoding="utf-8") as f:
