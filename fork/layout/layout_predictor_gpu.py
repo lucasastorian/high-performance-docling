@@ -148,18 +148,23 @@ class LayoutPredictor:
                 
                 if self._use_torch_compile_trt:
                     try:
+                        # Turn on debug logs to see failing ops
+                        os.environ["TORCH_TRT_LOG_LEVEL"] = "DEBUG"
+                        os.environ["TORCH_LOGS"] = "+dynamo,graph_breaks"
+                        os.environ["TORCH_COMPILE_DEBUG"] = "1"
+                        
                         import torch_tensorrt  # ensure installed, version-matched to torch
                         
-                        # Always use FP32 for this conv-heavy model
-                        self._trt_dtype = torch.float32
+                        # Use FP16, not FP32 for better TRT coverage
+                        self._trt_dtype = torch.float16
                         
-                        # Backend options (safe defaults)
+                        # Backend options (fixes for empty engine issues)
                         trt_opts = {
                             "precision": self._trt_dtype,
-                            "use_fast_partitioner": True,   # fuse more segments quickly
-                            "min_block_size": 5,            # avoid tiny partitions
-                            "workspace_size": 2 << 30,      # 2GB
-                            "require_full_compilation": False,  # unsupported ops just stay in PT
+                            "use_fast_partitioner": True,
+                            "min_block_size": 1,                 # allow small clusters
+                            "workspace_size": 6 << 30,           # bump to 6GB for big batches
+                            "require_full_compilation": False,
                             "truncate_long_and_double": True,
                         }
                         
@@ -167,7 +172,7 @@ class LayoutPredictor:
                         self._model = torch.compile(self._model, backend="tensorrt", options=trt_opts)
                         
                         # Optional warmup to prebuild engines for common batch sizes
-                        warm_batches = [int(x) for x in os.getenv("DOCLING_TRT_WARMUPS", "1,64,128").split(",") if x.strip()]
+                        warm_batches = [1, 64, 128]
                         _log.info(f"Warming up TensorRT compilation for batch sizes: {warm_batches}")
                         for b in warm_batches:
                             try:
