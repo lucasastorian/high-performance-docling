@@ -316,17 +316,89 @@ class LayoutPostprocessor:
             clusters.extend(orphan_clusters)
         timer.end("layout_handle_orphans")
 
-        # Iterative refinement
+        # Iterative refinement with safe early convergence
         timer.start("layout_iterative_refine")
-        prev_count = len(clusters) + 1
-        for _ in range(3):  # Maximum 3 iterations
-            if prev_count == len(clusters):
-                break
-            prev_count = len(clusters)
-            clusters = self._adjust_cluster_bboxes(clusters)
-            clusters = self._remove_overlapping_clusters(clusters, "regular")
+        clusters = self._iterative_refine_with_convergence(clusters)
         timer.end("layout_iterative_refine")
 
+        return clusters
+
+    def _state_snapshot(self, clusters):
+        # Stable id-anchored snapshot
+        ids = np.fromiter((c.id for c in clusters), dtype=np.int64, count=len(clusters))
+        boxes = np.asarray([c.bbox.as_tuple() for c in clusters], dtype=np.float32)
+
+        # tiny, order-insensitive signature for membership (hash + len)
+        sig = np.empty((len(clusters), 2), dtype=np.uint64)
+        for i, c in enumerate(clusters):
+            if not c.cells:
+                sig[i, 0] = 0;
+                sig[i, 1] = 0;
+                continue
+            sig[i, 1] = len(c.cells)
+            h = np.uint64(1469598103934665603)  # FNV-1a 64-bit
+            for v in (x.index for x in c.cells[:128]):  # cap for speed
+                h ^= np.uint64(np.int64(v));
+                h *= np.uint64(1099511628211)
+            sig[i, 0] = h
+        return ids, boxes, sig
+
+    def _converged(self, prev_ids, prev_boxes, cur_ids, cur_boxes, page_w, page_h, eps_ratio=0.002):
+        # If the set of clusters changed (merges/deletions), we’re not converged.
+        if prev_ids.shape[0] != cur_ids.shape[0] or not np.array_equal(prev_ids, cur_ids):
+            return False
+        # Align by id (defensive even if equal)
+        order_prev = np.argsort(prev_ids, kind="stable")
+        order_cur = np.argsort(cur_ids, kind="stable")
+        pb = prev_boxes[order_prev]
+        cb = cur_boxes[order_cur]
+
+        eps = eps_ratio * max(page_w, page_h)
+        return np.all(np.max(np.abs(pb - cb), axis=1) < eps)
+
+    def _memberships_stable(self, prev_clusters, cur_clusters, j_lo=0.995, j_p95=0.98):
+        # Require identical id sets; otherwise clearly not stable.
+        pid = np.fromiter((c.id for c in prev_clusters), dtype=np.int64)
+        cid = np.fromiter((c.id for c in cur_clusters), dtype=np.int64)
+        if pid.shape[0] != cid.shape[0] or not np.array_equal(np.sort(pid), np.sort(cid)):
+            return False
+
+        by_id_prev = {c.id: {x.index for x in c.cells} for c in prev_clusters}
+        by_id_cur = {c.id: {x.index for x in c.cells} for c in cur_clusters}
+        j = []
+        for k in by_id_prev.keys():
+            A, B = by_id_prev[k], by_id_cur[k]
+            if not A and not B:
+                j.append(1.0);
+                continue
+            inter = len(A & B);
+            union = len(A) + len(B) - inter
+            j.append(inter / max(union, 1))
+        j = np.asarray(j, dtype=np.float32)
+        return (j.min() >= j_lo) and (np.percentile(j, 95) >= j_p95)
+
+    def _iterative_refine_with_convergence(self, clusters):
+        max_passes = 6  # safety only
+
+        prev_ids, prev_boxes, _ = self._state_snapshot(clusters)
+        prev_clusters = [Cluster(id=c.id, label=c.label, bbox=c.bbox,
+                                 confidence=c.confidence, cells=c.cells[:]) for c in clusters]
+
+        for _ in range(max_passes):
+            clusters = self._adjust_cluster_bboxes(clusters)
+            clusters = self._remove_overlapping_clusters(clusters, "regular")
+
+            cur_ids, cur_boxes, _ = self._state_snapshot(clusters)
+            geo_ok = self._converged(prev_ids, prev_boxes, cur_ids, cur_boxes,
+                                     self.page_size.width, self.page_size.height)
+            mem_ok = self._memberships_stable(prev_clusters, clusters)
+
+            if geo_ok and mem_ok:
+                break
+
+            prev_ids, prev_boxes = cur_ids, cur_boxes
+            prev_clusters = [Cluster(id=c.id, label=c.label, bbox=c.bbox,
+                                     confidence=c.confidence, cells=c.cells[:]) for c in clusters]
         return clusters
 
     def _process_special_clusters(self) -> List[Cluster]:
