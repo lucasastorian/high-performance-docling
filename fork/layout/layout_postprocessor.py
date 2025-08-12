@@ -12,7 +12,7 @@ from rtree import index
 from docling.datamodel.base_models import BoundingBox, Page
 from docling.datamodel.pipeline_options import LayoutOptions
 
-from fork.layout.cluster import Cluster
+from fork.types import Cluster
 from fork.timers import _CPUTimer
 
 _log = logging.getLogger(__name__)

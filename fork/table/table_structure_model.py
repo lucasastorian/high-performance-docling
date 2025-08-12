@@ -8,7 +8,6 @@ from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell
 from docling_core.types.doc.page import BoundingRectangle, TextCellUnit
 
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-from docling.datamodel.base_models import Table, TableStructurePrediction
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import TableFormerMode, TableStructureOptions
 from docling.datamodel.settings import settings
@@ -18,21 +17,21 @@ from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
 from page_model import Page
+from fork.types import Table, TableStructurePrediction
 
 from fork.table.tf_predictor import TFPredictor
 
 
 class TableStructureModel(BasePageModel):
-
     _model_repo_folder = "ds4sd--docling-models"
     _model_path = "model_artifacts/tableformer"
 
     def __init__(
-        self,
-        enabled: bool,
-        artifacts_path: Optional[Path],
-        options: TableStructureOptions,
-        accelerator_options: AcceleratorOptions,
+            self,
+            enabled: bool,
+            artifacts_path: Optional[Path],
+            options: TableStructureOptions,
+            accelerator_options: AcceleratorOptions,
     ):
         self.options = options
         self.do_cell_matching = self.options.do_cell_matching
@@ -46,7 +45,7 @@ class TableStructureModel(BasePageModel):
                 # will become the default in the future
                 if (artifacts_path / self._model_repo_folder).exists():
                     artifacts_path = (
-                        artifacts_path / self._model_repo_folder / self._model_path
+                            artifacts_path / self._model_repo_folder / self._model_path
                     )
                 elif (artifacts_path / self._model_path).exists():
                     warnings.warn(
@@ -84,7 +83,7 @@ class TableStructureModel(BasePageModel):
 
     @staticmethod
     def download_models(
-        local_dir: Optional[Path] = None, force: bool = False, progress: bool = False
+            local_dir: Optional[Path] = None, force: bool = False, progress: bool = False
     ) -> Path:
         return download_hf_model(
             repo_id="ds4sd/docling-models",
@@ -95,11 +94,11 @@ class TableStructureModel(BasePageModel):
         )
 
     def draw_table_and_cells(
-        self,
-        conv_res: ConversionResult,
-        page: Page,
-        tbl_list: Iterable[Table],
-        show: bool = False,
+            self,
+            conv_res: ConversionResult,
+            page: Page,
+            tbl_list: Iterable[Table],
+            show: bool = False,
     ):
         assert page._backend is not None
         assert page.size is not None
@@ -146,15 +145,15 @@ class TableStructureModel(BasePageModel):
             image.show()
         else:
             out_path: Path = (
-                Path(settings.debug.debug_output_path)
-                / f"debug_{conv_res.input.file.stem}"
+                    Path(settings.debug.debug_output_path)
+                    / f"debug_{conv_res.input.file.stem}"
             )
             out_path.mkdir(parents=True, exist_ok=True)
             out_file = out_path / f"table_struct_page_{page.page_no:05}.png"
             image.save(str(out_file), format="png")
 
     def __call__(
-        self, conv_res: ConversionResult, page_batch: Iterable[Page]
+            self, conv_res: ConversionResult, page_batch: Iterable[Page]
     ) -> Iterable[Page]:
         if not self.enabled:
             # passthrough
@@ -166,8 +165,8 @@ class TableStructureModel(BasePageModel):
         # Batch accumulators
         page_inputs: List[dict] = []
         table_bboxes_list: List[List[List[float]]] = []  # per-page list of bboxes
-        page_clusters_list: List[List[Any]] = []         # per-page list of clusters
-        batched_page_indexes: List[int] = []             # map batch idx -> pages_list idx
+        page_clusters_list: List[List[Any]] = []  # per-page list of clusters
+        batched_page_indexes: List[int] = []  # map batch idx -> pages_list idx
 
         # Prepare pages (aggregate tokens per page; dedup by token id)
         for page_idx, page in enumerate(pages_list):
@@ -244,7 +243,7 @@ class TableStructureModel(BasePageModel):
             clusters = page_clusters_list[i]
             n_tables = len(clusters)
 
-            page_outputs = all_outputs[result_idx : result_idx + n_tables]
+            page_outputs = all_outputs[result_idx: result_idx + n_tables]
             result_idx += n_tables
 
             for output, table_cluster in zip(page_outputs, clusters):
