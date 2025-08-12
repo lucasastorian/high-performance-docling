@@ -2,6 +2,7 @@ import os
 import sys
 import bisect
 import logging
+import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
@@ -699,8 +700,8 @@ class LayoutPostprocessor:
                 for c in clusters:
                     cid = c.id
                     l1, t1, r1, b1 = boxes[cid]
-                    # Candidate set is tiny now
-                    for oid in grid.candidates(l1, t1, r1, b1):
+                    # Candidate set is tiny now (sorted for deterministic order)
+                    for oid in sorted(grid.candidates(l1, t1, r1, b1)):
                         if oid <= cid or oid not in valid_clusters:
                             continue
                         # Quick AABB reject by tuples
@@ -858,8 +859,8 @@ class LayoutPostprocessor:
             # Get cell bbox coords once
             lx, ty, rx, by = cell_bbox.as_tuple()
 
-            # Query grid for candidate clusters
-            for cluster_id in assign_grid.candidates(lx, ty, rx, by):
+            # Query grid for candidate clusters (sorted for deterministic order)
+            for cluster_id in sorted(assign_grid.candidates(lx, ty, rx, by)):
                 cluster = id_to_cluster.get(cluster_id)
                 if cluster is None:
                     continue
