@@ -268,7 +268,7 @@ class Page(BaseModel):
     )
     _default_image_scale: float = 1.0  # Default image scale for external usage.
     _image_cache: Dict[
-        float, Image.Image
+        float, Image
     ] = {}  # Cache of images in different scales. By default it is cleared during assembling.
     _np_image_cache: dict[float, np.ndarray] = {}
 
@@ -294,7 +294,7 @@ class Page(BaseModel):
             scale: float = 1.0,
             max_size: Optional[int] = None,
             cropbox: Optional[BoundingBox] = None,
-    ) -> Optional[Image.Image]:
+    ) -> Optional[Image]:
         if self._backend is None:
             return self._image_cache.get(scale, None)
 
@@ -331,7 +331,7 @@ class Page(BaseModel):
         return arr
 
     @property
-    def image(self) -> Optional[Image.Image]:
+    def image(self) -> Optional[Image]:
         return self.get_image(scale=self._default_image_scale)
 
 
