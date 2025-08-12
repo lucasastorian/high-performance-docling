@@ -28,7 +28,6 @@ from fork.layout.layout_postprocessor import LayoutPostprocessor
 from fork.types import Cluster
 
 
-
 _log = logging.getLogger(__name__)
 
 class LayoutPrediction(BaseModel):
