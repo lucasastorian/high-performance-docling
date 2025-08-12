@@ -135,7 +135,7 @@ class LayoutPredictor:
                 # Fast default math for Ampere+ without changing numerics materially
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-                torch.backends.cudnn.benchmark = True  # helps if your resize/pad lands on few shapes
+                torch.backends.cudnn.benchmark = False  # <-- disable benchmark for varying shapes
                 
                 # Avoid per-batch layout conversions
                 self._model.to(memory_format=torch.channels_last)
