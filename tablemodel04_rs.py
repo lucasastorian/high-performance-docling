@@ -260,58 +260,73 @@ class TableModel04_rs(BaseModel, nn.Module):
             AggProfiler().begin("model_tag_transformer_fc", self._prof)
             logits = self._tag_transformer._fc(decoded[-1, :, :])  # 1, vocab_size
             AggProfiler().end("model_tag_transformer_fc", self._prof)
-            new_tag = logits.argmax(1).item()
+            new_tag_tensor = logits.argmax(1)  # Keep as tensor [1]
 
-            # STRUCTURE ERROR CORRECTION
-            # Correction for first line xcel...
-            if line_num == 0:
-                if new_tag == word_map["xcel"]:
-                    new_tag = word_map["lcel"]
+            # STRUCTURE ERROR CORRECTION using tensor operations
+            # Cache tag IDs as tensors
+            if not hasattr(self, '_cached_tag_ids'):
+                self._cached_tag_ids = {
+                    'end': torch.tensor(word_map["<end>"], device=logits.device),
+                    'xcel': torch.tensor(word_map["xcel"], device=logits.device),
+                    'lcel': torch.tensor(word_map["lcel"], device=logits.device),
+                    'fcel': torch.tensor(word_map["fcel"], device=logits.device),
+                    'ucel': torch.tensor(word_map["ucel"], device=logits.device),
+                    'nl': torch.tensor(word_map["nl"], device=logits.device),
+                }
+            
+            # Correction for first line xcel -> lcel
+            mask_first_line = (line_num == 0) & new_tag_tensor.eq(self._cached_tag_ids['xcel'])
+            new_tag_tensor = torch.where(mask_first_line, self._cached_tag_ids['lcel'], new_tag_tensor)
 
-            # Correction for ucel, lcel sequence...
-            if prev_tag_ucel:
-                if new_tag == word_map["lcel"]:
-                    new_tag = word_map["fcel"]
+            # Correction for ucel, lcel sequence -> fcel
+            mask_ucel_lcel = prev_tag_ucel & new_tag_tensor.eq(self._cached_tag_ids['lcel'])
+            new_tag_tensor = torch.where(mask_ucel_lcel, self._cached_tag_ids['fcel'], new_tag_tensor)
 
-            # End of generation
-            if new_tag == word_map["<end>"]:
-                output_tags.append(new_tag)
+            # End of generation check (only extract scalar when needed to break)
+            is_end = new_tag_tensor.eq(self._cached_tag_ids['end'])
+            if bool(is_end.item()):  # Single sync point only for loop termination
+                output_tags.append(int(self._cached_tag_ids['end'].item()))
                 decoded_tags = torch.cat(
                     [
                         decoded_tags,
-                        torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
+                        new_tag_tensor.unsqueeze(0).unsqueeze(1),
                     ],
                     dim=0,
                 )  # current_output_len, 1
                 break
-            output_tags.append(new_tag)
+            
+            # Append tag (defer .item() until after loop)
+            output_tags.append(new_tag_tensor)  # Keep as tensor for now
 
-            # BBOX PREDICTION
-
+            # BBOX PREDICTION using tensor operations
+            
+            # Create mask for bbox-generating tags
+            bbox_tags = torch.stack([
+                self._cached_tag_ids['fcel'], self._cached_tag_ids['xcel'],
+                torch.tensor(word_map["ecel"], device=logits.device),
+                torch.tensor(word_map["ched"], device=logits.device),
+                torch.tensor(word_map["rhed"], device=logits.device),
+                torch.tensor(word_map["srow"], device=logits.device),
+                self._cached_tag_ids['nl'], self._cached_tag_ids['ucel']
+            ])
+            emit_bbox = torch.isin(new_tag_tensor, bbox_tags)
+            
             # MAKE SURE TO SYNC NUMBER OF CELLS WITH NUMBER OF BBOXes
-            if not skip_next_tag:
-                if new_tag in [
-                    word_map["fcel"],
-                    word_map["ecel"],
-                    word_map["ched"],
-                    word_map["rhed"],
-                    word_map["srow"],
-                    word_map["nl"],
-                    word_map["ucel"],
-                ]:
-                    # GENERATE BBOX HERE TOO (All other cases)...
-                    tag_H_buf.append(decoded[-1, :, :])
-                    if first_lcel is not True:
-                        # Mark end index for horizontal cell bbox merge
-                        bboxes_to_merge[cur_bbox_ind] = bbox_ind
-                    bbox_ind += 1
+            if not skip_next_tag and bool(emit_bbox.item()):  # Minimal scalar extraction
+                # GENERATE BBOX HERE TOO (All other cases)...
+                tag_H_buf.append(decoded[-1, :, :])
+                if first_lcel is not True:
+                    # Mark end index for horizontal cell bbox merge
+                    bboxes_to_merge[cur_bbox_ind] = bbox_ind
+                bbox_ind += 1
 
-            # Treat horisontal span bboxes...
-            if new_tag != word_map["lcel"]:
+            # Treat horizontal span bboxes...
+            is_lcel = new_tag_tensor.eq(self._cached_tag_ids['lcel'])
+            if not bool(is_lcel.item()):  # Minimal scalar extraction for control flow
                 first_lcel = True
             else:
                 if first_lcel:
-                    # GENERATE BBOX HERE (Beginning of horisontal span)...
+                    # GENERATE BBOX HERE (Beginning of horizontal span)...
                     tag_H_buf.append(decoded[-1, :, :])
                     first_lcel = False
                     # Mark start index for cell bbox merge
@@ -319,24 +334,36 @@ class TableModel04_rs(BaseModel, nn.Module):
                     bboxes_to_merge[cur_bbox_ind] = -1
                     bbox_ind += 1
 
-            if new_tag in [word_map["nl"], word_map["ucel"], word_map["xcel"]]:
-                skip_next_tag = True
-            else:
-                skip_next_tag = False
+            # Update skip_next_tag using tensor operations
+            skip_tags = torch.stack([
+                self._cached_tag_ids['nl'], self._cached_tag_ids['ucel'], self._cached_tag_ids['xcel']
+            ])
+            skip_next_tag = bool(torch.isin(new_tag_tensor, skip_tags).item())
 
-            # Register ucel in sequence...
-            if new_tag == word_map["ucel"]:
-                prev_tag_ucel = True
-            else:
-                prev_tag_ucel = False
+            # Register ucel in sequence using tensor operations
+            prev_tag_ucel = bool(new_tag_tensor.eq(self._cached_tag_ids['ucel']).item())
+
+            # Update line counter
+            if bool(new_tag_tensor.eq(self._cached_tag_ids['nl']).item()):
+                line_num += 1
 
             decoded_tags = torch.cat(
                 [
                     decoded_tags,
-                    torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
+                    new_tag_tensor.unsqueeze(0).unsqueeze(1),
                 ],
                 dim=0,
             )  # current_output_len, 1
+        
+        # Convert any remaining tensor tags to integers (single GPU sync at end)
+        output_tags_final = []
+        for tag in output_tags:
+            if torch.is_tensor(tag):
+                output_tags_final.append(int(tag.item()))
+            else:
+                output_tags_final.append(tag)
+        output_tags = output_tags_final
+        
         seq = decoded_tags.squeeze().tolist()
 
         if self._bbox:

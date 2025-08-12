@@ -329,87 +329,47 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page, table_cluster, ios=0.8):
-        bbox = table_cluster.bbox.to_top_left_origin(page.word_index.H)
-        return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
+        # bbox = table_cluster.bbox.to_top_left_origin(page.word_index.H)
+        # return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
 
-        # # Ensure tokens are prebuilt
-        # toks = page.tokens_np
-        # if toks is None or toks.size == 0:
-        #     return []
-        #
-        # # Table bbox → TOP-LEFT origin (unscaled)
-        # H = float(page.size.height)
-        # tbl_tl = table_cluster.bbox.to_top_left_origin(page_height=H)
-        # lb, tb, rb, bb = tbl_tl.l, tbl_tl.t, tbl_tl.r, tbl_tl.b
-        #
-        # # Vectorized IOS filter
-        # L, T, R, B = toks['l'], toks['t'], toks['r'], toks['b']
-        # inter_w = np.maximum(0.0, np.minimum(R, rb) - np.maximum(L, lb))
-        # inter_h = np.maximum(0.0, np.minimum(B, bb) - np.maximum(T, tb))
-        # inter = inter_w * inter_h
-        # area = (R - L) * (B - T)
-        # keep = inter >= (ios * area)
-        #
-        # if not np.any(keep):
-        #     return []
-        #
-        # idx = np.nonzero(keep)[0]
-        # sel = toks[idx]
-        #
-        # # Package for TF: scale now (cheap, one pass)
-        # s = float(self.scale)
-        # return [
-        #     {
-        #         "id": int(t['id']),
-        #         "text": "",  # keep light; attach later only if needed
-        #         "bbox": {
-        #             "l": float(t['l'] * s),
-        #             "t": float(t['t'] * s),
-        #             "r": float(t['r'] * s),
-        #             "b": float(t['b'] * s),
-        #         },
-        #     }
-        #     for t in sel
-        # ]
-        #
-        # sp = page.parsed_page
-        # if sp is not None:
-        #     tcells = sp.get_cells_in_bbox(
-        #         cell_unit=TextCellUnit.WORD,
-        #         bbox=table_cluster.bbox,
-        #     )
-        #     if len(tcells) == 0:
-        #         # In case word-level cells yield empty
-        #         tcells = table_cluster.cells
-        # else:
-        #     # Otherwise - we use normal (line/phrase) cells
-        #     tcells = table_cluster.cells
-        #
-        # tokens = []
-        # sx = sy = self.scale  # Pre-compute scale factors
-        #
-        # for c in tcells:
-        #     # Only allow non empty strings (spaces) into the cells of a table
-        #     text = c.text.strip()
-        #     if not text:
-        #         continue
-        #
-        #     # Direct bbox calculation without deep copy or intermediate objects
-        #     bb = c.rect.to_bounding_box()
-        #     tokens.append(
-        #         {
-        #             "id": c.index,
-        #             "text": text,
-        #             "bbox": {
-        #                 "l": bb.l * sx,
-        #                 "t": bb.t * sy,
-        #                 "r": bb.r * sx,
-        #                 "b": bb.b * sy,
-        #             },
-        #         }
-        #     )
-        #
-        # return tokens
+        sp = page.parsed_page
+        if sp is not None:
+            tcells = sp.get_cells_in_bbox(
+                cell_unit=TextCellUnit.WORD,
+                bbox=table_cluster.bbox,
+            )
+            if len(tcells) == 0:
+                # In case word-level cells yield empty
+                tcells = table_cluster.cells
+        else:
+            # Otherwise - we use normal (line/phrase) cells
+            tcells = table_cluster.cells
+
+        tokens = []
+        sx = sy = self.scale  # Pre-compute scale factors
+
+        for c in tcells:
+            # Only allow non empty strings (spaces) into the cells of a table
+            text = c.text.strip()
+            if not text:
+                continue
+
+            # Direct bbox calculation without deep copy or intermediate objects
+            bb = c.rect.to_bounding_box()
+            tokens.append(
+                {
+                    "id": c.index,
+                    "text": text,
+                    "bbox": {
+                        "l": bb.l * sx,
+                        "t": bb.t * sy,
+                        "r": bb.r * sx,
+                        "b": bb.b * sy,
+                    },
+                }
+            )
+
+        return tokens
 
     # def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
     #     timer = get_timing_collector()
