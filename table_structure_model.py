@@ -329,47 +329,47 @@ class TableStructureModel(BasePageModel):
         ]
 
     def _get_table_tokens(self, page, table_cluster, ios=0.8):
-        # bbox = table_cluster.bbox.to_top_left_origin(page.word_index.H)
-        # return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
-
-        sp = page.parsed_page
-        if sp is not None:
-            tcells = sp.get_cells_in_bbox(
-                cell_unit=TextCellUnit.WORD,
-                bbox=table_cluster.bbox,
-            )
-            if len(tcells) == 0:
-                # In case word-level cells yield empty
-                tcells = table_cluster.cells
-        else:
-            # Otherwise - we use normal (line/phrase) cells
-            tcells = table_cluster.cells
-
-        tokens = []
-        sx = sy = self.scale  # Pre-compute scale factors
-
-        for c in tcells:
-            # Only allow non empty strings (spaces) into the cells of a table
-            text = c.text.strip()
-            if not text:
-                continue
-
-            # Direct bbox calculation without deep copy or intermediate objects
-            bb = c.rect.to_bounding_box()
-            tokens.append(
-                {
-                    "id": c.index,
-                    "text": text,
-                    "bbox": {
-                        "l": bb.l * sx,
-                        "t": bb.t * sy,
-                        "r": bb.r * sx,
-                        "b": bb.b * sy,
-                    },
-                }
-            )
-
-        return tokens
+        bbox = table_cluster.bbox.to_top_left_origin(page.word_index.H)
+        return page.word_index.query_bbox(bbox.l, bbox.t, bbox.r, bbox.b, ios=ios, scale=self.scale)
+        #
+        # sp = page.parsed_page
+        # if sp is not None:
+        #     tcells = sp.get_cells_in_bbox(
+        #         cell_unit=TextCellUnit.WORD,
+        #         bbox=table_cluster.bbox,
+        #     )
+        #     if len(tcells) == 0:
+        #         # In case word-level cells yield empty
+        #         tcells = table_cluster.cells
+        # else:
+        #     # Otherwise - we use normal (line/phrase) cells
+        #     tcells = table_cluster.cells
+        #
+        # tokens = []
+        # sx = sy = self.scale  # Pre-compute scale factors
+        #
+        # for c in tcells:
+        #     # Only allow non empty strings (spaces) into the cells of a table
+        #     text = c.text.strip()
+        #     if not text:
+        #         continue
+        #
+        #     # Direct bbox calculation without deep copy or intermediate objects
+        #     bb = c.rect.to_bounding_box()
+        #     tokens.append(
+        #         {
+        #             "id": c.index,
+        #             "text": text,
+        #             "bbox": {
+        #                 "l": bb.l * sx,
+        #                 "t": bb.t * sy,
+        #                 "r": bb.r * sx,
+        #                 "b": bb.b * sy,
+        #             },
+        #         }
+        #     )
+        #
+        # return tokens
 
     # def _process_table_output(self, page: Page, table_cluster: Any, table_out: Dict) -> Table:
     #     timer = get_timing_collector()
