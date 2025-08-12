@@ -19,6 +19,9 @@ class GPUPreprocessor(nn.Module):
         size: Dict[str, int],
         do_pad: bool = False,
         pad_size: Optional[Dict[str, int]] = None,
+        do_rescale: bool = True,
+        rescale_factor: float = 1/255.0,
+        do_normalize: bool = False,  # RT-DETR typically doesn't normalize
         mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
         device: Union[str, torch.device] = "cuda",
@@ -28,10 +31,13 @@ class GPUPreprocessor(nn.Module):
         self.size = size
         self.do_pad = do_pad
         self.pad_size = pad_size
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
         self.device = torch.device(device)  # Ensure proper device object
         self.dtype = dtype
         
-        # Pre-compute mean/std tensors
+        # Pre-compute mean/std tensors (only used if do_normalize=True)
         self.register_buffer('mean', torch.tensor(mean, dtype=dtype, device=device).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor(std, dtype=dtype, device=device).view(1, 3, 1, 1))
         
@@ -134,25 +140,32 @@ class GPUPreprocessor(nn.Module):
         
         batch_gpu = batch_cpu.to(self.device, non_blocking=True)
         
-        if is_u8:
-            batch_gpu = batch_gpu.to(self.dtype)
-            batch_gpu = batch_gpu.mul_(1.0/255.0)
-        else:
-            # Float input: detect range ~[0,255] vs [0,1]
-            if batch_gpu.dtype.is_floating_point:
-                # Heuristic: if max>1.5, assume 0..255 range
-                needs_rescale = (batch_gpu.max().item() > 1.5)
+        # Rescale if needed
+        if self.do_rescale:
+            if is_u8:
                 batch_gpu = batch_gpu.to(self.dtype)
-                if needs_rescale:
-                    batch_gpu.mul_(1.0/255.0)
+                batch_gpu = batch_gpu.mul_(self.rescale_factor)
             else:
-                batch_gpu = batch_gpu.to(self.dtype)
+                # Float input: detect range ~[0,255] vs [0,1]
+                if batch_gpu.dtype.is_floating_point:
+                    # Heuristic: if max>1.5, assume 0..255 range
+                    needs_rescale = (batch_gpu.max().item() > 1.5)
+                    batch_gpu = batch_gpu.to(self.dtype)
+                    if needs_rescale:
+                        batch_gpu.mul_(self.rescale_factor)
+                else:
+                    batch_gpu = batch_gpu.to(self.dtype)
+        else:
+            batch_gpu = batch_gpu.to(self.dtype)
         
         # Apply resize
         batch_resized = self.resize_op(batch_gpu)
         
-        # Normalize using pre-computed mean/std
-        batch_normalized = (batch_resized - self.mean) / self.std
+        # Normalize only if do_normalize=True
+        if self.do_normalize:
+            batch_normalized = (batch_resized - self.mean) / self.std
+        else:
+            batch_normalized = batch_resized
         
         # Handle padding if needed
         if self.do_pad:
@@ -219,6 +232,9 @@ class GPUPreprocessorV2(nn.Module):
         size: Dict[str, int],
         do_pad: bool = False,
         pad_size: Optional[Dict[str, int]] = None,
+        do_rescale: bool = True,
+        rescale_factor: float = 1/255.0,
+        do_normalize: bool = False,  # RT-DETR typically doesn't normalize
         mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
         device: Union[str, torch.device] = "cuda",
@@ -228,10 +244,13 @@ class GPUPreprocessorV2(nn.Module):
         self.size = size
         self.do_pad = do_pad
         self.pad_size = pad_size
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
         self.device = torch.device(device)  # Ensure proper device object
         self.dtype = dtype
         
-        # Pre-compute mean/std for NHWC format
+        # Pre-compute mean/std for NHWC format (only used if do_normalize=True)
         self.register_buffer('mean', torch.tensor(mean, dtype=dtype, device=device).view(1, 1, 1, 3))
         self.register_buffer('std', torch.tensor(std, dtype=dtype, device=device).view(1, 1, 1, 3))
         
@@ -309,22 +328,37 @@ class GPUPreprocessorV2(nn.Module):
         
         if stream_compute:
             with torch.cuda.stream(stream_compute):
-                # Convert to float and scale
-                batch_float = batch_gpu.to(self.dtype) / 255.0
+                # Convert to float and rescale if needed
+                if self.do_rescale:
+                    batch_float = batch_gpu.to(self.dtype) * self.rescale_factor
+                else:
+                    batch_float = batch_gpu.to(self.dtype)
                 
                 # Resize (internally converts to NCHW and back)
                 batch_resized = self.resize_op(batch_float)
                 
-                # Normalize in NHWC format (more efficient)
-                batch_normalized = (batch_resized - self.mean) / self.std
+                # Normalize only if do_normalize=True
+                if self.do_normalize:
+                    batch_normalized = (batch_resized - self.mean) / self.std
+                else:
+                    batch_normalized = batch_resized
                 
                 # Convert to NCHW for model input - plain contiguous
                 batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
         else:
             # CPU path
-            batch_float = batch_gpu.to(self.dtype) / 255.0
+            if self.do_rescale:
+                batch_float = batch_gpu.to(self.dtype) * self.rescale_factor
+            else:
+                batch_float = batch_gpu.to(self.dtype)
+            
             batch_resized = self.resize_op(batch_float)
-            batch_normalized = (batch_resized - self.mean) / self.std
+            
+            if self.do_normalize:
+                batch_normalized = (batch_resized - self.mean) / self.std
+            else:
+                batch_normalized = batch_resized
+            
             batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
         
         # Handle padding

@@ -44,7 +44,7 @@ class LayoutPredictor:
         use_gpu_preprocess: bool = True,
         gpu_preprocess_version: int = 1,  # 1 or 2
     ):
-        """
+        """w
         Initialize layout predictor with optional GPU preprocessing.
         
         Parameters
@@ -110,6 +110,9 @@ class LayoutPredictor:
                 size=size_config,
                 do_pad=self._image_preprocessor.do_pad,
                 pad_size=self._image_preprocessor.pad_size,
+                do_rescale=self._image_preprocessor.do_rescale,
+                rescale_factor=self._image_preprocessor.rescale_factor,
+                do_normalize=self._image_preprocessor.do_normalize,
                 mean=tuple(self._image_preprocessor.image_mean),
                 std=tuple(self._image_preprocessor.image_std),
                 device=str(self._device),  # Keep full device string (e.g., "cuda:1")
