@@ -67,6 +67,9 @@ class LayoutPredictor:
 
         # Set basic params
         self._threshold = base_threshold
+        
+        # Enable compatibility mode if environment variable is set
+        self._compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
 
         # Set number of threads for CPU
         self._device = torch.device(device)
@@ -137,6 +140,38 @@ class LayoutPredictor:
             self._label_offset = 0
 
         _log.debug("LayoutPredictorGPU settings: {}".format(self.info()))
+
+    def _stable_sort_result(self, res: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """
+        Stable sort detection result to make order deterministic.
+        Sort by: label, -score, x1, y1, x2, y2 (consistent and stable).
+        """
+        boxes, scores, labels = res["boxes"], res["scores"], res["labels"]
+        
+        # Create sort key: [labels, -scores, x1, y1, x2, y2]
+        key = torch.stack([
+            labels.to(torch.int64),
+            (-scores).to(torch.float32),
+            boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        ], dim=1)
+        
+        # Sort by each column in order using lexsort or argsort
+        if hasattr(torch, "lexsort"):
+            idx = torch.lexsort(key.t())
+        else:
+            # Fallback: manual lexicographic sort
+            # Sort by the last column first, then work backwards
+            idx = torch.arange(len(boxes), device=boxes.device)
+            for col_idx in range(key.shape[1] - 1, -1, -1):
+                col = key[:, col_idx]
+                sort_idx = torch.argsort(col, stable=True)
+                idx = idx[sort_idx]
+        
+        return {
+            "boxes": boxes[idx],
+            "scores": scores[idx], 
+            "labels": labels[idx],
+        }
 
     def _create_timer(self):
         """Create a timer appropriate for the device."""
@@ -223,13 +258,22 @@ class LayoutPredictor:
             outputs = self._model(pixel_values=pixel_values)
 
         with timer.time_section('postprocess'):
+            # Apply threshold hysteresis in compatibility mode
+            threshold = self._threshold
+            if self._compat_mode:
+                threshold = max(0.0, threshold - 1e-4)
+            
             results_list: List[Dict[str, Tensor]] = (
                 self._image_postprocessor.post_process_object_detection(
                     outputs,
                     target_sizes=target_sizes,
-                    threshold=self._threshold,
+                    threshold=threshold,
                 )
             )
+            
+            # Apply stable sorting in compatibility mode
+            if self._compat_mode:
+                results_list = [self._stable_sort_result(r) for r in results_list]
 
         timer.finalize()
         self._store_timings(timer)

@@ -1,5 +1,6 @@
 import bisect
 import logging
+import os
 import sys
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
@@ -94,14 +95,22 @@ class SpatialClusterIndex:
         if bbox1.area() <= 0 or bbox2.area() <= 0:
             return False
 
+        # Apply epsilon for compatibility mode to handle floating point precision issues
+        compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
+        epsilon = 1e-4 if compat_mode else 0.0
+
         iou = bbox1.intersection_over_union(bbox2)
         containment1 = bbox1.intersection_over_self(bbox2)
         containment2 = bbox2.intersection_over_self(bbox1)
 
+        # Apply epsilon to thresholds to handle tie-breaks consistently
+        effective_overlap_threshold = overlap_threshold - epsilon
+        effective_containment_threshold = containment_threshold - epsilon
+
         return (
-                iou > overlap_threshold
-                or containment1 > containment_threshold
-                or containment2 > containment_threshold
+                iou >= effective_overlap_threshold
+                or containment1 >= effective_containment_threshold
+                or containment2 >= effective_containment_threshold
         )
 
 
