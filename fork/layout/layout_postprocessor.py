@@ -804,15 +804,11 @@ class LayoutPostprocessor:
     def _assign_cells_to_clusters(
             self, clusters: List[Cluster], min_overlap: float = 0.2
     ) -> List[Cluster]:
-        """Assign cells to best overlapping cluster using R-tree optimization."""
+        """Assign cells to best overlapping cluster using GridIndex optimization."""
         # Initialize clusters and track first cell index for fast sorting
         for cluster in clusters:
             cluster.cells = []
             cluster._first_cell_index = sys.maxsize
-
-        # Local handles for speed
-        rtree_idx = self.regular_index.spatial_index
-        id_to_cluster = {c.id: c for c in clusters}
 
         # Early exit for empty inputs
         if not clusters or not self.cells:
@@ -823,8 +819,35 @@ class LayoutPostprocessor:
         self._valid_cells = valid_cells  # save for later unassigned check
         self._assigned_cell_indices = set()
 
-        # Hoist method lookups for speed
-        inter = rtree_idx.intersection
+        # Build geometry arrays for fast access
+        id_to_cluster = {c.id: c for c in clusters}
+        cluster_boxes = {c.id: c.bbox.as_tuple() for c in clusters}
+        
+        # Build grid for assignment (reuse page size logic from overlap)
+        if self.page_size is not None:
+            page_w, page_h = self.page_size.width, self.page_size.height
+        else:
+            # Fallback to cluster extents
+            min_l = min(l for (l, _, _, _) in cluster_boxes.values())
+            min_t = min(t for (_, t, _, _) in cluster_boxes.values())
+            max_r = max(r for (_, _, r, _) in cluster_boxes.values())
+            max_b = max(b for (_, _, _, b) in cluster_boxes.values())
+            page_w = max_r - min_l
+            page_h = max_b - min_t
+
+        # Use median-based bin sizing
+        ws = sorted((r - l) for (l, t, r, b) in cluster_boxes.values() if r > l)
+        hs = sorted((b - t) for (l, t, r, b) in cluster_boxes.values() if b > t)
+        med_w = ws[len(ws) // 2] if ws else max(1.0, page_w / 12.0)
+        med_h = hs[len(hs) // 2] if hs else max(1.0, page_h / 24.0)
+
+        bin_w = max(page_w / 60.0, 1.5 * med_w)
+        bin_h = max(page_h / 60.0, 1.5 * med_h)
+
+        # Build assignment grid
+        assign_grid = GridIndex(page_w, page_h, bin_w, bin_h)
+        for cid, (l, t, r, b) in cluster_boxes.items():
+            assign_grid.insert(cid, l, t, r, b)
         
         # Assign each cell to best overlapping cluster
         for cell in valid_cells:
@@ -832,21 +855,21 @@ class LayoutPostprocessor:
             best_overlap = min_overlap
             best_cluster = None
 
-            # Get cell bbox coords once for AABB reject
+            # Get cell bbox coords once
             lx, ty, rx, by = cell_bbox.as_tuple()
 
-            # Query only candidate clusters whose bbox intersects the cell bbox  
-            for cluster_id in inter((lx, ty, rx, by)):
+            # Query grid for candidate clusters
+            for cluster_id in assign_grid.candidates(lx, ty, rx, by):
                 cluster = id_to_cluster.get(cluster_id)
                 if cluster is None:
                     continue
                 
                 # Fast AABB reject before expensive overlap computation
-                bb = cluster.bbox
-                if bb.l >= rx or bb.r <= lx or bb.t >= by or bb.b <= ty:
+                l2, t2, r2, b2 = cluster_boxes[cluster_id]
+                if l2 >= rx or r2 <= lx or t2 >= by or b2 <= ty:
                     continue
                     
-                overlap_ratio = cell_bbox.intersection_over_self(bb)
+                overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
                 if overlap_ratio > best_overlap:
                     best_overlap = overlap_ratio
                     best_cluster = cluster
