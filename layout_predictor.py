@@ -38,6 +38,7 @@ class CudaTimer:
     
     def __enter__(self):
         if self.enabled:
+            torch.cuda.synchronize()
             self.start_event.record()
         else:
             self.t0 = time.perf_counter()
@@ -164,13 +165,6 @@ class LayoutPredictor:
         
         # Pre-compute name to ID mapping for blacklist filtering
         self._name_to_id = {name: i for i, name in enumerate(self._classes_map)}
-        
-        # Precompute blacklist tensor once
-        if self._black_classes:
-            blk_ids = [self._name_to_id[n] - self._label_offset for n in self._black_classes]
-            self._blk_ids = torch.tensor(blk_ids, device=self._device, dtype=torch.long)
-        else:
-            self._blk_ids = None
 
         _log.debug("LayoutPredictor settings: {}".format(self.info()))
 
@@ -187,6 +181,72 @@ class LayoutPredictor:
             "threshold": self._threshold,
         }
         return info
+    #
+    # @torch.inference_mode()
+    # def predict(self, orig_img: Union[Image.Image, np.ndarray]) -> Iterable[dict]:
+    #     """
+    #     Predict bounding boxes for a given image.
+    #     The origin (0, 0) is the top-left corner and the predicted bbox coords are provided as:
+    #     [left, top, right, bottom]
+    #     """
+    #     # Convert image format
+    #     if isinstance(orig_img, Image.Image):
+    #         page_img = orig_img.convert("RGB")
+    #     elif isinstance(orig_img, np.ndarray):
+    #         page_img = Image.fromarray(orig_img).convert("RGB")
+    #     else:
+    #         raise TypeError("Not supported input image format")
+    #
+    #     target_sizes = torch.tensor([page_img.size[::-1]])
+    #
+    #     inputs = self._image_processor(images=[page_img], return_tensors="pt")
+    #     pixel_values = inputs["pixel_values"]
+    #
+    #     if self._device.type == "cuda":
+    #         # contiguous channels_last + pinned host + non_blocking copy
+    #         pixel_values = (
+    #             pixel_values
+    #             .contiguous(memory_format=torch.channels_last)
+    #             .pin_memory()
+    #             .to(self._device, non_blocking=True)
+    #         )
+    #     outputs = self._model(pixel_values=pixel_values)
+    #     results: List[Dict[str, Tensor]] = (
+    #         self._image_processor.post_process_object_detection(
+    #             outputs,
+    #             target_sizes=target_sizes,
+    #             threshold=self._threshold,
+    #         )
+    #     )
+    #
+    #     w, h = page_img.size
+    #     result = results[0]
+    #
+    #     # Bulk move to CPU once to avoid sync storms
+    #     scores_cpu = result["scores"].cpu().numpy().tolist()
+    #     labels_cpu = result["labels"].cpu().numpy().tolist()
+    #     boxes_cpu = result["boxes"].cpu().numpy().tolist()
+    #
+    #     for score, label_id, box in zip(scores_cpu, labels_cpu, boxes_cpu):
+    #         label_id = int(label_id) + self._label_offset
+    #         label_str = self._classes_map[label_id]
+    #
+    #         # Filter out blacklisted classes
+    #         if label_str in self._black_classes:
+    #             continue
+    #
+    #         l = min(w, max(0, box[0]))
+    #         t = min(h, max(0, box[1]))
+    #         r = min(w, max(0, box[2]))
+    #         b = min(h, max(0, box[3]))
+    #         yield {
+    #             "l": float(l),
+    #             "t": float(t),
+    #             "r": float(r),
+    #             "b": float(b),
+    #             "label": label_str,
+    #             "confidence": float(score),
+    #         }
 
     @torch.inference_mode()
     def predict_batch(
@@ -266,17 +326,20 @@ class LayoutPredictor:
 
             # Early GPU culling of small/extreme aspect ratio boxes (optional)
             if self._device.type == "cuda" and boxes.numel() > 0:
-                w = (boxes[:, 2] - boxes[:, 0]).clamp_min_(0)
-                h = (boxes[:, 3] - boxes[:, 1]).clamp_min_(0)
-                wh = w * h
-                ar = (w.clamp_min_(1e-6)) / (h.clamp_min_(1e-6))
+                wh = (boxes[:, 2] - boxes[:, 0]).clamp_min_(0) * (boxes[:, 3] - boxes[:, 1]).clamp_min_(0)
+                ar = (boxes[:, 2] - boxes[:, 0]).clamp_min_(1e-6) / (boxes[:, 3] - boxes[:, 1]).clamp_min_(1e-6)
                 keep = (wh >= 9.0) & (ar <= 20) & (ar >= 1/20)
                 # No need for keep.any() check - indexing with empty mask is fine
                 boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
             # GPU-accelerated blacklist filtering
-            if self._blk_ids is not None and labels.numel() > 0:
-                keep = ~torch.isin(labels, self._blk_ids)
+            if self._black_classes and labels.numel() > 0:
+                blk = torch.tensor(
+                    [self._name_to_id[n] - self._label_offset for n in self._black_classes],
+                    device=labels.device, dtype=labels.dtype
+                )
+                keep = ~torch.isin(labels, blk)
+                # No need for keep.any() check - indexing with empty mask is fine
                 boxes, scores, labels, batch_idx = boxes[keep], scores[keep], labels[keep], batch_idx[keep]
 
             # Batched NMS (only if enabled - can add overhead)
@@ -287,15 +350,22 @@ class LayoutPredictor:
                     boxes, scores, labels + batch_idx * label_stride, iou_threshold=0.5
                 )
                 boxes, scores, labels, batch_idx = boxes[kept], scores[kept], labels[kept], batch_idx[kept]
-            
-            return boxes, scores, labels, batch_idx, splits
-        
+
+            return boxes, scores, labels, batch_idx
+
         if self._enable_timing:
             with CudaTimer() as t_post:
-                boxes, scores, labels, batch_idx, splits = post_process()
+                boxes, scores, labels, batch_idx = post_process()
             st.add("post", t_post.ms)
         else:
-            boxes, scores, labels, batch_idx, splits = post_process()
+            boxes, scores, labels, batch_idx = post_process()
+
+        # Bulk move to CPU once to avoid sync storms from .item() calls
+        # Single path - .detach().cpu() works fine on empty tensors
+        boxes_cpu = boxes.detach().cpu()
+        scores_cpu = scores.detach().cpu()
+        labels_cpu = labels.detach().cpu()
+        batch_idx_cpu = batch_idx.detach().cpu()
         
         # Detection count logging for spotting outliers
         if self._enable_timing and scores.numel() > 0:
@@ -303,21 +373,20 @@ class LayoutPredictor:
             det_per_page = torch.bincount(batch_idx, minlength=len(pil_images)).detach().cpu().tolist()
             _log.debug(f"[layout.det] total={det_total} | per_page={det_per_page[:8]}{'...' if len(det_per_page)>8 else ''}")
         
-        # Use splits for efficient per-image slicing (no CPU boolean masks)
-        boxes, scores, labels, batch_idx, splits = post_process()
-        boxes_cpu = boxes.detach().cpu()
-        scores_cpu = scores.detach().cpu() 
-        labels_cpu = labels.detach().cpu()
-
+        # Finally, for each page, slice and wrap into dicts once:
         all_predictions = []
-        for i, (lo, hi) in enumerate(splits):
-            b_i = boxes_cpu[lo:hi]
-            s_i = scores_cpu[lo:hi]
-            l_i = labels_cpu[lo:hi]
-            if hi > lo:
-                coords = b_i.numpy().tolist()
-                confs  = s_i.numpy().tolist()
-                labs   = l_i.numpy().tolist()
+        for i in range(len(pil_images)):
+            mask = (batch_idx_cpu == i)
+            b_i = boxes_cpu[mask]
+            s_i = scores_cpu[mask]
+            l_i = labels_cpu[mask]
+
+            # Convert to numpy arrays and then to lists in bulk (single sync)
+            if len(b_i) > 0:
+                coords = b_i.numpy().tolist()  # [[l,t,r,b], ...]
+                confs = s_i.numpy().tolist()   # [score, ...]
+                labs = l_i.numpy().tolist()    # [int, ...]
+
                 w, h = pil_images[i].size
                 preds = [
                     {
@@ -500,18 +569,21 @@ class LayoutPredictor:
 
 def rtdetr_preprocess_tensor(pil_list, device):
     import numpy as np
+    import torch
     import torch.nn.functional as F
 
-    # One pass → one big array [B,H,W,3] uint8
-    rgb = np.stack([np.asarray(im.convert("RGB"), dtype=np.uint8) for im in pil_list], axis=0)
-    t = torch.from_numpy(rgb)  # CPU uint8, shared memory, zero-copy
+    # PIL -> RGB uint8 (CPU) with pinned memory for async transfer
+    rgb_list = [np.array(im.convert("RGB"), dtype=np.uint8) for im in pil_list]
+    t = torch.stack([torch.from_numpy(x) for x in rgb_list])  # [B,H,W,3] uint8 (CPU)
 
+    # Pin memory for truly async H2D copy
     if device.type == "cuda":
         t = t.pin_memory()
 
-    # [B,H,W,3] -> [B,3,H,W] on CPU; then a single non_blocking H2D
-    t = t.permute(0, 3, 1, 2).contiguous()
-    t = t.to(device, non_blocking=True).to(torch.float32)
-    t = t.div_(255.0)
-    t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)
+    t = t.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W] uint8 (CPU)
+
+    # Move first, then do math on GPU
+    t = t.to(device, non_blocking=True).to(torch.float32)  # (CUDA)
+    t = t.div_(255.0)  # rescale on GPU
+    t = F.interpolate(t, size=(640, 640), mode="bilinear", align_corners=False)  # resize on GPU
     return t.contiguous(memory_format=torch.channels_last)
