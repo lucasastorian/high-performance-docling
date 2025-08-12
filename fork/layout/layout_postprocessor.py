@@ -273,17 +273,16 @@ class LayoutPostprocessor:
         
         timer.finalize()
         
-        # Log detailed timing breakdown
-        _log.debug(
-            "layout-postprocess(ms): total=%.1f, regular=%.1f, special=%.1f, "
-            "filter=%.1f, sort_final=%.1f, finalize=%.1f",
-            timer.get_time("postprocess_total"),
-            timer.get_time("process_regular"),
-            timer.get_time("process_special"),
-            timer.get_time("filter_contained"),
-            timer.get_time("sort_final"),
-            timer.get_time("finalize_page"),
-        )
+        # Store timing results for access by layout model
+        self._postprocess_timer = timer
+        
+        # Print detailed timing breakdown
+        print(f"       └─ layout-postprocess breakdown:")
+        print(f"           ├─ regular: {timer.get_time('process_regular'):.1f} ms")
+        print(f"           ├─ special: {timer.get_time('process_special'):.1f} ms")
+        print(f"           ├─ filter: {timer.get_time('filter_contained'):.1f} ms")
+        print(f"           ├─ sort_final: {timer.get_time('sort_final'):.1f} ms")
+        print(f"           └─ finalize: {timer.get_time('finalize_page'):.1f} ms")
 
         return final_clusters, self.cells
 
