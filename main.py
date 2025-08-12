@@ -81,7 +81,7 @@ if __name__ == '__main__':
     markdown = conv_res.document.export_to_markdown()
     print(f"✓ Markdown length: {len(markdown)} chars")
 
-    print(f"{markdown[0:20000]}")
+    print(f"{markdown[0:25000]}")
     
     # Final cleanup
     import torch
