@@ -1,3 +1,4 @@
+import logging
 import requests
 from io import BytesIO
 from docling.datamodel.base_models import InputFormat
@@ -10,6 +11,9 @@ from docling.datamodel.accelerator_options import AcceleratorOptions
 from document_assembler import DocumentAssembler
 from lambda_preprocessor import distribute_preprocessing
 from gpu_processor import GPUProcessor
+
+# Configure logging to show debug messages
+logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
 
 if __name__ == '__main__':
     pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/a411a029-368f-4479-b416-25c404acca3d.pdf"  # DocLing paper

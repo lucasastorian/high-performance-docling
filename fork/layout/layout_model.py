@@ -184,16 +184,13 @@ class LayoutModel(BasePageModel):
                     valid_page_images
                 )
 
-        # Process each page with its predictions
+        # Process each page with its predictions  
         self._t_layout_postprocess_total_ms = 0.0
         self._t_cluster_build_total_ms = 0.0
         
-        # Initialize postprocess timing aggregators
-        self._t_postprocess_regular_total_ms = 0.0
-        self._t_postprocess_special_total_ms = 0.0
-        self._t_postprocess_filter_total_ms = 0.0
-        self._t_postprocess_sort_final_total_ms = 0.0
-        self._t_postprocess_finalize_total_ms = 0.0
+        # Create timer for detailed postprocess timing (auto-aggregates across pages)
+        from fork.timers import _CPUTimer
+        self._postprocess_timer = _CPUTimer()
         
         valid_page_idx = 0
         for page in pages:
@@ -229,19 +226,10 @@ class LayoutModel(BasePageModel):
 
             # Apply postprocessing (CPU timing is fine here)
             t_layout_postprocess_start = time.perf_counter()
-            postprocessor = LayoutPostprocessor(page, clusters, self.options)
-            processed_clusters, processed_cells = postprocessor.postprocess()
+            processed_clusters, processed_cells = LayoutPostprocessor(
+                page, clusters, self.options, shared_timer=self._postprocess_timer
+            ).postprocess()
             self._t_layout_postprocess_total_ms += (time.perf_counter() - t_layout_postprocess_start) * 1000
-            
-            # Aggregate detailed postprocess timings
-            if hasattr(postprocessor, '_postprocess_timer'):
-                timer = postprocessor._postprocess_timer
-                self._t_postprocess_regular_total_ms += timer.get_time('process_regular')
-                self._t_postprocess_special_total_ms += timer.get_time('process_special')
-                self._t_postprocess_filter_total_ms += timer.get_time('filter_contained')
-                self._t_postprocess_sort_final_total_ms += timer.get_time('sort_final')
-                self._t_postprocess_finalize_total_ms += timer.get_time('finalize_page')
-            
             # Note: LayoutPostprocessor updates page.cells and page.parsed_page internally
 
             with warnings.catch_warnings():
@@ -268,3 +256,23 @@ class LayoutModel(BasePageModel):
                 )
 
             yield page
+        
+        # Finalize postprocess timing after all pages processed
+        self._postprocess_timer.finalize()
+        
+        # Show detailed breakdown of regular processing (where the time goes)
+        timer = self._postprocess_timer
+        print(
+            f"       └─ regular breakdown: filter={timer.get_time('filter_regular'):.2f}ms "
+            f"assign={timer.get_time('assign_cells'):.2f}ms empty={timer.get_time('filter_empty'):.2f}ms "
+            f"unassigned={timer.get_time('find_unassigned'):.2f}ms iter={timer.get_time('iterative_refinement'):.2f}ms"
+        )
+        # Also log iteration details if any iteration took significant time
+        iter_details = []
+        for i in range(3):
+            adj_time = timer.get_time(f"adjust_bboxes_iter{i}")
+            ovlp_time = timer.get_time(f"overlaps_regular_iter{i}")
+            if adj_time > 0.1 or ovlp_time > 0.1:  # Only show if >0.1ms
+                iter_details.append(f"adj{i}={adj_time:.2f}ms ovlp{i}={ovlp_time:.2f}ms")
+        if iter_details:
+            print(f"           ├─ iterations: {' '.join(iter_details)}")

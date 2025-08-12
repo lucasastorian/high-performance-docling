@@ -307,12 +307,20 @@ class GPUProcessor:
         timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_total_ms', 0.0)
         timings['cluster_build'] = getattr(self.layout_model, '_t_cluster_build_total_ms', 0.0)
         
-        # Get detailed postprocess breakdown timings (aggregated across all pages)
-        timings['postprocess_regular'] = getattr(self.layout_model, '_t_postprocess_regular_total_ms', 0.0)
-        timings['postprocess_special'] = getattr(self.layout_model, '_t_postprocess_special_total_ms', 0.0)
-        timings['postprocess_filter'] = getattr(self.layout_model, '_t_postprocess_filter_total_ms', 0.0)
-        timings['postprocess_sort_final'] = getattr(self.layout_model, '_t_postprocess_sort_final_total_ms', 0.0)
-        timings['postprocess_finalize'] = getattr(self.layout_model, '_t_postprocess_finalize_total_ms', 0.0)
+        # Get detailed postprocess breakdown timings (auto-aggregated across all pages)
+        if hasattr(self.layout_model, '_postprocess_timer'):
+            timer = self.layout_model._postprocess_timer
+            timings['postprocess_regular'] = timer.get_time('process_regular')
+            timings['postprocess_special'] = timer.get_time('process_special')
+            timings['postprocess_filter'] = timer.get_time('filter_contained')
+            timings['postprocess_sort_final'] = timer.get_time('sort_final')
+            timings['postprocess_finalize'] = timer.get_time('finalize_page')
+        else:
+            timings['postprocess_regular'] = 0.0
+            timings['postprocess_special'] = 0.0
+            timings['postprocess_filter'] = 0.0
+            timings['postprocess_sort_final'] = 0.0
+            timings['postprocess_finalize'] = 0.0
         
         return timings
 

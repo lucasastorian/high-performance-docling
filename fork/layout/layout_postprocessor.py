@@ -205,7 +205,7 @@ class LayoutPostprocessor:
     }
 
     def __init__(
-            self, page: Page, clusters: List[Cluster], options: LayoutOptions
+            self, page: Page, clusters: List[Cluster], options: LayoutOptions, shared_timer=None
     ) -> None:
         """Initialize processor with page and clusters."""
 
@@ -222,6 +222,9 @@ class LayoutPostprocessor:
         # Cache compatibility mode settings to avoid repeated env lookups
         self.compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
         self.epsilon = 1e-4 if self.compat_mode else 0.0
+        
+        # Use shared timer if provided, otherwise create own
+        self.timer = shared_timer if shared_timer is not None else _CPUTimer()
 
         # Build spatial indices once
         self.regular_index = SpatialClusterIndex(self.regular_clusters)
@@ -234,17 +237,16 @@ class LayoutPostprocessor:
 
     def postprocess(self) -> Tuple[List[Cluster], List[TextCell]]:
         """Main processing pipeline with comprehensive timing."""
-        timer = _CPUTimer()
         
-        with timer.time_section("postprocess_total"):
-            with timer.time_section("process_regular"):
-                self.regular_clusters = self._process_regular_clusters(timer)
+        with self.timer.time_section("postprocess_total"):
+            with self.timer.time_section("process_regular"):
+                self.regular_clusters = self._process_regular_clusters()
             
-            with timer.time_section("process_special"):
-                self.special_clusters = self._process_special_clusters(timer)
+            with self.timer.time_section("process_special"):
+                self.special_clusters = self._process_special_clusters()
 
             # Remove regular clusters that are included in wrappers
-            with timer.time_section("filter_contained"):
+            with self.timer.time_section("filter_contained"):
                 contained_ids = {
                     child.id
                     for wrapper in self.special_clusters
@@ -256,7 +258,7 @@ class LayoutPostprocessor:
                 ]
 
             # Combine and sort final clusters
-            with timer.time_section("sort_final"):
+            with self.timer.time_section("sort_final"):
                 final_clusters = self._sort_clusters(
                     self.regular_clusters + self.special_clusters, mode="id"
                 )
@@ -266,21 +268,16 @@ class LayoutPostprocessor:
                     for child in cluster.children:
                         child.cells = self._sort_cells(child.cells)
 
-            with timer.time_section("finalize_page"):
+            with self.timer.time_section("finalize_page"):
                 assert self.page.parsed_page is not None
                 self.page.parsed_page.textline_cells = self.cells
                 self.page.parsed_page.has_lines = len(self.cells) > 0
-        
-        timer.finalize()
-        
-        # Store timing results for access by layout model
-        self._postprocess_timer = timer
 
         return final_clusters, self.cells
 
-    def _process_regular_clusters(self, timer: _CPUTimer) -> List[Cluster]:
+    def _process_regular_clusters(self) -> List[Cluster]:
         """Process regular clusters with iterative refinement and detailed timing."""
-        with timer.time_section("filter_regular"):
+        with self.timer.time_section("filter_regular"):
             clusters = [
                 c
                 for c in self.regular_clusters
@@ -293,10 +290,10 @@ class LayoutPostprocessor:
                     cluster.label = self.LABEL_REMAPPING[cluster.label]
 
         # Initial cell assignment
-        with timer.time_section("assign_cells"):
+        with self.timer.time_section("assign_cells"):
             clusters = self._assign_cells_to_clusters(clusters)
 
-        with timer.time_section("filter_empty"):
+        with self.timer.time_section("filter_empty"):
             # Remove clusters with no cells (if keep_empty_clusters is False),
             # but always keep clusters with label DocItemLabel.FORMULA
             if not self.options.keep_empty_clusters:
@@ -307,7 +304,7 @@ class LayoutPostprocessor:
                 ]
 
         # Handle orphaned cells
-        with timer.time_section("find_unassigned"):
+        with self.timer.time_section("find_unassigned"):
             unassigned = self._find_unassigned_cells(clusters)
             if unassigned and self.options.create_orphan_clusters:
                 next_id = max((c.id for c in self.all_clusters), default=0) + 1
@@ -327,33 +324,33 @@ class LayoutPostprocessor:
                 clusters.extend(orphan_clusters)
 
         # Iterative refinement
-        with timer.time_section("iterative_refinement"):
+        with self.timer.time_section("iterative_refinement"):
             prev_count = len(clusters) + 1
             for iteration in range(3):  # Maximum 3 iterations
                 if prev_count == len(clusters):
                     break
                 prev_count = len(clusters)
                 
-                with timer.time_section(f"adjust_bboxes_iter{iteration}"):
+                with self.timer.time_section(f"adjust_bboxes_iter{iteration}"):
                     clusters = self._adjust_cluster_bboxes(clusters)
                 
-                with timer.time_section(f"overlaps_regular_iter{iteration}"):
+                with self.timer.time_section(f"overlaps_regular_iter{iteration}"):
                     clusters = self._remove_overlapping_clusters(clusters, "regular")
 
         return clusters
 
-    def _process_special_clusters(self, timer: _CPUTimer) -> List[Cluster]:
-        with timer.time_section("filter_special"):
+    def _process_special_clusters(self) -> List[Cluster]:
+        with self.timer.time_section("filter_special"):
             special_clusters = [
                 c
                 for c in self.special_clusters
                 if c.confidence >= self.CONFIDENCE_THRESHOLDS[c.label]
             ]
 
-        with timer.time_section("cross_type_overlaps"):
+        with self.timer.time_section("cross_type_overlaps"):
             special_clusters = self._handle_cross_type_overlaps(special_clusters)
 
-        with timer.time_section("filter_full_page_pictures"):
+        with self.timer.time_section("filter_full_page_pictures"):
             # Calculate page area from known page size
             assert self.page_size is not None
             page_area = self.page_size.width * self.page_size.height
@@ -368,7 +365,7 @@ class LayoutPostprocessor:
                     )
                 ]
 
-        with timer.time_section("assign_children"):
+        with self.timer.time_section("assign_children"):
             for special in special_clusters:
                 contained = []
                 for cluster in self.regular_clusters:
@@ -397,7 +394,7 @@ class LayoutPostprocessor:
                     special.cells = self._deduplicate_cells(all_cells)
                     special.cells = self._sort_cells(special.cells)
 
-        with timer.time_section("overlaps_picture"):
+        with self.timer.time_section("overlaps_picture"):
             picture_clusters = [
                 c for c in special_clusters if c.label == DocItemLabel.PICTURE
             ]
@@ -405,7 +402,7 @@ class LayoutPostprocessor:
                 picture_clusters, "picture"
             )
 
-        with timer.time_section("overlaps_wrapper"):
+        with self.timer.time_section("overlaps_wrapper"):
             wrapper_clusters = [
                 c for c in special_clusters if c.label in self.WRAPPER_TYPES
             ]
