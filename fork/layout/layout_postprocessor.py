@@ -221,37 +221,59 @@ class GridIndex:
         return cands
 
 
-def vectorized_overlap_check(query_box, candidate_boxes, candidate_areas, query_area, ovlp_thr, cont_thr):
-    """Vectorized IoU/containment check using NumPy for candidate tiles."""
-    if len(candidate_boxes) == 0:
+def vectorized_overlap_check_with_arrays(query_idx, candidate_idx, boxes, areas, ovlp_thr, cont_thr, temp_arrays=None):
+    """Vectorized IoU/containment check using pre-packed arrays and views."""
+    if len(candidate_idx) == 0:
         return np.array([], dtype=bool)
     
-    # Convert to numpy arrays for vectorization
-    C = np.asarray(candidate_boxes, dtype=np.float32)  # (K, 4) - (l,t,r,b)
-    areas_C = np.asarray(candidate_areas, dtype=np.float32)  # (K,)
-    q = np.asarray(query_box, dtype=np.float32)  # (4,) - (l,t,r,b)
+    # Use views into pre-packed arrays (no allocation)
+    C = boxes[candidate_idx]  # (K, 4) view
+    areas_C = areas[candidate_idx]  # (K,) view  
+    q = boxes[query_idx]  # (4,) view
+    query_area = areas[query_idx]
     
-    # Vectorized intersection calculation
-    L = np.maximum(q[0], C[:, 0])  # max(l1, l2)
-    T = np.maximum(q[1], C[:, 1])  # max(t1, t2) 
-    R = np.minimum(q[2], C[:, 2])  # min(r1, r2)
-    B = np.minimum(q[3], C[:, 3])  # min(b1, b2)
+    # Reuse temp arrays if provided, else allocate
+    if temp_arrays is not None:
+        L, T, R, B, iw, ih, inter, cont_q, cont_c = temp_arrays
+        K = len(candidate_idx)
+        L = L[:K]; T = T[:K]; R = R[:K]; B = B[:K]
+        iw = iw[:K]; ih = ih[:K]; inter = inter[:K]
+        cont_q = cont_q[:K]; cont_c = cont_c[:K]
+    else:
+        L = np.empty(len(candidate_idx), dtype=np.float32)
+        T = np.empty(len(candidate_idx), dtype=np.float32) 
+        R = np.empty(len(candidate_idx), dtype=np.float32)
+        B = np.empty(len(candidate_idx), dtype=np.float32)
+        iw = np.empty(len(candidate_idx), dtype=np.float32)
+        ih = np.empty(len(candidate_idx), dtype=np.float32)
+        inter = np.empty(len(candidate_idx), dtype=np.float32)
+        cont_q = np.empty(len(candidate_idx), dtype=np.float32)
+        cont_c = np.empty(len(candidate_idx), dtype=np.float32)
     
-    # Intersection width/height (clipped to 0)
-    iw = np.maximum(R - L, 0.0)
-    ih = np.maximum(B - T, 0.0)
-    inter = iw * ih
+    # Vectorized intersection calculation with reused buffers
+    np.maximum(q[0], C[:, 0], out=L)
+    np.maximum(q[1], C[:, 1], out=T) 
+    np.minimum(q[2], C[:, 2], out=R)
+    np.minimum(q[3], C[:, 3], out=B)
     
-    # Fast containment checks (both ways)
-    cont_q = inter / np.maximum(query_area, 1e-6)  # query contained in candidates
-    cont_c = inter / np.maximum(areas_C, 1e-6)    # candidates contained in query
+    # Intersection width/height 
+    np.subtract(R, L, out=iw); iw.clip(min=0, out=iw)
+    np.subtract(B, T, out=ih); ih.clip(min=0, out=ih)
+    np.multiply(iw, ih, out=inter)
     
-    # IoU calculation
-    denom = query_area + areas_C - inter
-    iou = inter / np.maximum(denom, 1e-6)
+    # Containment checks (both ways)
+    np.divide(inter, query_area, out=cont_q)
+    np.divide(inter, areas_C, out=cont_c)
+    cont_mask = (cont_q >= cont_thr) | (cont_c >= cont_thr)
     
-    # Combined overlap mask
-    mask = (iou >= ovlp_thr) | (cont_q >= cont_thr) | (cont_c >= cont_thr)
+    # IoU only for non-containment cases (save work)
+    mask = cont_mask.copy()
+    rem = ~cont_mask
+    if rem.any():
+        denom = query_area + areas_C[rem] - inter[rem]
+        iou = inter[rem] / np.maximum(denom, 1e-6)
+        mask[rem] |= iou >= ovlp_thr
+    
     return mask
 
 
@@ -683,72 +705,105 @@ class LayoutPostprocessor:
                         if overlaps(cid, oid):
                             uf.union(cid, oid)
             else:
-                # Grid bucketing for dense pages
-                boxes = {c.id: c.bbox.as_tuple() for c in clusters}
-                areas = {c.id: c.bbox.area() for c in clusters}
+                # Grid bucketing for dense pages with packed arrays
+                # Pack geometry into contiguous arrays once
+                cluster_list = list(clusters)
+                N = len(cluster_list)
+                boxes = np.empty((N, 4), dtype=np.float32)
+                areas = np.empty(N, dtype=np.float32)
+                id2ix = {}
+                ix2id = {}
+                
+                for i, c in enumerate(cluster_list):
+                    bbox = c.bbox.as_tuple()
+                    boxes[i] = bbox
+                    areas[i] = c.bbox.area()
+                    id2ix[c.id] = i
+                    ix2id[i] = c.id
 
                 # Page size or extents
                 if self.page_size is not None:
                     page_w, page_h = self.page_size.width, self.page_size.height
                 else:
-                    # Fallback to cluster extents
-                    min_l = min(l for (l, _, _, _) in boxes.values())
-                    min_t = min(t for (_, t, _, _) in boxes.values())
-                    max_r = max(r for (_, _, r, _) in boxes.values())
-                    max_b = max(b for (_, _, _, b) in boxes.values())
+                    # Fallback to cluster extents from packed array
+                    min_l, min_t = boxes[:, 0].min(), boxes[:, 1].min()
+                    max_r, max_b = boxes[:, 2].max(), boxes[:, 3].max()
                     page_w = max_r - min_l
                     page_h = max_b - min_t
 
-                # Median w/h of regular clusters
-                ws = sorted((r - l) for (l, t, r, b) in boxes.values() if r > l)
-                hs = sorted((b - t) for (l, t, r, b) in boxes.values() if b > t)
-                med_w = ws[len(ws) // 2] if ws else max(1.0, page_w / 12.0)
-                med_h = hs[len(hs) // 2] if hs else max(1.0, page_h / 24.0)
+                # Median w/h from packed arrays
+                ws = np.sort(boxes[:, 2] - boxes[:, 0])  # widths
+                hs = np.sort(boxes[:, 3] - boxes[:, 1])  # heights
+                med_w = ws[N // 2] if N > 0 else max(1.0, page_w / 12.0)
+                med_h = hs[N // 2] if N > 0 else max(1.0, page_h / 24.0)
 
-                bin_w = max(page_w / 60.0, 1.5 * med_w)  # Clamp to keep bins reasonable
+                bin_w = max(page_w / 60.0, 1.5 * med_w)
                 bin_h = max(page_h / 60.0, 1.5 * med_h)
 
+                # Build grid with cluster indices, not IDs
                 grid = GridIndex(page_w, page_h, bin_w, bin_h)
-                for cid, (l, t, r, b) in boxes.items():
-                    grid.insert(cid, l, t, r, b)
+                for i, c in enumerate(cluster_list):
+                    l, t, r, b = boxes[i]
+                    grid.insert(i, l, t, r, b)  # Store index, not ID
 
                 ovlp_thr = overlap_threshold - self.epsilon
                 cont_thr = containment_threshold - self.epsilon
-
-                # Vectorized overlap processing with tiling
-                TILE_SIZE = 256  # Process candidates in tiles for cache efficiency
                 
-                # Union only within shared grid cells (vectorized)
-                for c in clusters:
+                # Pre-allocate temp arrays for vectorization
+                MAX_TILE = 256
+                temp_arrays = tuple(np.empty(MAX_TILE, dtype=np.float32) for _ in range(9))
+                
+                # Union only within shared grid cells (optimized)
+                for i, c in enumerate(cluster_list):
                     cid = c.id
-                    query_box = boxes[cid]
-                    query_area = areas[cid]
+                    query_box = boxes[i]
                     
-                    # Get candidates and filter
-                    candidates = [oid for oid in sorted(grid.candidates(*query_box)) 
-                                if oid > cid and oid in valid_clusters]
+                    # Get candidate indices (no sorting for speed)
+                    candidate_indices = [j for j in grid.candidates(*query_box) 
+                                       if j > i and ix2id[j] in valid_clusters]
                     
-                    if not candidates:
+                    if not candidate_indices:
                         continue
                     
-                    # Process candidates in tiles for memory efficiency
-                    for i in range(0, len(candidates), TILE_SIZE):
-                        tile_candidates = candidates[i:i + TILE_SIZE]
-                        
-                        # Gather candidate boxes and areas for vectorization
-                        candidate_boxes = [boxes[oid] for oid in tile_candidates]
-                        candidate_areas = [areas[oid] for oid in tile_candidates]
-                        
-                        # Vectorized overlap check
-                        overlap_mask = vectorized_overlap_check(
-                            query_box, candidate_boxes, candidate_areas, 
-                            query_area, ovlp_thr, cont_thr
+                    K = len(candidate_indices)
+                    
+                    # Use vectorization only for large candidate sets
+                    if K >= 64:
+                        # Vectorized path
+                        overlap_mask = vectorized_overlap_check_with_arrays(
+                            i, candidate_indices, boxes, areas, ovlp_thr, cont_thr, temp_arrays
                         )
                         
                         # Union overlapping pairs
-                        for j, overlaps in enumerate(overlap_mask):
-                            if overlaps:
-                                uf.union(cid, tile_candidates[j])
+                        for j in np.nonzero(overlap_mask)[0]:
+                            uf.union(cid, ix2id[candidate_indices[j]])
+                    else:
+                        # Scalar fast path for small candidate sets
+                        for j in candidate_indices:
+                            other_id = ix2id[j]
+                            
+                            # Quick AABB reject using packed arrays
+                            l1, t1, r1, b1 = boxes[i]
+                            l2, t2, r2, b2 = boxes[j]
+                            if l2 >= r1 or r2 <= l1 or t2 >= b1 or b2 <= t1:
+                                continue
+                            
+                            # Scalar overlap check 
+                            l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
+                            iw = r - l; ih = b - t
+                            if iw <= 0.0 or ih <= 0.0:
+                                continue
+                            interA = iw * ih
+                            aa, bb = areas[i], areas[j]
+                            if aa > 0.0 and interA / aa >= cont_thr:
+                                uf.union(cid, other_id)
+                                continue
+                            if bb > 0.0 and interA / bb >= cont_thr:
+                                uf.union(cid, other_id)
+                                continue
+                            denom = aa + bb - interA
+                            if denom > 0.0 and (interA / denom) >= ovlp_thr:
+                                uf.union(cid, other_id)
         else:
             # Keep existing logic for picture/wrapper clusters
             for cluster in clusters:
@@ -890,74 +945,38 @@ class LayoutPostprocessor:
         for cid, (l, t, r, b) in cluster_boxes.items():
             assign_grid.insert(cid, l, t, r, b)
         
-        # Build cell boxes array for vectorization
-        cell_boxes_list = []
-        cell_areas_list = []
-        cell_indices = []
+        # Assign each cell to best overlapping cluster (simplified, no vectorization)
         for cell in valid_cells:
             cell_bbox = self._cell_bbox[cell.index]
-            cell_boxes_list.append(cell_bbox.as_tuple())
-            cell_areas_list.append(cell_bbox.area())
-            cell_indices.append(cell.index)
-
-        # Assign each cell to best overlapping cluster (vectorized where beneficial)
-        for i, cell in enumerate(valid_cells):
-            cell_bbox = self._cell_bbox[cell.index]
-            cell_box = cell_boxes_list[i]
-            cell_area = cell_areas_list[i]
+            cell_box = cell_bbox.as_tuple()
             
-            # Get candidates
-            candidates = [cid for cid in sorted(assign_grid.candidates(*cell_box)) 
+            # Get candidates (no sorting for speed)
+            candidates = [cid for cid in assign_grid.candidates(*cell_box) 
                          if cid in id_to_cluster]
             
             if not candidates:
                 continue
                 
-            # For small candidate sets, use scalar processing (avoid vectorization overhead)
-            if len(candidates) <= 8:
-                best_overlap = min_overlap
-                best_cluster = None
+            # Simple scalar processing - vectorization overhead not worth it for assignment
+            best_overlap = min_overlap
+            best_cluster = None
+            
+            for cluster_id in candidates:
+                cluster = id_to_cluster[cluster_id]
                 
-                for cluster_id in candidates:
-                    cluster = id_to_cluster[cluster_id]
+                # Fast AABB reject using cached tuples
+                l2, t2, r2, b2 = cluster_boxes[cluster_id]
+                lx, ty, rx, by = cell_box
+                if l2 >= rx or r2 <= lx or t2 >= by or b2 <= ty:
+                    continue
                     
-                    # Fast AABB reject
-                    l2, t2, r2, b2 = cluster_boxes[cluster_id]
-                    lx, ty, rx, by = cell_box
-                    if l2 >= rx or r2 <= lx or t2 >= by or b2 <= ty:
-                        continue
-                        
-                    overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
-                    if overlap_ratio > best_overlap:
-                        best_overlap = overlap_ratio
-                        best_cluster = cluster
-                        # Fast break when we find very good overlap
-                        if best_overlap >= 0.95:
-                            break
-            else:
-                # Vectorized processing for large candidate sets
-                candidate_boxes = [cluster_boxes[cid] for cid in candidates]
-                candidate_areas = [cluster_areas[cid] for cid in candidates]
-                
-                # Use containment check (cell contained in cluster) as the overlap metric
-                # This is equivalent to intersection_over_self(cell_bbox, cluster_bbox)
-                overlap_mask = vectorized_overlap_check(
-                    cell_box, candidate_boxes, candidate_areas, cell_area, 
-                    0.0, min_overlap  # Use containment threshold as minimum overlap
-                )
-                
-                # Find best overlap from vectorized results
-                best_overlap = min_overlap
-                best_cluster = None
-                for j, has_overlap in enumerate(overlap_mask):
-                    if has_overlap:
-                        cluster_id = candidates[j]
-                        cluster = id_to_cluster[cluster_id]
-                        # Compute exact overlap ratio for ranking
-                        overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
-                        if overlap_ratio > best_overlap:
-                            best_overlap = overlap_ratio
-                            best_cluster = cluster
+                overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
+                if overlap_ratio > best_overlap:
+                    best_overlap = overlap_ratio
+                    best_cluster = cluster
+                    # Fast break when we find very good overlap
+                    if best_overlap >= 0.95:
+                        break
 
             if best_cluster is not None:
                 best_cluster.cells.append(cell)
