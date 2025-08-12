@@ -86,6 +86,8 @@ class LayoutModel(BasePageModel):
             artifact_path=str(artifacts_path),
             device=device,
             num_threads=accelerator_options.num_threads,
+            use_gpu_preprocess=True,
+            gpu_preprocess_version=1
         )
 
     @staticmethod

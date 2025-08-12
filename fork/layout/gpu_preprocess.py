@@ -367,27 +367,28 @@ class GPUPreprocessorV2(nn.Module):
         with (torch.cuda.stream(stream_compute) if stream_compute else contextlib.nullcontext()):
             # Convert to float
             batch_float = batch_gpu.to(self.dtype)
-                # Rescale if needed (in-place for efficiency)
-                if self.do_rescale:
-                    batch_float.mul_(self.rescale_factor)
-                
-                # Resize (internally converts to NCHW and back)
-                batch_resized = self.resize_op(batch_float)
-                
-                # Optional quantization for bit-for-bit parity in compatibility mode
-                if self._compat_mode:
-                    batch_resized = (batch_resized * 4096.0).round().div_(4096.0)
-                
-                # Normalize only if do_normalize=True
-                if self.do_normalize:
-                    batch_normalized = (batch_resized - self.mean) / self.std
-                else:
-                    batch_normalized = batch_resized
-                
-                # Convert to NCHW for model input - plain contiguous
-                batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
-        else:
-            # CPU path
+            # Rescale if needed (in-place for efficiency)
+            if self.do_rescale:
+                batch_float.mul_(self.rescale_factor)
+            
+            # Resize (internally converts to NCHW and back)
+            batch_resized = self.resize_op(batch_float)
+            
+            # Optional quantization for bit-for-bit parity in compatibility mode
+            if self._compat_mode:
+                batch_resized = (batch_resized * 4096.0).round().div_(4096.0)
+            
+            # Normalize only if do_normalize=True
+            if self.do_normalize:
+                batch_normalized = (batch_resized - self.mean) / self.std
+            else:
+                batch_normalized = batch_resized
+            
+            # Convert to NCHW for model input - plain contiguous
+            batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
+        
+        # Handle CPU fallback path (when no streams available)
+        if stream_compute is None:
             batch_float = batch_gpu.to(self.dtype)
             if self.do_rescale:
                 batch_float.mul_(self.rescale_factor)
