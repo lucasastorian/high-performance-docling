@@ -140,43 +140,57 @@ class LayoutPredictor:
                 # Avoid per-batch layout conversions
                 self._model.to(memory_format=torch.channels_last)
                 
-                # ----- TensorRT setup (always on for CUDA) -----
-                self._use_trt = True
+                # ----- Torch-TRT via torch.compile (env gated) -----
+                self._use_torch_compile_trt = os.getenv("USE_TRT", "").lower() in ("1", "true", "yes")
                 
-                if self._use_trt:
+                # Keep a fallback handle to the eager model
+                self._pt_model = self._model
+                
+                if self._use_torch_compile_trt:
                     try:
-                        import torch_tensorrt as trt
+                        import torch_tensorrt  # ensure installed, version-matched to torch
                         
-                        # Choose opt batches (default: 64 and 128)
-                        opt_list = os.getenv("DOCLING_TRT_OPT_BATCHES", "64,128")
-                        self._trt_opt_batches = sorted({int(x) for x in opt_list.split(",") if x.strip()})
-                        # Sanity clamp
-                        self._trt_opt_batches = [max(1, min(128, b)) for b in self._trt_opt_batches]
-                        
-                        # TF32 precision for TensorRT (FP16 alternative)
+                        # precision: fp16 widely supported; use bf16 on Hopper only if desired
                         prec = os.getenv("DOCLING_TRT_PREC", "fp16").lower()
-                        self._trt_dtype = torch.bfloat16 if (prec == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
-                        self._trt_enabled_precisions = {self._trt_dtype}
+                        self._trt_dtype = (
+                            torch.bfloat16 if (prec == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
+                        )
                         
-                        # Build TRT engines for each opt batch size
-                        self._trt_modules = {}
-                        for opt_b in self._trt_opt_batches:
-                            _log.info(f"Building TensorRT engine for opt batch size {opt_b}...")
-                            self._trt_modules[opt_b] = self._build_trt_engine(opt_b)
+                        # Backend options (safe defaults)
+                        trt_opts = {
+                            "precision": self._trt_dtype,
+                            "use_fast_partitioner": True,   # fuse more segments quickly
+                            "min_block_size": 5,            # avoid tiny partitions
+                            "workspace_size": 2 << 30,      # 2GB
+                            "require_full_compilation": False,  # unsupported ops just stay in PT
+                            "truncate_long_and_double": True,
+                        }
                         
-                        # Clear original PyTorch model from VRAM to free memory
-                        del self._model
-                        torch.cuda.empty_cache()
-                        _log.info(f"TRT engines ready for opt batches: {self._trt_opt_batches} (prec={self._trt_dtype})")
-                        _log.info("Original PyTorch model cleared from VRAM")
+                        # Wrap the model. kwargs preserved (e.g., pixel_values=...)
+                        self._model = torch.compile(self._model, backend="tensorrt", options=trt_opts)
+                        
+                        # Optional warmup to prebuild engines for common batch sizes
+                        warm_batches = [int(x) for x in os.getenv("DOCLING_TRT_WARMUPS", "1,64,128").split(",") if x.strip()]
+                        _log.info(f"Warming up TensorRT compilation for batch sizes: {warm_batches}")
+                        for b in warm_batches:
+                            try:
+                                dummy = torch.zeros((b, 3, 640, 640), device=self._device, dtype=self._trt_dtype)
+                                dummy = dummy.contiguous(memory_format=torch.channels_last)
+                                with torch.inference_mode():
+                                    _ = self._model(pixel_values=dummy)
+                                _log.info(f"✓ TRT warmup complete for batch {b}")
+                            except Exception as e:
+                                _log.warning(f"TRT warmup failed for batch {b}: {e}")
+                        
+                        _log.info(f"TensorRT compilation enabled (precision={self._trt_dtype})")
                     except ImportError:
                         _log.warning("torch_tensorrt not available, falling back to PyTorch")
-                        self._use_trt = False
+                        self._use_torch_compile_trt = False
                     except Exception as e:
                         _log.warning(f"TensorRT compilation failed: {e}, falling back to PyTorch")
-                        self._use_trt = False
+                        self._use_torch_compile_trt = False
             else:
-                self._use_trt = False
+                self._use_torch_compile_trt = False
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -189,34 +203,6 @@ class LayoutPredictor:
 
         _log.debug("LayoutPredictorGPU settings: {}".format(self.info()))
 
-    def _build_trt_engine(self, opt_b: int):
-        """Build TensorRT engine for given optimal batch size."""
-        import torch_tensorrt as trt
-        BMIN, BOPT, BMAX = 1, opt_b, 128  # dynamic batch profile
-        
-        # Build from current self._model; returns a drop-in module
-        engine = trt.compile(
-            self._model, ir="dynamo",
-            inputs=[
-                trt.Input(
-                    min_shape=(BMIN, 3, 640, 640),
-                    opt_shape=(BOPT, 3, 640, 640),
-                    max_shape=(BMAX, 3, 640, 640),
-                    dtype=self._trt_dtype,
-                )
-            ],
-            enabled_precisions=self._trt_enabled_precisions,
-            truncate_long_and_double=True,
-            workspace_size=2 << 30,  # 2 GB; bump if you see tactic spills
-        )
-        return engine
-
-    def _select_trt(self, bsz: int):
-        """Pick the engine whose opt batch is closest to current batch."""
-        if not hasattr(self, '_trt_modules') or not self._trt_modules:
-            return None
-        best = min(self._trt_modules.keys(), key=lambda optb: abs(optb - bsz))
-        return self._trt_modules[best]
 
     def _stable_sort_result(self, res: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """
@@ -329,18 +315,12 @@ class LayoutPredictor:
                     pixel_values = pixel_values.to(self._device)
 
         with timer.time_section('predict'):
-            if self._use_trt:
-                # Feed TRT the layout/dtype it expects
+            # Friendly to both eager and TRT partitions
+            if self._device.type == "cuda" and self._use_torch_compile_trt:
                 pixel_values = pixel_values.to(dtype=self._trt_dtype)
                 pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
-                
-                trt_mod = self._select_trt(pixel_values.shape[0])
-                if trt_mod is not None:
-                    outputs = trt_mod(pixel_values=pixel_values)
-                else:
-                    raise RuntimeError("No TensorRT engine available for batch size and original model was cleared")
-            else:
-                outputs = self._model(pixel_values=pixel_values)
+            
+            outputs = self._model(pixel_values=pixel_values)  # works for eager & compiled
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
