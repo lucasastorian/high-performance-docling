@@ -1215,6 +1215,11 @@ class TFPredictor:
         max_steps = self._config["predict"]["max_steps"]
         beam_size = self._config["predict"]["beam_size"]
 
+        # Sync GPU before timing to isolate upstream async work
+        device_obj = torch.device(self._device) if isinstance(self._device, str) else self._device
+        if device_obj.type == "cuda":
+            torch.cuda.synchronize()
+            
         timer.start("prepare_image_batch")
         image_batch = self._prepare_image_batch(table_images)
         timer.end("prepare_image_batch")
