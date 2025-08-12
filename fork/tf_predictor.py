@@ -26,7 +26,7 @@ from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellM
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
-from fork.tablemodel04_rs import TableModel04_rs
+from optimized.table.tablemodel04_rs import TableModel04_rs
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
