@@ -275,14 +275,6 @@ class LayoutPostprocessor:
         
         # Store timing results for access by layout model
         self._postprocess_timer = timer
-        
-        # Print detailed timing breakdown
-        print(f"       └─ layout-postprocess breakdown:")
-        print(f"           ├─ regular: {timer.get_time('process_regular'):.1f} ms")
-        print(f"           ├─ special: {timer.get_time('process_special'):.1f} ms")
-        print(f"           ├─ filter: {timer.get_time('filter_contained'):.1f} ms")
-        print(f"           ├─ sort_final: {timer.get_time('sort_final'):.1f} ms")
-        print(f"           └─ finalize: {timer.get_time('finalize_page'):.1f} ms")
 
         return final_clusters, self.cells
 

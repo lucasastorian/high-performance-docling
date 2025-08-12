@@ -94,6 +94,14 @@ class GPUProcessor:
             print(f"       └─ cluster-build: {layout_timings['cluster_build']:.1f} ms")
             print(f"       └─ layout-postprocess: {layout_timings['layout_postprocess']:.1f} ms")
             
+            # Show detailed postprocess breakdown if available
+            if any(layout_timings.get(k, 0) > 0 for k in ['postprocess_regular', 'postprocess_special', 'postprocess_filter', 'postprocess_sort_final', 'postprocess_finalize']):
+                print(f"           ├─ regular: {layout_timings['postprocess_regular']:.1f} ms")
+                print(f"           ├─ special: {layout_timings['postprocess_special']:.1f} ms")
+                print(f"           ├─ filter: {layout_timings['postprocess_filter']:.1f} ms")
+                print(f"           ├─ sort_final: {layout_timings['postprocess_sort_final']:.1f} ms")
+                print(f"           └─ finalize: {layout_timings['postprocess_finalize']:.1f} ms")
+            
             # Calculate any remaining unaccounted time
             timed_components = (layout_timings['preprocess'] + 
                              layout_timings['predict'] + 
@@ -298,6 +306,13 @@ class GPUProcessor:
         # Get timings from layout model (totals across all pages)
         timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_total_ms', 0.0)
         timings['cluster_build'] = getattr(self.layout_model, '_t_cluster_build_total_ms', 0.0)
+        
+        # Get detailed postprocess breakdown timings (aggregated across all pages)
+        timings['postprocess_regular'] = getattr(self.layout_model, '_t_postprocess_regular_total_ms', 0.0)
+        timings['postprocess_special'] = getattr(self.layout_model, '_t_postprocess_special_total_ms', 0.0)
+        timings['postprocess_filter'] = getattr(self.layout_model, '_t_postprocess_filter_total_ms', 0.0)
+        timings['postprocess_sort_final'] = getattr(self.layout_model, '_t_postprocess_sort_final_total_ms', 0.0)
+        timings['postprocess_finalize'] = getattr(self.layout_model, '_t_postprocess_finalize_total_ms', 0.0)
         
         return timings
 

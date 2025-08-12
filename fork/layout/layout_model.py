@@ -187,6 +187,14 @@ class LayoutModel(BasePageModel):
         # Process each page with its predictions
         self._t_layout_postprocess_total_ms = 0.0
         self._t_cluster_build_total_ms = 0.0
+        
+        # Initialize postprocess timing aggregators
+        self._t_postprocess_regular_total_ms = 0.0
+        self._t_postprocess_special_total_ms = 0.0
+        self._t_postprocess_filter_total_ms = 0.0
+        self._t_postprocess_sort_final_total_ms = 0.0
+        self._t_postprocess_finalize_total_ms = 0.0
+        
         valid_page_idx = 0
         for page in pages:
             assert page._backend is not None
@@ -221,10 +229,19 @@ class LayoutModel(BasePageModel):
 
             # Apply postprocessing (CPU timing is fine here)
             t_layout_postprocess_start = time.perf_counter()
-            processed_clusters, processed_cells = LayoutPostprocessor(
-                page, clusters, self.options
-            ).postprocess()
+            postprocessor = LayoutPostprocessor(page, clusters, self.options)
+            processed_clusters, processed_cells = postprocessor.postprocess()
             self._t_layout_postprocess_total_ms += (time.perf_counter() - t_layout_postprocess_start) * 1000
+            
+            # Aggregate detailed postprocess timings
+            if hasattr(postprocessor, '_postprocess_timer'):
+                timer = postprocessor._postprocess_timer
+                self._t_postprocess_regular_total_ms += timer.get_time('process_regular')
+                self._t_postprocess_special_total_ms += timer.get_time('process_special')
+                self._t_postprocess_filter_total_ms += timer.get_time('filter_contained')
+                self._t_postprocess_sort_final_total_ms += timer.get_time('sort_final')
+                self._t_postprocess_finalize_total_ms += timer.get_time('finalize_page')
+            
             # Note: LayoutPostprocessor updates page.cells and page.parsed_page internally
 
             with warnings.catch_warnings():
