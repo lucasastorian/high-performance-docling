@@ -137,11 +137,8 @@ class LayoutPredictor:
                 torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cudnn.benchmark = False  # <-- disable benchmark for varying shapes
                 
-                # Step 2: Convert weights to BF16 and use channels_last
-                if torch.cuda.is_bf16_supported():
-                    self._model.to(dtype=torch.bfloat16, memory_format=torch.channels_last)
-                else:
-                    self._model.to(memory_format=torch.channels_last)
+                # Avoid per-batch layout conversions
+                self._model.to(memory_format=torch.channels_last)
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -264,18 +261,8 @@ class LayoutPredictor:
                 else:
                     pixel_values = pixel_values.to(self._device)
 
-        # Step 1: BF16 AMP toggle (enabled by default)
-        use_bf16_amp = (
-            self._device.type == "cuda" and
-            torch.cuda.is_bf16_supported()
-        )
-        
         with timer.time_section('predict'):
-            if use_bf16_amp:
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    outputs = self._model(pixel_values=pixel_values)
-            else:
-                outputs = self._model(pixel_values=pixel_values)
+            outputs = self._model(pixel_values=pixel_values)
 
         with timer.time_section('postprocess'):
             # Apply threshold hysteresis in compatibility mode
