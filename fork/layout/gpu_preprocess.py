@@ -3,11 +3,13 @@ import torch
 import torch.nn as nn
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as F
+import torchvision.io
 from typing import List, Dict, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
 import os
 import contextlib
+from pathlib import Path
 
 
 def enable_strict_determinism():
@@ -130,13 +132,13 @@ class GPUPreprocessor(nn.Module):
     @torch.no_grad()
     def preprocess_batch(
         self, 
-        images: List[Union[Image.Image, np.ndarray, torch.Tensor]]
+        images: List[Union[Image.Image, np.ndarray, torch.Tensor, str, Path]]
     ) -> Dict[str, torch.Tensor]:
         """
         Preprocess a batch of images on GPU.
         
         Args:
-            images: List of PIL Images, numpy arrays, or torch tensors
+            images: List of PIL Images, numpy arrays, torch tensors, or file paths
             
         Returns:
             Dictionary with 'pixel_values' and optionally 'pixel_mask'
@@ -147,7 +149,19 @@ class GPUPreprocessor(nn.Module):
         # Convert all images to torch tensors on CPU first
         cpu_tensors = []
         for img in images:
-            if isinstance(img, Image.Image):
+            if isinstance(img, (str, Path)):
+                # Direct JPEG/PNG decode using libjpeg-turbo via torchvision.io
+                img_path = str(img)
+                try:
+                    img_tensor = torchvision.io.read_image(img_path)  # Already CHW uint8
+                    if img_tensor.shape[0] == 1:  # Grayscale
+                        img_tensor = img_tensor.repeat(3, 1, 1)
+                except Exception:
+                    # Fallback to PIL if torchvision.io fails
+                    with Image.open(img_path) as pil_img:
+                        img_np = np.array(pil_img.convert('RGB'))
+                        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)
+            elif isinstance(img, Image.Image):
                 # PIL Image -> numpy -> torch
                 img_np = np.array(img.convert('RGB'))
                 img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # HWC -> CHW
@@ -247,13 +261,14 @@ class GPUPreprocessor(nn.Module):
             pixel_mask = torch.ones((B, H, W), dtype=torch.int64, device=self.device)
             return batch, pixel_mask
         
-        # Create padded tensor
-        padded = torch.zeros((B, C, target_h, target_w), dtype=batch.dtype, device=self.device)
-        padded[:, :, :H, :W] = batch
+        # Use F.pad for single-kernel efficiency: (left, right, top, bottom)
+        pad_right = target_w - W
+        pad_bottom = target_h - H
+        padded = F.pad(batch, (0, pad_right, 0, pad_bottom), mode='constant', value=0.0)
         
-        # Create pixel mask (1 for valid pixels, 0 for padding)
-        pixel_mask = torch.zeros((B, target_h, target_w), dtype=torch.int64, device=self.device)
-        pixel_mask[:, :H, :W] = 1
+        # Create pixel mask efficiently using F.pad
+        mask_template = torch.ones((B, H, W), dtype=torch.int64, device=self.device)
+        pixel_mask = F.pad(mask_template, (0, pad_right, 0, pad_bottom), mode='constant', value=0)
         
         return padded, pixel_mask
 
@@ -350,6 +365,7 @@ class GPUPreprocessorV2(nn.Module):
         # Create local streams for thread safety
         stream_h2d = torch.cuda.Stream() if self.device.type == "cuda" else None
         stream_compute = torch.cuda.Stream() if self.device.type == "cuda" else None
+        h2d_event = torch.cuda.Event() if self.device.type == "cuda" else None
         
         # Create pinned tensor using staging buffer to avoid allocator churn
         batch_tensor = torch.from_numpy(batch_np)
@@ -371,12 +387,15 @@ class GPUPreprocessorV2(nn.Module):
             with torch.cuda.stream(stream_h2d):
                 batch_gpu = batch_pinned.to(self.device, non_blocking=True)
                 # Keep in NHWC format (already contiguous from numpy)
+                # Record event when H2D transfer completes
+                if h2d_event:
+                    h2d_event.record()
         else:
             batch_gpu = batch_pinned.to(self.device)
         
-        # Make compute stream wait on H2D completion 
-        if stream_h2d and stream_compute:
-            stream_compute.wait_stream(stream_h2d)
+        # Make compute stream wait on H2D completion using event (more efficient than wait_stream)
+        if stream_compute and h2d_event:
+            stream_compute.wait_event(h2d_event)
         
         with (torch.cuda.stream(stream_compute) if stream_compute else contextlib.nullcontext()):
             # Convert to float
@@ -424,7 +443,7 @@ class GPUPreprocessorV2(nn.Module):
                 'pixel_values': batch_final
             }
         
-        # Ensure compute is done before returning
+        # Ensure compute is done before returning (optional sync)
         if stream_compute:
             torch.cuda.current_stream().wait_stream(stream_compute)
         
@@ -448,10 +467,13 @@ class GPUPreprocessorV2(nn.Module):
             pixel_mask = torch.ones((B, H, W), dtype=torch.int64, device=self.device)
             return batch, pixel_mask
         
-        padded = torch.zeros((B, C, target_h, target_w), dtype=batch.dtype, device=self.device)
-        padded[:, :, :H, :W] = batch
+        # Use F.pad for single-kernel efficiency: (left, right, top, bottom)
+        pad_right = target_w - W
+        pad_bottom = target_h - H
+        padded = F.pad(batch, (0, pad_right, 0, pad_bottom), mode='constant', value=0.0)
         
-        pixel_mask = torch.zeros((B, target_h, target_w), dtype=torch.int64, device=self.device)
-        pixel_mask[:, :H, :W] = 1
+        # Create pixel mask efficiently using F.pad
+        mask_template = torch.ones((B, H, W), dtype=torch.int64, device=self.device)
+        pixel_mask = F.pad(mask_template, (0, pad_right, 0, pad_bottom), mode='constant', value=0)
         
         return padded, pixel_mask
