@@ -663,13 +663,16 @@ class LayoutPostprocessor:
 
     def _deduplicate_cells(self, cells: List[TextCell]) -> List[TextCell]:
         """Ensure each cell appears only once, maintaining order of first appearance."""
-        seen_ids = set()
-        unique_cells = []
-        for cell in cells:
-            if cell.index not in seen_ids:
-                seen_ids.add(cell.index)
-                unique_cells.append(cell)
-        return unique_cells
+        if not cells:
+            return cells
+        
+        # Vectorized deduplication using NumPy
+        idx = np.fromiter((c.index for c in cells), count=len(cells), dtype=np.int64)
+        # Keep first occurrence of each unique index
+        _, first_pos = np.unique(idx, return_index=True)
+        keep = np.zeros(len(cells), dtype=bool)
+        keep[first_pos] = True
+        return [cell for cell, k in zip(cells, keep) if k]
 
     def _assign_cells_to_clusters(
             self,
@@ -936,7 +939,17 @@ class LayoutPostprocessor:
 
     def _sort_cells(self, cells: List[TextCell]) -> List[TextCell]:
         """Sort cells in native reading order."""
-        return sorted(cells, key=lambda c: (c.index))
+        if len(cells) < 2:
+            return cells
+        
+        # Check if already monotonic (common case from PageWordIndex fast path)
+        idx = np.fromiter((c.index for c in cells), dtype=np.int64, count=len(cells))
+        if np.all(idx[1:] >= idx[:-1]):
+            return cells
+        
+        # Sort using stable algorithm to preserve order for equal indices
+        order = np.argsort(idx, kind="stable")
+        return [cells[i] for i in order]
 
     def _sort_clusters(
         self, clusters: List[Cluster], mode: str = "id"
