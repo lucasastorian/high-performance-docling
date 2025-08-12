@@ -1,3 +1,4 @@
+import sys
 from typing import List
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell
