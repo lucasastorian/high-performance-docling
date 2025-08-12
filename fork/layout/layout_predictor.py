@@ -79,7 +79,7 @@ class LayoutPredictor:
             raise FileNotFoundError(f"Missing model config file: {self._model_config}")
 
         # Load model and move to device
-        self._optimized_image_processor = OptimizedRTDetrImageProcessor.from_json_file(
+        self._image_preprocessor = RTDetrImageProcessor.from_json_file(
             self._processor_config
         )
 
@@ -114,7 +114,7 @@ class LayoutPredictor:
             "safe_tensors_file": self._st_fn,
             "device": self._device.type,
             "num_threads": self._num_threads,
-            "image_size": self._optimized_image_processor.size,
+            "image_size": self._image_preprocessor.size,
             "threshold": self._threshold,
         }
         return info
@@ -147,7 +147,7 @@ class LayoutPredictor:
             raise TypeError("Not supported input image format")
 
         target_sizes = torch.tensor([page_img.size[::-1]])
-        inputs = self._optimized_image_processor(images=[page_img], return_tensors="pt").to(
+        inputs = self._image_preprocessor(images=[page_img], return_tensors="pt").to(
             self._device
         )
         outputs = self._model(**inputs)
@@ -205,7 +205,7 @@ class LayoutPredictor:
         # 2) Preprocess with the ORIGINAL HF processor (exact math preserved)
         #    NOTE: this builds CPU tensors; we'll pin & async-copy below.
         t_preprocess_start = time.perf_counter()
-        inputs = self._optimized_image_processor(images=pil_images, return_tensors="pt")
+        inputs = self._image_preprocessor(images=pil_images, return_tensors="pt")
         pixel_values = inputs["pixel_values"]  # [B,3,H’,W’] on CPU
         if self._device.type == "cuda":
             pixel_values = pixel_values.pin_memory().to(
