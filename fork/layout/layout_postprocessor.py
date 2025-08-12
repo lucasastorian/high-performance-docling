@@ -2,18 +2,34 @@ import bisect
 import logging
 import os
 import sys
+from pydantic import BaseModel, field_serializer, FieldSerializationInfo, PrivateAttr
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 
-from docling_core.types.doc import DocItemLabel, Size
+from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell
 from rtree import index
 
-from docling.datamodel.base_models import BoundingBox, Cluster, Page
+from docling.datamodel.base_models import BoundingBox, Page, PydanticSerCtxKey, round_pydantic_float
 from docling.datamodel.pipeline_options import LayoutOptions
 from fork.timers import _CPUTimer
 
 _log = logging.getLogger(__name__)
+
+
+class Cluster(BaseModel):
+    id: int
+    label: DocItemLabel
+    bbox: BoundingBox
+    confidence: float = 1.0
+    cells: List[TextCell] = []
+    children: List["Cluster"] = []  # Add child cluster support
+
+    _first_cell_index: int = PrivateAttr(default=sys.maxsize)
+
+    @field_serializer("confidence")
+    def _serialize(self, value: float, info: FieldSerializationInfo) -> float:
+        return round_pydantic_float(value, info.context, PydanticSerCtxKey.CONFID_PREC)
 
 
 class UnionFind:
@@ -634,7 +650,7 @@ class LayoutPostprocessor:
         # Initialize clusters and track first cell index for fast sorting
         for cluster in clusters:
             cluster.cells = []
-            cluster.first_cell_index = sys.maxsize
+            cluster._first_cell_index = sys.maxsize
 
         # Local handles for speed
         rtree_idx = self.regular_index.spatial_index
@@ -669,8 +685,8 @@ class LayoutPostprocessor:
             if best_cluster is not None:
                 best_cluster.cells.append(cell)
                 # Track first cell index for fast sorting later
-                if cell.index < best_cluster.first_cell_index:
-                    best_cluster.first_cell_index = cell.index
+                if cell.index < best_cluster._first_cell_index:
+                    best_cluster._first_cell_index = cell.index
 
         # Deduplicate cells in each cluster after assignment
         for cluster in clusters:
@@ -732,9 +748,7 @@ class LayoutPostprocessor:
             return sorted(
                 clusters,
                 key=lambda cluster: (
-                    # Use cached first_cell_index if available, else compute
-                    getattr(cluster, "first_cell_index", 
-                            min((cell.index for cell in cluster.cells), default=sys.maxsize)),
+                    cluster._first_cell_index,
                     cluster.bbox.t,
                     cluster.bbox.l,
                 ),
