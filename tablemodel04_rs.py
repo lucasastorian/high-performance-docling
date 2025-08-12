@@ -1,14 +1,12 @@
-#
 # Copyright IBM Corp. 2024 - 2024
 # SPDX-License-Identifier: MIT
-#
+
 import logging
 import os
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn as nn
-
-from typing import List, Tuple, Optional
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
@@ -22,57 +20,54 @@ from batched_decoder import BatchedTableDecoder
 LOG_LEVEL = logging.WARN
 
 
-# LOG_LEVEL = logging.INFO
-# LOG_LEVEL = logging.DEBUG
-
-
 class TableModel04_rs(BaseModel, nn.Module):
     r"""
-    TableNet04Model encoder, dual-decoder model with OTSL+ support
+    Encoder + dual-decoder (tags + bbox) model with OTSL+ support.
+    Optimized to avoid GPU->CPU sync in hot paths, and to minimize tensor churn.
     """
 
     def __init__(self, config, init_data, device):
         super(TableModel04_rs, self).__init__(config, init_data, device)
 
-        self._prof = False  # Disable profiling for now (needs proper initialization)
+        self._prof = False
         self._device = device
-        # Extract the word_map from the init_data
-        word_map = init_data["word_map"]
+        self._config = config
+        self._init_data = init_data
 
         # Encoder
         self._enc_image_size = config["model"]["enc_image_size"]
         self._encoder_dim = config["model"]["hidden_dim"]
         self._encoder = Encoder04(self._enc_image_size, self._encoder_dim).to(device)
 
-        tag_vocab_size = len(word_map["word_map_tag"])
+        # Word map
+        word_map = init_data["word_map"]["word_map_tag"]
+        tag_vocab_size = len(word_map)
 
-        td_encode = []
-        for t in ["ecel", "fcel", "ched", "rhed", "srow"]:
-            if t in word_map["word_map_tag"]:
-                td_encode.append(word_map["word_map_tag"][t])
-        self._log().debug("td_encode length: {}".format(len(td_encode)))
-        self._log().debug("td_encode: {}".format(td_encode))
+        # td_encode indices (present tags only)
+        td_encode = [word_map[t] for t in ["ecel", "fcel", "ched", "rhed", "srow"] if t in word_map]
 
+        # Transformer dims
         self._tag_attention_dim = config["model"]["tag_attention_dim"]
         self._tag_embed_dim = config["model"]["tag_embed_dim"]
         self._tag_decoder_dim = config["model"]["tag_decoder_dim"]
         self._decoder_dim = config["model"]["hidden_dim"]
         self._dropout = config["model"]["dropout"]
 
+        # BBox settings
         self._bbox = config["train"]["bbox"]
         self._bbox_attention_dim = config["model"]["bbox_attention_dim"]
         self._bbox_embed_dim = config["model"]["bbox_embed_dim"]
         self._bbox_decoder_dim = config["model"]["hidden_dim"]
+        self._num_classes = config["model"]["bbox_classes"]
 
+        # Transformer layers/heads
         self._enc_layers = config["model"]["enc_layers"]
         self._dec_layers = config["model"]["dec_layers"]
         self._n_heads = config["model"]["nheads"]
 
-        self._num_classes = config["model"]["bbox_classes"]
-        self._enc_image_size = config["model"]["enc_image_size"]
-
         self._max_pred_len = config["predict"]["max_steps"]
 
+        # Tag transformer (SDPA toggle)
         self._tag_transformer = Tag_Transformer(
             device,
             tag_vocab_size,
@@ -82,9 +77,10 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._dec_layers,
             self._enc_image_size,
             n_heads=self._n_heads,
-            use_sdpa=os.environ.get('USE_SDPA', '1') == '1',  # Toggle via USE_SDPA env var
+            use_sdpa=os.environ.get("USE_SDPA", "1") == "1",
         ).to(device)
 
+        # BBox decoder
         self._bbox_decoder = BBoxDecoder(
             device,
             self._bbox_attention_dim,
@@ -95,340 +91,248 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._encoder_dim,
             self._dropout,
         ).to(device)
-        
-        # Create batched decoder wrapper
-        self._use_batched_decoder = os.environ.get('USE_BATCHED_DECODER', '1') == '1'
+
+        # Batched decoder wrapper (use for ALL batch sizes to avoid per-step syncs)
+        self._use_batched_decoder = os.environ.get("USE_BATCHED_DECODER", "1") == "1"
         self._batched_decoder = BatchedTableDecoder(self, device)
-        if self._use_batched_decoder:
-            print(f"✅ Using BATCHED decoder (process multiple tables in parallel)")
-        else:
-            print(f"⚠️ Using SEQUENTIAL decoder (process tables one by one)")
+
+        # Precompute tag id tensors once (used in fallback paths/tests)
+        self._tag_ids = {}
+        for k in ["<start>", "<end>", "xcel", "lcel", "fcel", "ucel", "nl", "ecel", "ched", "rhed", "srow"]:
+            if k in word_map:
+                self._tag_ids[k] = torch.tensor(word_map[k], device=device, dtype=torch.long)
+
+        # Convenience packed tensors
+        def pack(keys):
+            return torch.stack([self._tag_ids[k] for k in keys if k in self._tag_ids], dim=0) \
+                   if all(k in self._tag_ids for k in keys) else None
+
+        self._bbox_emit_ids = pack(["fcel", "xcel", "ecel", "ched", "rhed", "srow", "nl", "ucel"])
+        self._skip_ids = pack(["nl", "ucel", "xcel"])
 
     def _log(self):
-        # Setup a custom logger
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
-    def mergebboxes(self, bbox1, bbox2):
-        device = bbox1.device
+    @staticmethod
+    def _flatten_hw_to_sbc(hwc: torch.Tensor) -> torch.Tensor:
+        """
+        [B,H,W,C] -> [S,B,C] without extra copies where possible.
+        """
+        B, H, W, C = hwc.shape
+        return hwc.flatten(1, 2).permute(1, 0, 2).contiguous()
+
+    def mergebboxes(self, bbox1: torch.Tensor, bbox2: torch.Tensor) -> torch.Tensor:
+        """
+        Merge two [cx,cy,w,h] boxes into a span box. Assumes same device.
+        """
         new_w = (bbox2[0] + bbox2[2] / 2) - (bbox1[0] - bbox1[2] / 2)
         new_h = (bbox2[1] + bbox2[3] / 2) - (bbox1[1] - bbox1[3] / 2)
-
         new_left = bbox1[0] - bbox1[2] / 2
         new_top = torch.minimum(bbox2[1] - bbox2[3] / 2, bbox1[1] - bbox1[3] / 2)
-
         new_cx = new_left + new_w / 2
         new_cy = new_top + new_h / 2
+        return torch.stack([new_cx, new_cy, new_w, new_h])
 
-        bboxm = torch.stack([new_cx, new_cy, new_w, new_h]).to(device)
-        return bboxm
-
-    # --- in TableModel04_rs.predict ---
-
-    def predict(self, imgs: torch.Tensor, max_steps: int, k: int,
-                return_attention: bool = False):
+    @torch.inference_mode()
+    def predict(self, imgs: torch.Tensor, max_steps: int, k: int, return_attention: bool = False):
         """
         imgs: [B, 3, 448, 448]
+        Returns: list of tuples (seq, outputs_class, outputs_coord) per table.
         """
-        batch_size = imgs.size(0)
-        
-        # Do the heavy lift ONCE
-        with torch.inference_mode():
-            self._encoder.eval()
-            self._tag_transformer.eval()
-            
-            # Check tensor device
-            if str(self._device) == 'mps':
-                assert imgs.device.type == 'mps', f"Images on {imgs.device}, expected mps"
-                if hasattr(torch, 'mps'):
-                    torch.mps.synchronize()
-            
+        prof = AggProfiler()
+        prof.begin("predict_total", self._prof)
+
+        self._encoder.eval()
+        self._tag_transformer.eval()
+
+        # Optional: AMP (bfloat16) – measure before keeping enabled permanently.
+        use_amp = os.environ.get("USE_AMP", "1") == "1"
+        cm = torch.autocast(device_type=self._device.type, dtype=torch.bfloat16) if use_amp else torch.cpu.amp.autocast(enabled=False)
+
+        with cm:
             enc_out_batch = self._encoder(imgs)  # [B, H, W, C]
-            
-            # Use batched decoder if enabled and batch size > 1
-            if self._use_batched_decoder and batch_size > 1:
-                print(f"🚀 Using batched decoder for B={batch_size} tables")
-                return self._batched_decoder.predict_batched(enc_out_batch, max_steps)
-            else:
-                if batch_size > 1:
-                    print(f"⚠️ Sequential decoder for B={batch_size} tables (batched disabled)")
-                else:
-                    print(f"📊 Processing single table (B=1)")
-                # Fall back to sequential processing
-                batch_results = []
-                for i in range(batch_size):
-                    img_i = imgs[i:i + 1]  # keep batch dim
-                    enc_i = enc_out_batch[i:i + 1].contiguous()  # [1, H, W, C]
-                    seq, outputs_class, outputs_coord = self._predict(
-                        img_i, max_steps, k, return_attention,
-                        precomputed_enc=enc_i
-                    )
-                    batch_results.append((seq, outputs_class, outputs_coord))
-                return batch_results
 
-    def _predict(
-            self,
-            imgs: torch.Tensor,
-            max_steps: int,
-            k: int,
-            return_attention: bool = False,
-            precomputed_enc: Optional[torch.Tensor] = None,  # <- add this
+        # Always use batched decoder when enabled (even for B=1) to avoid scalar syncs
+        if self._use_batched_decoder:
+            results = self._batched_decoder.predict_batched(enc_out_batch, max_steps)
+        else:
+            # Fallback: sequential
+            results = []
+            B = imgs.size(0)
+            for i in range(B):
+                seq, cls_t, coord_t = self._predict_compat(
+                    imgs[i:i+1], max_steps, k, precomputed_enc=enc_out_batch[i:i+1].contiguous()
+                )
+                results.append((seq, cls_t, coord_t))
+
+        prof.end("predict_total", self._prof)
+
+        # Optional profiler dump
+        if self._prof:
+            print("\n📊 Model Profiling Results:")
+            for key in ["predict_total"]:
+                if hasattr(prof, "_timings") and key in prof._timings and prof._timings[key]:
+                    avg_ms = (sum(prof._timings[key]) / len(prof._timings[key])) * 1000
+                    print(f"  {key:30s}: {avg_ms:.2f} ms")
+
+        return results
+
+    @torch.inference_mode()
+    def _predict_compat(
+        self,
+        imgs: torch.Tensor,
+        max_steps: int,
+        k: int,
+        return_attention: bool = False,
+        precomputed_enc: Optional[torch.Tensor] = None,
     ):
-        r"""
-        Inference.
-        The input image must be preprocessed and transformed.
-
-        Parameters
-        ----------
-        img : tensor FloatTensor - torch.Size([1, 3, 448, 448])
-            Input image for the inference
-
-        Returns
-        -------
-        seq : list
-            Predictions for the tags as indices over the word_map
-        outputs_class : tensor(x, 3)
-            Classes of predicted bboxes. x is the number of bboxes. There are 3 bbox classes
-
-        outputs_coord : tensor(x, 4)
-            Coords of predicted bboxes. x is the number of bboxes. Each bbox is in [cxcywh] format
         """
-        # --- inside _predict, replace the encoder block with this ---
-        AggProfiler().begin("predict_total", self._prof)
+        Compatibility single-item path kept for tests/debug.
+        Not used in production when batched decoder is enabled.
+        """
+        device = self._device
+        prof = AggProfiler()
 
-        with torch.inference_mode():
-            self._tag_transformer.eval()
-            if precomputed_enc is not None:
-                enc_out = precomputed_enc  # [1, H, W, C]
-            else:
-                enc_out = self._encoder(imgs)  # [1, H, W, C]
+        # --- Encoder (or use precomputed) ---
+        prof.begin("model_encoder", self._prof)
+        enc_out = precomputed_enc if precomputed_enc is not None else self._encoder(imgs)  # [1,H,W,C]
+        prof.end("model_encoder", self._prof)
 
-        AggProfiler().end("model_encoder", self._prof)
+        # --- Tag transformer encoder ---
+        # [1,H,W,C] -> [1,h,w,C]
+        x = self._tag_transformer._input_filter(enc_out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        mem = self._flatten_hw_to_sbc(x)  # [S,1,C]
 
-        # The rest stays the same
-        word_map = self._init_data["word_map"]["word_map_tag"]
-        n_heads = self._tag_transformer._n_heads
+        prof.begin("model_tag_transformer_encoder", self._prof)
+        mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,1,C]
+        prof.end("model_tag_transformer_encoder", self._prof)
 
-        # [1, 28, 28, 512]
-        encoder_out = self._tag_transformer._input_filter(
-            enc_out.permute(0, 3, 1, 2)
-        ).permute(0, 2, 3, 1)
+        # --- Autoregressive decode (single) – kept minimal, but not hot path ---
+        start_id = self._tag_ids["<start>"]
+        end_id = self._tag_ids["<end>"]
+        decoded_tags = start_id.view(1, 1)  # [T=1, 1]
 
-        batch_size = encoder_out.size(0)
-        encoder_dim = encoder_out.size(-1)
-        # Use reshape instead of view for non-contiguous tensor
-        enc_inputs = encoder_out.reshape(batch_size, -1, encoder_dim).to(self._device)
-        enc_inputs = enc_inputs.permute(1, 0, 2)
-        positions = enc_inputs.shape[0]
-
-        # Don't create giant all-False mask - just use None
-        AggProfiler().begin("model_tag_transformer_encoder", self._prof)
-        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=None)
-        AggProfiler().end("model_tag_transformer_encoder", self._prof)
-
-        decoded_tags = (
-            torch.LongTensor([word_map["<start>"]]).to(self._device).unsqueeze(1)
-        )
-        output_tags = []
         cache = None
-        tag_H_buf = []
+        output_tags: List[int] = []
+        tag_H_buf: List[torch.Tensor] = []
 
+        # Python state (ok here since this is not production path)
         skip_next_tag = True
         prev_tag_ucel = False
         line_num = 0
-
-        # Populate bboxes_to_merge, indexes of first lcel, and last cell in a span
         first_lcel = True
         bboxes_to_merge = {}
         cur_bbox_ind = -1
         bbox_ind = 0
 
-        # i = 0
-        while len(output_tags) < self._max_pred_len:
-            decoded_embedding = self._tag_transformer._embedding(decoded_tags)
-            decoded_embedding = self._tag_transformer._positional_encoding(
-                decoded_embedding
-            )
-            AggProfiler().begin("model_tag_transformer_decoder", self._prof)
+        for _ in range(self._max_pred_len):
+            dec_emb = self._tag_transformer._positional_encoding(self._tag_transformer._embedding(decoded_tags))
+            prof.begin("model_tag_transformer_decoder", self._prof)
             decoded, cache = self._tag_transformer._decoder(
-                decoded_embedding,
-                encoder_out,
-                cache,
-                memory_key_padding_mask=None,  # Don't use the mask
+                dec_emb, memory=mem_enc, cache=cache, memory_key_padding_mask=None
             )
-            AggProfiler().end("model_tag_transformer_decoder", self._prof)
-            # Grab last feature to produce token
-            AggProfiler().begin("model_tag_transformer_fc", self._prof)
-            logits = self._tag_transformer._fc(decoded[-1, :, :])  # 1, vocab_size
-            AggProfiler().end("model_tag_transformer_fc", self._prof)
-            new_tag_tensor = logits.argmax(1)  # Keep as tensor [1]
+            prof.end("model_tag_transformer_decoder", self._prof)
 
-            # STRUCTURE ERROR CORRECTION using tensor operations
-            # Cache tag IDs as tensors
-            if not hasattr(self, '_cached_tag_ids'):
-                self._cached_tag_ids = {
-                    'end': torch.tensor(word_map["<end>"], device=logits.device),
-                    'xcel': torch.tensor(word_map["xcel"], device=logits.device),
-                    'lcel': torch.tensor(word_map["lcel"], device=logits.device),
-                    'fcel': torch.tensor(word_map["fcel"], device=logits.device),
-                    'ucel': torch.tensor(word_map["ucel"], device=logits.device),
-                    'nl': torch.tensor(word_map["nl"], device=logits.device),
-                }
-            
-            # Correction for first line xcel -> lcel
-            mask_first_line = (line_num == 0) & new_tag_tensor.eq(self._cached_tag_ids['xcel'])
-            new_tag_tensor = torch.where(mask_first_line, self._cached_tag_ids['lcel'], new_tag_tensor)
+            prof.begin("model_tag_transformer_fc", self._prof)
+            logits = self._tag_transformer._fc(decoded[-1, :, :])  # [1, vocab]
+            prof.end("model_tag_transformer_fc", self._prof)
 
-            # Correction for ucel, lcel sequence -> fcel
-            mask_ucel_lcel = prev_tag_ucel & new_tag_tensor.eq(self._cached_tag_ids['lcel'])
-            new_tag_tensor = torch.where(mask_ucel_lcel, self._cached_tag_ids['fcel'], new_tag_tensor)
+            new_tag = logits.argmax(1)  # [1]
 
-            # End of generation check (only extract scalar when needed to break)
-            is_end = new_tag_tensor.eq(self._cached_tag_ids['end'])
-            if bool(is_end.item()):  # Single sync point only for loop termination
-                output_tags.append(int(self._cached_tag_ids['end'].item()))
-                decoded_tags = torch.cat(
-                    [
-                        decoded_tags,
-                        new_tag_tensor.unsqueeze(0).unsqueeze(1),
-                    ],
-                    dim=0,
-                )  # current_output_len, 1
+            # Structure corrections
+            if "xcel" in self._tag_ids and "lcel" in self._tag_ids and line_num == 0:
+                if new_tag.eq(self._tag_ids["xcel"]).item():
+                    new_tag = self._tag_ids["lcel"].view_as(new_tag)
+            if "ucel" in self._tag_ids and "lcel" in self._tag_ids and "fcel" in self._tag_ids:
+                if prev_tag_ucel and new_tag.eq(self._tag_ids["lcel"]).item():
+                    new_tag = self._tag_ids["fcel"].view_as(new_tag)
+
+            if new_tag.eq(end_id).item():
+                output_tags.append(int(end_id.item()))
+                decoded_tags = torch.cat([decoded_tags, new_tag.view(1, 1)], dim=0)
                 break
-            
-            # Append tag (defer .item() until after loop)
-            output_tags.append(new_tag_tensor)  # Keep as tensor for now
 
-            # BBOX PREDICTION using tensor operations
-            
-            # Create mask for bbox-generating tags
-            bbox_tags = torch.stack([
-                self._cached_tag_ids['fcel'], self._cached_tag_ids['xcel'],
-                torch.tensor(word_map["ecel"], device=logits.device),
-                torch.tensor(word_map["ched"], device=logits.device),
-                torch.tensor(word_map["rhed"], device=logits.device),
-                torch.tensor(word_map["srow"], device=logits.device),
-                self._cached_tag_ids['nl'], self._cached_tag_ids['ucel']
-            ])
-            emit_bbox = torch.isin(new_tag_tensor, bbox_tags)
-            
-            # MAKE SURE TO SYNC NUMBER OF CELLS WITH NUMBER OF BBOXes
-            if not skip_next_tag and bool(emit_bbox.item()):  # Minimal scalar extraction
-                # GENERATE BBOX HERE TOO (All other cases)...
+            # BBox emission and span handling (compat path)
+            if self._bbox_emit_ids is not None:
+                emit_bbox = torch.isin(new_tag, self._bbox_emit_ids).item()
+            else:
+                emit_bbox = False
+
+            if not skip_next_tag and emit_bbox:
                 tag_H_buf.append(decoded[-1, :, :])
-                if first_lcel is not True:
-                    # Mark end index for horizontal cell bbox merge
+                if not first_lcel:
                     bboxes_to_merge[cur_bbox_ind] = bbox_ind
                 bbox_ind += 1
 
-            # Treat horizontal span bboxes...
-            is_lcel = new_tag_tensor.eq(self._cached_tag_ids['lcel'])
-            if not bool(is_lcel.item()):  # Minimal scalar extraction for control flow
+            is_lcel = "lcel" in self._tag_ids and new_tag.eq(self._tag_ids["lcel"]).item()
+            if not is_lcel:
                 first_lcel = True
             else:
                 if first_lcel:
-                    # GENERATE BBOX HERE (Beginning of horizontal span)...
                     tag_H_buf.append(decoded[-1, :, :])
                     first_lcel = False
-                    # Mark start index for cell bbox merge
                     cur_bbox_ind = bbox_ind
                     bboxes_to_merge[cur_bbox_ind] = -1
                     bbox_ind += 1
 
-            # Update skip_next_tag using tensor operations
-            skip_tags = torch.stack([
-                self._cached_tag_ids['nl'], self._cached_tag_ids['ucel'], self._cached_tag_ids['xcel']
-            ])
-            skip_next_tag = bool(torch.isin(new_tag_tensor, skip_tags).item())
-
-            # Register ucel in sequence using tensor operations
-            prev_tag_ucel = bool(new_tag_tensor.eq(self._cached_tag_ids['ucel']).item())
-
-            # Update line counter
-            if bool(new_tag_tensor.eq(self._cached_tag_ids['nl']).item()):
+            # Update flags
+            if self._skip_ids is not None:
+                skip_next_tag = torch.isin(new_tag, self._skip_ids).item()
+            prev_tag_ucel = ("ucel" in self._tag_ids) and new_tag.eq(self._tag_ids["ucel"]).item()
+            if "nl" in self._tag_ids and new_tag.eq(self._tag_ids["nl"]).item():
                 line_num += 1
 
-            decoded_tags = torch.cat(
-                [
-                    decoded_tags,
-                    new_tag_tensor.unsqueeze(0).unsqueeze(1),
-                ],
-                dim=0,
-            )  # current_output_len, 1
-        
-        # Convert any remaining tensor tags to integers (single GPU sync at end)
-        output_tags_final = []
-        for tag in output_tags:
-            if torch.is_tensor(tag):
-                output_tags_final.append(int(tag.item()))
-            else:
-                output_tags_final.append(tag)
-        output_tags = output_tags_final
-        
-        seq = decoded_tags.squeeze().tolist()
+            decoded_tags = torch.cat([decoded_tags, new_tag.view(1, 1)], dim=0)
+            output_tags.append(int(new_tag.item()))
 
+        seq = decoded_tags.squeeze(1).tolist()  # list of ints
+
+        # BBox head
         if self._bbox:
-            AggProfiler().begin("model_bbox_decoder", self._prof)
+            prof.begin("model_bbox_decoder", self._prof)
             outputs_class, outputs_coord = self._bbox_decoder.inference(enc_out, tag_H_buf)
-            AggProfiler().end("model_bbox_decoder", self._prof)
+            prof.end("model_bbox_decoder", self._prof)
         else:
-            outputs_class, outputs_coord = None, None
+            outputs_class, outputs_coord = torch.empty(0, device=device), torch.empty(0, device=device)
 
-        outputs_class = outputs_class.to(self._device)
-        outputs_coord = outputs_coord.to(self._device)
+        # Merge span bboxes safely
+        outputs_class, outputs_coord = self._merge_span_bboxes_safe(outputs_class, outputs_coord, bboxes_to_merge)
 
-        ########################################################################################
-        # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
-        ########################################################################################
-
-        outputs_class1 = []
-        outputs_coord1 = []
-        boxes_to_skip = []
-
-        for box_ind in range(len(outputs_coord)):
-            box1 = outputs_coord[box_ind].to(self._device)
-            cls1 = outputs_class[box_ind].to(self._device)
-            if box_ind in bboxes_to_merge:
-                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
-                boxes_to_skip.append(bboxes_to_merge[box_ind])
-                boxm = self.mergebboxes(box1, box2).to(self._device)
-                outputs_coord1.append(boxm)
-                outputs_class1.append(cls1)
-            else:
-                if box_ind not in boxes_to_skip:
-                    outputs_coord1.append(box1)
-                    outputs_class1.append(cls1)
-
-        if len(outputs_coord1) > 0:
-            outputs_coord1 = torch.stack(outputs_coord1)
-        else:
-            outputs_coord1 = torch.empty(0)
-        if len(outputs_class1) > 0:
-            outputs_class1 = torch.stack(outputs_class1)
-        else:
-            outputs_class1 = torch.empty(0)
-
-        outputs_class = outputs_class1
-        outputs_coord = outputs_coord1
-
-        # Do the rest of the steps...
-        AggProfiler().end("predict_total", self._prof)
-        
-        # Print profiling results if enabled
-        if self._prof:
-            profiler = AggProfiler()
-            print("\n📊 Model Profiling Results:")
-            for key in ["model_encoder", "model_tag_transformer_encoder", 
-                       "model_tag_transformer_decoder", "model_tag_transformer_fc",
-                       "model_bbox_decoder", "predict_total"]:
-                if hasattr(profiler, '_timings') and key in profiler._timings:
-                    times = profiler._timings[key]
-                    if times:
-                        avg_ms = (sum(times) / len(times)) * 1000
-                        print(f"  {key:30s}: {avg_ms:.2f} ms")
-        
-        num_tab_cells = seq.count(4) + seq.count(5)
-        num_rows = seq.count(9)
-        self._log().info(
-            "OTSL predicted table cells#: {}; rows#: {}".format(num_tab_cells, num_rows)
-        )
         return seq, outputs_class, outputs_coord
+
+    def _merge_span_bboxes_safe(self, outputs_class, outputs_coord, bboxes_to_merge):
+        """
+        Safe bbox merge with O(1) skip tracking and bounds checks.
+        """
+        device = self._device
+        outputs_class = outputs_class if outputs_class is not None else torch.empty(0, device=device)
+        outputs_coord = outputs_coord if outputs_coord is not None else torch.empty(0, device=device)
+
+        out_cls, out_coord = [], []
+        skip = set()
+        N = len(outputs_coord)
+
+        for i in range(N):
+            if i in skip:
+                continue
+            box1 = outputs_coord[i]
+            cls1 = outputs_class[i] if len(outputs_class) > i else outputs_class.new_empty(())
+
+            if i in bboxes_to_merge:
+                j = bboxes_to_merge[i]
+                if 0 <= j < N:
+                    skip.add(j)
+                    boxm = self.mergebboxes(box1, outputs_coord[j])
+                    out_coord.append(boxm)
+                    out_cls.append(cls1)
+                else:
+                    # open span (-1) or invalid -> keep box1
+                    out_coord.append(box1)
+                    out_cls.append(cls1)
+            else:
+                out_coord.append(box1)
+                out_cls.append(cls1)
+
+        out_coord = torch.stack(out_coord) if len(out_coord) else torch.empty(0, device=device)
+        out_cls = torch.stack(out_cls) if len(out_cls) else torch.empty(0, device=device)
+        return out_cls, out_coord
