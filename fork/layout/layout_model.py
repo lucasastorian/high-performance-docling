@@ -206,12 +206,12 @@ class LayoutModel(BasePageModel):
                     conv_res, page, clusters, mode_prefix="raw"
                 )
 
-            # Apply postprocessing
+            # Apply postprocessing (CPU timing is fine here)
             t_layout_postprocess_start = time.perf_counter()
             processed_clusters, processed_cells = LayoutPostprocessor(
                 page, clusters, self.options
             ).postprocess()
-            self._t_layout_postprocess = time.perf_counter() - t_layout_postprocess_start
+            self._t_layout_postprocess_ms = (time.perf_counter() - t_layout_postprocess_start) * 1000
             # Note: LayoutPostprocessor updates page.cells and page.parsed_page internally
 
             with warnings.catch_warnings():

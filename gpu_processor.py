@@ -84,10 +84,10 @@ class GPUProcessor:
         layout_timings = self._get_layout_timings()
         print(f"     ⏱ layout: {fmt_secs(t_layout)}")
         if layout_timings:
-            print(f"       └─ preprocess: {fmt_secs(layout_timings['preprocess'])}")
-            print(f"       └─ predict: {fmt_secs(layout_timings['predict'])}")
-            print(f"       └─ rtdetr-postprocess: {fmt_secs(layout_timings['rtdetr_postprocess'])}")
-            print(f"       └─ layout-postprocess: {fmt_secs(layout_timings['layout_postprocess'])}")
+            print(f"       └─ preprocess: {layout_timings['preprocess']:.1f} ms")
+            print(f"       └─ predict: {layout_timings['predict']:.1f} ms") 
+            print(f"       └─ postprocess: {layout_timings['postprocess']:.1f} ms")
+            print(f"       └─ layout-postprocess: {layout_timings['layout_postprocess']:.1f} ms")
 
         # Step 2: Identify regions needing OCR
         print("  2️⃣ Identifying OCR regions...")
@@ -276,12 +276,12 @@ class GPUProcessor:
         # Get timings from layout predictor (RTDetr preprocessing, predict, postprocessing)
         if hasattr(self.layout_model, 'layout_predictor'):
             predictor = self.layout_model.layout_predictor
-            timings['preprocess'] = getattr(predictor, '_t_preprocess', 0.0)
-            timings['predict'] = getattr(predictor, '_t_predict', 0.0)
-            timings['rtdetr_postprocess'] = getattr(predictor, '_t_rtdetr_postprocess', 0.0)
+            timings['preprocess'] = getattr(predictor, '_t_preprocess_ms', 0.0)
+            timings['predict'] = getattr(predictor, '_t_predict_ms', 0.0)
+            timings['postprocess'] = getattr(predictor, '_t_postprocess_ms', 0.0)
         
         # Get timings from layout model (layout postprocessing)
-        timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess', 0.0)
+        timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_ms', 0.0)
         
         return timings
 
