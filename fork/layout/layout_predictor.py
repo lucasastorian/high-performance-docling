@@ -182,27 +182,11 @@ class LayoutPredictor:
             }
 
     @torch.inference_mode()
-    def predict_batch(
-        self, images: List[Union[Image.Image, np.ndarray]]
-    ) -> List[List[dict]]:
-        """
-        Batch prediction for multiple images - more efficient than calling predict() multiple times.
-
-        Parameters
-        ----------
-        images : List[Union[Image.Image, np.ndarray]]
-            List of images to process in a single batch
-
-        Returns
-        -------
-        List[List[dict]]
-            List of prediction lists, one per input image. Each prediction dict contains:
-            "label", "confidence", "l", "t", "r", "b"
-        """
+    def predict_batch(self, images: List[Union[Image.Image, np.ndarray]]) -> List[List[dict]]:
         if not images:
             return []
 
-        # Convert all images to RGB PIL format
+        # 1) Canonicalize inputs (RGB PIL) without branching later
         pil_images = []
         for img in images:
             if isinstance(img, Image.Image):
@@ -212,59 +196,53 @@ class LayoutPredictor:
             else:
                 raise TypeError("Not supported input image format")
 
-        # Get target sizes for all images
-        target_sizes = torch.tensor([img.size[::-1] for img in pil_images])
+        # 2) Preprocess with the ORIGINAL HF processor (exact math preserved)
+        #    NOTE: this builds CPU tensors; we’ll pin & async-copy below.
+        inputs = self._image_processor(images=pil_images, return_tensors="pt")
+        pixel_values = inputs["pixel_values"]  # [B,3,H’,W’] on CPU
+        if self._device.type == "cuda":
+            pixel_values = pixel_values.pin_memory().to(
+                self._device, non_blocking=True
+            ).contiguous(memory_format=torch.channels_last)
+        else:
+            pixel_values = pixel_values.to(self._device)
 
-        # Process all images in a single batch
-        inputs = self._image_processor(images=pil_images, return_tensors="pt").to(
-            self._device
+        # 3) Forward pass with autocast (no output drift in object-detection heads)
+        with torch.autocast(self._device.type, dtype=torch.float16 if self._device.type == "cuda" else torch.bfloat16,
+                            enabled=self._device.type != "cpu"):
+            outputs = self._model(pixel_values=pixel_values)
+
+        # 4) Post-process on CPU in one go (HF logic retained)
+        #    Build target_sizes as CPU tensor once (h, w per image).
+        target_sizes = torch.tensor([im.size[::-1] for im in pil_images], dtype=torch.long)
+        # HF helper expects model-device tensors; it handles device moves internally.
+        results_list = self._image_processor.post_process_object_detection(
+            outputs, target_sizes=target_sizes, threshold=self._threshold
         )
-        outputs = self._model(**inputs)
 
-        # Post-process all results at once
-        results_list: List[Dict[str, Tensor]] = (
-            self._image_processor.post_process_object_detection(
-                outputs,
-                target_sizes=target_sizes,
-                threshold=self._threshold,
-            )
-        )
+        # 5) Bulk convert tensors -> Python dicts without .item() in loops
+        all_predictions: List[List[dict]] = []
+        for im, res in zip(pil_images, results_list):
+            w, h = im.size
+            # Move once
+            boxes = res["boxes"].detach().cpu().numpy()  # [N,4]
+            scores = res["scores"].detach().cpu().numpy()  # [N]
+            labels = res["labels"].detach().cpu().numpy()  # [N]
 
-        # Convert results to standard format for each image
-        all_predictions = []
-
-        for img, results in zip(pil_images, results_list):
-            w, h = img.size
-            predictions = []
-
-            for score, label_id, box in zip(
-                results["scores"], results["labels"], results["boxes"]
-            ):
-                score = float(score.item())
-                label_id = int(label_id.item()) + self._label_offset
-                label_str = self._classes_map[label_id]
-
-                # Filter out blacklisted classes
+            preds = []
+            # (Optional) blacklist filtering on CPU – micro-fast in NumPy
+            for box, score, lab in zip(boxes, scores, labels):
+                lab = int(lab) + self._label_offset
+                label_str = self._classes_map[lab]
                 if label_str in self._black_classes:
                     continue
+                l = float(min(w, max(0.0, box[0])))
+                t = float(min(h, max(0.0, box[1])))
+                r = float(min(w, max(0.0, box[2])))
+                b = float(min(h, max(0.0, box[3])))
+                preds.append({"l": l, "t": t, "r": r, "b": b, "label": label_str, "confidence": float(score)})
 
-                bbox_float = [float(b.item()) for b in box]
-                l = min(w, max(0, bbox_float[0]))
-                t = min(h, max(0, bbox_float[1]))
-                r = min(w, max(0, bbox_float[2]))
-                b = min(h, max(0, bbox_float[3]))
-
-                predictions.append(
-                    {
-                        "l": l,
-                        "t": t,
-                        "r": r,
-                        "b": b,
-                        "label": label_str,
-                        "confidence": score,
-                    }
-                )
-
-            all_predictions.append(predictions)
+            all_predictions.append(preds)
 
         return all_predictions
+
