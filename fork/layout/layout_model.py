@@ -25,7 +25,7 @@ from docling.utils.visualization import draw_clusters
 # from fork.layout.layout_predictor import LayoutPredictor
 from fork.layout.layout_predictor_gpu import LayoutPredictor
 from fork.layout.layout_postprocessor import LayoutPostprocessor
-from fork.layout.cluster import Cluster
+from fork.types import Cluster
 
 
 
