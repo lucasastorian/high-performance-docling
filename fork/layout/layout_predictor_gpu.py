@@ -41,7 +41,7 @@ class LayoutPredictor:
         num_threads: int = 4,
         base_threshold: float = 0.3,
         blacklist_classes: Set[str] = set(),
-        use_gpu_preprocess: bool = False,
+        use_gpu_preprocess: bool = True,
         gpu_preprocess_version: int = 1,  # 1 or 2
     ):
         """
