@@ -136,68 +136,28 @@ class BatchedTableDecoder:
             # Force <end> for finished sequences
             new_tags = torch.where(state.finished, torch.full_like(new_tags, end_id), new_tags)
             
-            # Store hidden states for bbox prediction
             last_H = decoded[-1, :, :]  # [B, D]
             
-            # Cache tag IDs as tensors once
-            if not hasattr(self, '_cached_tag_tensors'):
-                device = new_tags.device
-                self._cached_tag_tensors = {
-                    'fcel': torch.tensor(word_map.get("fcel", -999), device=device),
-                    'ecel': torch.tensor(word_map.get("ecel", -999), device=device),
-                    'ched': torch.tensor(word_map.get("ched", -999), device=device),
-                    'rhed': torch.tensor(word_map.get("rhed", -999), device=device),
-                    'srow': torch.tensor(word_map.get("srow", -999), device=device),
-                    'nl': torch.tensor(word_map.get("nl", -999), device=device),
-                    'ucel': torch.tensor(word_map.get("ucel", -999), device=device),
-                    'xcel': torch.tensor(word_map.get("xcel", -999), device=device),
-                    'lcel': torch.tensor(word_map.get("lcel", -999), device=device),
-                }
+            # Convert new_tags to CPU once for all comparisons
+            new_tags_cpu = new_tags.cpu().numpy()
             
-            # Create masks for vectorized operations (but still need per-batch processing for complex state)
-            active_mask = ~torch.tensor(state.finished, dtype=torch.bool, device=new_tags.device)
-            
-            # Vectorized tag matching
-            bbox_tag_ids = torch.stack([
-                self._cached_tag_tensors['fcel'], self._cached_tag_tensors['ecel'],
-                self._cached_tag_tensors['ched'], self._cached_tag_tensors['rhed'],
-                self._cached_tag_tensors['srow'], self._cached_tag_tensors['nl'],
-                self._cached_tag_tensors['ucel']
-            ])
-            emit_bbox_mask = torch.isin(new_tags, bbox_tag_ids)
-            
-            skip_tag_ids = torch.stack([
-                self._cached_tag_tensors['nl'], self._cached_tag_tensors['ucel'], 
-                self._cached_tag_tensors['xcel']
-            ])
-            skip_mask = torch.isin(new_tags, skip_tag_ids)
-            
-            is_lcel = new_tags.eq(self._cached_tag_tensors['lcel'])
-            is_ucel = new_tags.eq(self._cached_tag_tensors['ucel'])
-            
-            # Process each batch element (reduced scalar extractions)
             for b in range(B):
                 if state.finished[b]:
                     continue
-                
-                # Extract decisions for this batch element
-                should_emit = bool(emit_bbox_mask[b].item()) and not state.skip_next_tag[b]
-                is_lcel_b = bool(is_lcel[b].item())
-                should_skip = bool(skip_mask[b].item())
-                is_ucel_b = bool(is_ucel[b].item())
+                    
+                t = new_tags_cpu[b]  # Single CPU extraction per batch element
                 
                 # BBOX PREDICTION logic
-                if should_emit:
-                    state.tag_H_buf[b].append(last_H[b:b+1, :])  # Keep on GPU
-                    if not state.first_lcel[b]:
-                        # Mark end index for horizontal cell bbox merge (minimize .item() calls)
-                        cur_idx = int(state.cur_bbox_ind[b])
-                        bbox_idx = int(state.bbox_ind[b])
-                        state.bboxes_to_merge[b][cur_idx] = bbox_idx
-                    state.bbox_ind[b] += 1
+                if not state.skip_next_tag[b]:
+                    if t in [word_map.get(x, -999) for x in ["fcel", "ecel", "ched", "rhed", "srow", "nl", "ucel"]]:
+                        state.tag_H_buf[b].append(last_H[b:b+1, :])  # Keep on GPU
+                        if not state.first_lcel[b]:
+                            # Mark end index for horizontal cell bbox merge
+                            state.bboxes_to_merge[b][int(state.cur_bbox_ind[b])] = int(state.bbox_ind[b])
+                        state.bbox_ind[b] += 1
                 
                 # Handle horizontal span bboxes
-                if not is_lcel_b:
+                if t != word_map.get("lcel", -999):
                     state.first_lcel[b] = True
                 else:
                     if state.first_lcel[b]:
@@ -205,13 +165,17 @@ class BatchedTableDecoder:
                         state.tag_H_buf[b].append(last_H[b:b+1, :])
                         state.first_lcel[b] = False
                         state.cur_bbox_ind[b] = state.bbox_ind[b]
-                        cur_idx = int(state.cur_bbox_ind[b])
-                        state.bboxes_to_merge[b][cur_idx] = -1
+                        state.bboxes_to_merge[b][int(state.cur_bbox_ind[b])] = -1
                         state.bbox_ind[b] += 1
                 
-                # Update flags
-                state.skip_next_tag[b] = should_skip
-                state.prev_tag_ucel[b] = is_ucel_b
+                # Update skip_next_tag
+                if t in [word_map.get(x, -999) for x in ["nl", "ucel", "xcel"]]:
+                    state.skip_next_tag[b] = True
+                else:
+                    state.skip_next_tag[b] = False
+                
+                # Update prev_tag_ucel
+                state.prev_tag_ucel[b] = (t == word_map.get("ucel", -999))
             
             # Append new tokens
             state.decoded_tags = torch.cat([state.decoded_tags, new_tags.view(1, B)], dim=0)
