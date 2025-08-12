@@ -129,6 +129,16 @@ class LayoutPredictor:
                 artifact_path, config=self._model_config, device_map=self._device
             )
             self._model.eval()
+            
+            # Step 0: TF32 + channels_last optimization for CUDA
+            if self._device.type == "cuda":
+                # Fast default math for Ampere+ without changing numerics materially
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True  # helps if your resize/pad lands on few shapes
+                
+                # Avoid per-batch layout conversions
+                self._model.to(memory_format=torch.channels_last)
 
         # Set classes map
         self._model_name = type(self._model).__name__
@@ -236,18 +246,20 @@ class LayoutPredictor:
             # GPU preprocessing path
             with timer.time_section('preprocess'):
                 preprocessed = self._gpu_preprocessor.preprocess_batch(pil_images)
-                
-                # The GPU preprocessor returns a dict with 'pixel_values' and optionally 'pixel_mask'
                 pixel_values = preprocessed['pixel_values']
-                
-                # Ensure pixel_values is on the right device
                 if pixel_values.device != self._device:
-                    pixel_values = pixel_values.to(self._device)
+                    pixel_values = pixel_values.to(self._device, non_blocking=True)
+                pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
         else:
             # CPU preprocessing path (original HF)
             with timer.time_section('preprocess'):
                 inputs = self._image_preprocessor(images=pil_images, return_tensors="pt")
-                pixel_values = inputs.pixel_values.to(self._device)
+                pixel_values = inputs.pixel_values
+                if self._device.type == "cuda":
+                    pixel_values = pixel_values.to(self._device, non_blocking=True)
+                    pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
+                else:
+                    pixel_values = pixel_values.to(self._device)
 
         with timer.time_section('predict'):
             outputs = self._model(pixel_values=pixel_values)
