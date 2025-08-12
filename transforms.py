@@ -4,12 +4,6 @@
 #
 from __future__ import division
 
-import collections
-import numbers
-import random
-
-import torch
-
 from docling_ibm_models.tableformer.data_management import functional as F
 
 

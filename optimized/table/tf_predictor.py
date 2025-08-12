@@ -25,10 +25,11 @@ import docling_ibm_models.tableformer.utils.utils as u
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
-from tf_cell_matcher import CellMatcher
-from tablemodel04_rs import TableModel04_rs
-from table_timing_debug import get_timing_collector
-from matching_post_processor_optimized import MatchingPostProcessor
+from optimized.table.tf_cell_matcher import CellMatcher
+from optimized.table.tablemodel04_rs import TableModel04_rs
+from optimized.table.table_timing_debug import get_timing_collector
+from optimized.table.matching_post_processor import MatchingPostProcessor
+
 import transforms as T
 
 # LOG_LEVEL = logging.INFO

@@ -7,6 +7,7 @@
 import torch
 from dataclasses import dataclass
 from typing import List, Optional, Dict
+
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 

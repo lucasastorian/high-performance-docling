@@ -25,8 +25,8 @@ from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
 from page_model import Page
-from tf_predictor import TFPredictor
-from table_timing_debug import get_timing_collector
+from optimized.table.tf_predictor import TFPredictor
+from optimized.table.table_timing_debug import get_timing_collector
 
 
 class TableStructureModel(BasePageModel):

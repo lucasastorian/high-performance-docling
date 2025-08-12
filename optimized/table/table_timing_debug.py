@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List
 
+
 @dataclass
 class TimingCollector:
     """Collects timing information for different phases"""

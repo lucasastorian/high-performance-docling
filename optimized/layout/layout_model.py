@@ -21,8 +21,8 @@ from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
 
-from layout_postprocessor import LayoutPostprocessor
-from layout_predictor import LayoutPredictor
+from optimized.layout.layout_postprocessor import LayoutPostprocessor
+from optimized.layout.layout_predictor import LayoutPredictor
 
 _log = logging.getLogger(__name__)
 

@@ -11,7 +11,8 @@ import torch
 from torch import Tensor, nn
 
 import docling_ibm_models.tableformer.utils.utils as u
-from sdpa_utils import mha_sdpa_forward
+
+from optimized.sdpa_utils import mha_sdpa_forward
 
 LOG_LEVEL = logging.INFO
 

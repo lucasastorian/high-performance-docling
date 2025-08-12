@@ -12,9 +12,9 @@ from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
-from layout_model import LayoutModel
-from table_structure_model import TableStructureModel
-from table_timing_debug import print_timing_summary
+from optimized.layout.layout_model import LayoutModel
+from standard.table_structure_model import TableStructureModel
+from optimized.table.table_timing_debug import print_timing_summary
 
 
 def fmt_secs(s: float) -> str:

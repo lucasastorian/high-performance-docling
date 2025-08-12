@@ -1,16 +1,18 @@
-import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from typing import Optional
+
 
 def _split_heads_tbd(x: Tensor, B: int, T: int, H: int, Dh: int) -> Tensor:
     """Transform [T,B,D] -> [B,H,T,Dh]"""
     return x.transpose(0,1).reshape(B, T, H, Dh).permute(0,2,1,3).contiguous()
 
+
 def _merge_heads_bhtd(x: Tensor) -> Tensor:
     """Transform [B,H,T,Dh] -> [T,B,D]"""
     B,H,T,Dh = x.shape
     return x.permute(0,2,1,3).contiguous().reshape(B, T, H*Dh).transpose(0,1).contiguous()
+
 
 def _merge_masks_for_sdpa(B: int, H: int, T: int, S: int,
                           key_padding_mask: Optional[Tensor],

@@ -5,11 +5,8 @@
 import time
 import logging
 import os
-import io
-import contextlib
 import threading
-from collections.abc import Iterable
-from typing import Dict, List, Set, Union, Optional
+from typing import  List, Set, Union, Optional
 
 import numpy as np
 import torch
@@ -19,7 +16,7 @@ from torch import Tensor
 from transformers import AutoModelForObjectDetection, RTDetrImageProcessor
 
 from docling_ibm_models.layoutmodel.labels import LayoutLabels
-from optimization_utils import enable_fast_backends, safe_autocast, prepare_model_for_infer
+from optimized.optimization_utils import enable_fast_backends, safe_autocast, prepare_model_for_infer
 
 _log = logging.getLogger(__name__)
 
