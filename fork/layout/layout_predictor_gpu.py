@@ -137,8 +137,11 @@ class LayoutPredictor:
                 torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cudnn.benchmark = False  # <-- disable benchmark for varying shapes
                 
-                # Avoid per-batch layout conversions
-                self._model.to(memory_format=torch.channels_last)
+                # Step 2: Convert weights to BF16 and use channels_last
+                if torch.cuda.is_bf16_supported():
+                    self._model.to(dtype=torch.bfloat16, memory_format=torch.channels_last)
+                else:
+                    self._model.to(memory_format=torch.channels_last)
 
         # Set classes map
         self._model_name = type(self._model).__name__
