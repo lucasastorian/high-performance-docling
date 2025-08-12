@@ -1,4 +1,5 @@
-# gpu_processor.py
+import os
+import re
 import torch
 import time
 from typing import List
@@ -12,9 +13,10 @@ from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
-from optimized.layout.layout_model import LayoutModel
-from fork.table_structure_model import TableStructureModel
+from standard.layout.layout_model import LayoutModel
+from standard.table_structure_model import TableStructureModel
 from optimized.table.table_timing_debug import print_timing_summary
+from table_regression_runner import TableRegressionRunner, Tolerances
 
 
 def fmt_secs(s: float) -> str:
@@ -59,7 +61,7 @@ class GPUProcessor:
         self.device = device
         self.ocr_scale = 3
 
-    def process_all_pages(self, input_doc, pages: List[Page]) -> List[Page]:
+    def process_all_pages(self, url: str, input_doc, pages: List[Page]) -> List[Page]:
         """Main GPU processing pipeline with timing logs."""
         n_pages = len(pages)
         print(f"\n🚀 GPU Processing {n_pages} pages...")
@@ -122,6 +124,8 @@ class GPUProcessor:
             f"tables: {fmt_secs(t_tables)} | "
             f"total: {fmt_secs(t_all)}"
         )
+
+        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="baseline")
 
         return pages_with_tables
 
@@ -253,3 +257,19 @@ class GPUProcessor:
         """Context manager exit - cleanup on exit."""
         self.cleanup()
         return False
+
+    @staticmethod
+    def safe_id(url: str) -> str:
+        # Strip protocol and non-filename chars
+        return re.sub(r'[^A-Za-z0-9._-]+', '_', url)
+
+    def end_of_run_regression(self, url, pages_list, mode: str = "baseline"):
+        tol = Tolerances(bbox_abs=1.0, bbox_rel=0.01, iou_min=0.98, text_case_insensitive=False)
+        runner = TableRegressionRunner(
+            out_dir=os.getenv("TS_REGRESSION_DIR", "./tf_regression"),
+            mode=mode,
+            tolerances=tol
+        )
+        doc_id = self.safe_id(url)  # ✅ make URL safe for filenames
+        result = runner.run(doc_id, pages_list)
+        return result
