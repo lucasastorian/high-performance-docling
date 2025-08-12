@@ -3,11 +3,10 @@ from typing import List
 from docling.datamodel.base_models import Page
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.models.readingorder_model import ReadingOrderModel, ReadingOrderOptions
-from docling.datamodel.base_models import AssembledUnit
 from docling_core.types.doc import ImageRef, PictureItem
 
-from page_assemble_model import PageAssembleModel, PageAssembleOptions
+from readingorder_model import ReadingOrderModel, ReadingOrderOptions
+from page_assemble_model import PageAssembleModel, PageAssembleOptions, AssembledUnit
 
 
 class DocumentAssembler:
