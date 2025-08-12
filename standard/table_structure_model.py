@@ -25,8 +25,11 @@ from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
+from standard.tf_predictor import TFPredictor
+
 
 class TableStructureModel(BasePageModel):
+
     _model_repo_folder = "ds4sd--docling-models"
     _model_path = "model_artifacts/tableformer"
 
@@ -69,9 +72,6 @@ class TableStructureModel(BasePageModel):
 
             # Third Party
             import docling_ibm_models.tableformer.common as c
-            from docling_ibm_models.tableformer.data_management.tf_predictor import (
-                TFPredictor,
-            )
 
             device = decide_device(accelerator_options.device)
 
