@@ -78,11 +78,11 @@ class GPUProcessor:
         print("  1️⃣ Running layout detection...")
         t_layout_start = time.perf_counter()
         pages_with_layout = list(self.layout_model(conv_res, pages))
-        t_layout = time.perf_counter() - t_layout_start
         
         # Synchronize GPU work before measuring total time
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        t_layout = time.perf_counter() - t_layout_start
         
         # Collect detailed layout timings
         layout_timings = self._get_layout_timings()
