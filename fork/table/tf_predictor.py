@@ -8,7 +8,6 @@ import logging
 import os
 import threading
 from itertools import groupby
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,7 +24,7 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
 from docling_ibm_models.tableformer.data_management.matching_post_processor import MatchingPostProcessor
 
-from fork.tablemodel04_rs import TableModel04_rs
+from fork.table.tablemodel04_rs import TableModel04_rs
 # from optimized.table.matching_post_processor import MatchingPostProcessor
 
 LOG_LEVEL = logging.WARN

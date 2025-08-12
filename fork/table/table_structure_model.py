@@ -19,7 +19,7 @@ from docling.utils.profiling import TimeRecorder
 
 from page_model import Page
 
-from fork.tf_predictor import TFPredictor
+from fork.table.tf_predictor import TFPredictor
 
 
 class TableStructureModel(BasePageModel):

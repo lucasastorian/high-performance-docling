@@ -16,7 +16,9 @@ import numpy as np
 from optimized.layout.layout_model import LayoutModel
 from standard.table_structure_model import TableStructureModel
 from optimized.table.table_timing_debug import print_timing_summary
+
 from table_regression_runner import TableRegressionRunner, Tolerances
+from layout_regression_runner import LayoutRegressionRunner, LayoutTol
 
 
 def fmt_secs(s: float) -> str:
@@ -273,3 +275,9 @@ class GPUProcessor:
         doc_id = self.safe_id(url)  # ✅ make URL safe for filenames
         result = runner.run(doc_id, pages_list)
         return result
+
+    def end_of_run_layout_regression(self, url: str, pages, mode: str = "compare"):
+        tol = LayoutTol(iou_threshold=0.7)
+        runner = LayoutRegressionRunner(out_dir=os.getenv("LAYOUT_REGRESSION_DIR", "./tf_regression_layout"),
+                                        tol=tol)
+        return runner.run(url, pages, mode=mode)
