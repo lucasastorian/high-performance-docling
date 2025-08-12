@@ -177,7 +177,7 @@ class LayoutPredictor:
 
     def _store_timings(self, timer):
         """Store timing results from timer."""
-        self._t_preprocess_ms = timer.get_time('preprocess')  # Will be 0 for GPU preprocessing
+        self._t_preprocess_ms = timer.get_time('preprocess')
         self._t_predict_ms = timer.get_time('predict')
         self._t_postprocess_ms = timer.get_time('postprocess')
 
@@ -233,15 +233,16 @@ class LayoutPredictor:
         target_sizes = torch.tensor([img.size[::-1] for img in pil_images])
 
         if self._use_gpu_preprocess and self._gpu_preprocessor is not None:
-            # GPU preprocessing path - timing handled externally
-            preprocessed = self._gpu_preprocessor.preprocess_batch(pil_images)
-            
-            # The GPU preprocessor returns a dict with 'pixel_values' and optionally 'pixel_mask'
-            pixel_values = preprocessed['pixel_values']
-            
-            # Ensure pixel_values is on the right device
-            if pixel_values.device != self._device:
-                pixel_values = pixel_values.to(self._device)
+            # GPU preprocessing path
+            with timer.time_section('preprocess'):
+                preprocessed = self._gpu_preprocessor.preprocess_batch(pil_images)
+                
+                # The GPU preprocessor returns a dict with 'pixel_values' and optionally 'pixel_mask'
+                pixel_values = preprocessed['pixel_values']
+                
+                # Ensure pixel_values is on the right device
+                if pixel_values.device != self._device:
+                    pixel_values = pixel_values.to(self._device)
         else:
             # CPU preprocessing path (original HF)
             with timer.time_section('preprocess'):

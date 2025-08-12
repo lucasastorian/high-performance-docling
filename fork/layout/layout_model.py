@@ -87,7 +87,7 @@ class LayoutModel(BasePageModel):
             device=device,
             num_threads=accelerator_options.num_threads,
             use_gpu_preprocess=True,
-            gpu_preprocess_version=2
+            gpu_preprocess_version=1
         )
 
     @staticmethod

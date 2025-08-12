@@ -81,24 +81,18 @@ class GPUPreprocessor(nn.Module):
         """Create appropriate resize operation based on size specification."""
         if "height" in size_dict and "width" in size_dict:
             # Exact size resize (no aspect ratio preservation)
-            # Use antialias for downscales in compat mode to match PIL's behavior
-            antialias_setting = self._compat_mode if hasattr(self, '_compat_mode') else False
+            # Always use antialias=False to match PIL bilinear behavior
             return T.Resize(
                 (size_dict["height"], size_dict["width"]), 
                 interpolation=T.InterpolationMode.BILINEAR,
-                antialias=antialias_setting
+                antialias=False
             )
         elif "shortest_edge" in size_dict and "longest_edge" in size_dict:
             # Custom resize respecting shortest/longest edge constraints
             se = size_dict["shortest_edge"]
             le = size_dict["longest_edge"]
-            compat_mode = self._compat_mode if hasattr(self, '_compat_mode') else False
             
             class ShortLongResize(nn.Module):
-                def __init__(self, compat_mode):
-                    super().__init__()
-                    self._compat_mode = compat_mode
-                    
                 def forward(self, x):
                     # x shape: (B, C, H, W)
                     B, C, H, W = x.shape
@@ -122,10 +116,10 @@ class GPUPreprocessor(nn.Module):
                         x, 
                         [new_h, new_w], 
                         interpolation=T.InterpolationMode.BILINEAR, 
-                        antialias=self._compat_mode
+                        antialias=False
                     )
             
-            return ShortLongResize(compat_mode)
+            return ShortLongResize()
         else:
             raise ValueError(f"Unsupported size specification: {size_dict}")
     
@@ -189,10 +183,6 @@ class GPUPreprocessor(nn.Module):
         
         # Apply resize
         batch_resized = self.resize_op(batch_gpu)
-        
-        # Optional quantization for bit-for-bit parity in compatibility mode
-        if self._compat_mode:
-            batch_resized = (batch_resized * 4096.0).round().div_(4096.0)
         
         # Normalize only if do_normalize=True
         if self.do_normalize:
@@ -304,12 +294,11 @@ class GPUPreprocessorV2(nn.Module):
         def resize_exact(x):
             # x is NHWC
             x_nchw = x.permute(0, 3, 1, 2)  # NHWC -> NCHW for resize
-            antialias_setting = getattr(self, '_compat_mode', False)
             resized = F.resize(
                 x_nchw,
                 [target_h, target_w],
                 interpolation=T.InterpolationMode.BILINEAR,
-                antialias=antialias_setting
+                antialias=False
             )
             return resized.permute(0, 2, 3, 1)  # Back to NHWC
         
@@ -374,10 +363,6 @@ class GPUPreprocessorV2(nn.Module):
             # Resize (internally converts to NCHW and back)
             batch_resized = self.resize_op(batch_float)
             
-            # Optional quantization for bit-for-bit parity in compatibility mode
-            if self._compat_mode:
-                batch_resized = (batch_resized * 4096.0).round().div_(4096.0)
-            
             # Normalize only if do_normalize=True
             if self.do_normalize:
                 batch_normalized = (batch_resized - self.mean) / self.std
@@ -394,10 +379,6 @@ class GPUPreprocessorV2(nn.Module):
                 batch_float.mul_(self.rescale_factor)
             
             batch_resized = self.resize_op(batch_float)
-            
-            # Optional quantization for bit-for-bit parity in compatibility mode
-            if self._compat_mode:
-                batch_resized = (batch_resized * 4096.0).round().div_(4096.0)
             
             if self.do_normalize:
                 batch_normalized = (batch_resized - self.mean) / self.std
