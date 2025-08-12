@@ -148,46 +148,31 @@ class LayoutPredictor:
                 
                 if self._use_torch_compile_trt:
                     try:
-                        # Turn on debug logs to see failing ops
-                        os.environ["TORCH_TRT_LOG_LEVEL"] = "DEBUG"
-                        os.environ["TORCH_LOGS"] = "+dynamo,graph_breaks"
-                        os.environ["TORCH_COMPILE_DEBUG"] = "1"
+                        import torch_tensorrt as trt
                         
-                        import torch_tensorrt  # ensure installed, version-matched to torch
-                        
-                        # Use FP16, not FP32 for better TRT coverage
+                        # Use FP16 for TensorRT
                         self._trt_dtype = torch.float16
                         
-                        # Backend options (fixes for empty engine issues)
-                        trt_opts = {
-                            "precision": self._trt_dtype,
-                            "use_fast_partitioner": True,
-                            "min_block_size": 1,                 # allow small clusters
-                            "workspace_size": 6 << 30,           # bump to 6GB for big batches
-                            "require_full_compilation": False,
-                            "truncate_long_and_double": True,
-                        }
-                        
-                        # Cast model weights to FP16 to match input dtype
+                        # Cast model weights to FP16
                         self._model = self._model.to(dtype=self._trt_dtype)
                         
-                        # Wrap the model. kwargs preserved (e.g., pixel_values=...)
-                        self._model = torch.compile(self._model, backend="tensorrt", options=trt_opts)
+                        # Manual TensorRT compilation with explicit batch limits
+                        self._pt_model = self._model  # keep original for fallback
+                        self._model = trt.compile(
+                            self._pt_model,
+                            ir="dynamo",
+                            inputs=[trt.Input(
+                                min_shape=(1, 3, 640, 640),
+                                opt_shape=(64, 3, 640, 640),
+                                max_shape=(64, 3, 640, 640),  # cap max batch to avoid pathological tactics
+                                dtype=torch.float16
+                            )],
+                            enabled_precisions={torch.float16},
+                            workspace_size=2 << 30,  # 2 GB
+                            truncate_long_and_double=True,
+                        )
                         
-                        # Optional warmup to prebuild engines for common batch sizes
-                        warm_batches = [1, 32, 64]
-                        _log.info(f"Warming up TensorRT compilation for batch sizes: {warm_batches}")
-                        for b in warm_batches:
-                            try:
-                                dummy = torch.zeros((b, 3, 640, 640), device=self._device, dtype=self._trt_dtype)
-                                dummy = dummy.contiguous(memory_format=torch.channels_last)
-                                with torch.inference_mode():
-                                    _ = self._model(pixel_values=dummy)
-                                _log.info(f"✓ TRT warmup complete for batch {b}")
-                            except Exception as e:
-                                _log.warning(f"TRT warmup failed for batch {b}: {e}")
-                        
-                        _log.info(f"TensorRT compilation enabled (precision={self._trt_dtype})")
+                        _log.info(f"Manual TensorRT compilation complete (max_batch=64, precision=FP16)")
                     except ImportError:
                         _log.warning("torch_tensorrt not available, falling back to PyTorch")
                         self._use_torch_compile_trt = False
@@ -284,6 +269,14 @@ class LayoutPredictor:
         """
         if not images:
             return []
+
+        # Chunk large batches for TensorRT safety
+        safe_max = 64
+        if self._use_torch_compile_trt and len(images) > safe_max:
+            out = []
+            for i in range(0, len(images), safe_max):
+                out.extend(self.predict_batch(images[i:i+safe_max]))
+            return out
 
         # Convert all images to RGB PIL format for consistency
         pil_images = []
