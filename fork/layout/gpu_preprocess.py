@@ -77,6 +77,10 @@ class GPUPreprocessor(nn.Module):
         # Create resize transform based on size dict
         self.resize_op = self._make_resize(size)
         
+        # Pre-allocated pinned staging tensor for large batches (avoid allocator churn)
+        self._staging_tensor = None
+        self._staging_size = None
+        
     def _make_resize(self, size_dict: Dict[str, int]):
         """Create appropriate resize operation based on size specification."""
         if "height" in size_dict and "width" in size_dict:
@@ -168,11 +172,20 @@ class GPUPreprocessor(nn.Module):
         batch_cpu = torch.stack(cpu_tensors)
         is_u8 = (batch_cpu.dtype == torch.uint8)
         
-        # Pin memory for faster transfer if uint8 and CUDA available
+        # Use pre-allocated pinned staging tensor for faster transfer
         if is_u8 and torch.cuda.is_available() and self.device.type == "cuda":
-            batch_cpu = batch_cpu.pin_memory()
-        
-        batch_gpu = batch_cpu.to(self.device, non_blocking=True)
+            batch_shape = batch_cpu.shape
+            # Reuse staging tensor if same size, otherwise allocate new one
+            if (self._staging_tensor is None or 
+                self._staging_size != batch_shape):
+                self._staging_tensor = torch.empty(batch_shape, dtype=batch_cpu.dtype, pin_memory=True)
+                self._staging_size = batch_shape
+            
+            # Copy to staging tensor and transfer
+            self._staging_tensor.copy_(batch_cpu)
+            batch_gpu = self._staging_tensor.to(self.device, non_blocking=True)
+        else:
+            batch_gpu = batch_cpu.to(self.device, non_blocking=True)
         
         # Convert to target dtype
         batch_gpu = batch_gpu.to(self.dtype)
@@ -282,6 +295,10 @@ class GPUPreprocessorV2(nn.Module):
         
         # Create resize operation
         self.resize_op = self._make_resize(size)
+        
+        # Pre-allocated pinned staging tensor for large batches (avoid allocator churn)
+        self._staging_tensor = None
+        self._staging_size = None
     
     def _make_resize(self, size_dict: Dict[str, int]):
         """Create appropriate resize operation based on size specification."""
@@ -334,18 +351,26 @@ class GPUPreprocessorV2(nn.Module):
         stream_h2d = torch.cuda.Stream() if self.device.type == "cuda" else None
         stream_compute = torch.cuda.Stream() if self.device.type == "cuda" else None
         
-        # Create pinned tensor and start async H2D transfer
+        # Create pinned tensor using staging buffer to avoid allocator churn
         batch_tensor = torch.from_numpy(batch_np)
         if self.device.type == "cuda":
-            batch_pinned = batch_tensor.pin_memory()
+            batch_shape = batch_tensor.shape
+            # Reuse staging tensor if same size, otherwise allocate new one
+            if (self._staging_tensor is None or 
+                self._staging_size != batch_shape):
+                self._staging_tensor = torch.empty(batch_shape, dtype=batch_tensor.dtype, pin_memory=True)
+                self._staging_size = batch_shape
+            
+            # Copy to staging tensor
+            self._staging_tensor.copy_(batch_tensor)
+            batch_pinned = self._staging_tensor
         else:
             batch_pinned = batch_tensor
         
         if stream_h2d:
             with torch.cuda.stream(stream_h2d):
                 batch_gpu = batch_pinned.to(self.device, non_blocking=True)
-                # Keep in NHWC format (no channels_last hint needed for NHWC)
-                batch_gpu = batch_gpu.contiguous()
+                # Keep in NHWC format (already contiguous from numpy)
         else:
             batch_gpu = batch_pinned.to(self.device)
         
