@@ -2,7 +2,7 @@ from typing import List
 from docling.datamodel.document import InputDocument
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 
-from page_model import Page
+from base_models import Page
 
 
 class LambdaPreprocessor:

@@ -16,8 +16,7 @@ from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
-from page_model import Page
-from fork.types import Table, TableStructurePrediction
+from base_models import Table, TableStructurePrediction, Page
 
 from fork.table.tf_predictor import TFPredictor
 
