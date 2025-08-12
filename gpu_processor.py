@@ -13,7 +13,7 @@ from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
-from standard.layout_model import LayoutModel
+from optimized.layout_model import LayoutModel
 from standard.table_structure_model import TableStructureModel
 from optimized.table.table_timing_debug import print_timing_summary
 from table_regression_runner import TableRegressionRunner, Tolerances
@@ -263,7 +263,7 @@ class GPUProcessor:
         # Strip protocol and non-filename chars
         return re.sub(r'[^A-Za-z0-9._-]+', '_', url)
 
-    def end_of_run_regression(self, url, pages_list, mode: str = "baseline"):
+    def end_of_run_regression(self, url, pages_list, mode: str = "compare"):
         tol = Tolerances(bbox_abs=1.0, bbox_rel=0.01, iou_min=0.98, text_case_insensitive=False)
         runner = TableRegressionRunner(
             out_dir=os.getenv("TS_REGRESSION_DIR", "./tf_regression"),
