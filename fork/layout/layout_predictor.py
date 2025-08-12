@@ -12,9 +12,10 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor
-from transformers import AutoModelForObjectDetection, RTDetrImageProcessor
+from transformers import AutoModelForObjectDetection
 
 from docling_ibm_models.layoutmodel.labels import LayoutLabels
+from fork.layout.image_processing_rt_detr import OptimizedRTDetrImageProcessor
 
 _log = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class LayoutPredictor:
             raise FileNotFoundError(f"Missing model config file: {self._model_config}")
 
         # Load model and move to device
-        self._image_processor = RTDetrImageProcessor.from_json_file(
+        self._image_processor = OptimizedRTDetrImageProcessor.from_json_file(
             self._processor_config
         )
 
