@@ -225,6 +225,16 @@ class LayoutPostprocessor:
         
         # Use shared timer if provided, otherwise create own
         self.timer = shared_timer if shared_timer is not None else _CPUTimer()
+        
+        # Cache cell bboxes once per page and reuse everywhere  
+        self._cell_bbox = {}
+        for cell in self.cells:
+            txt = getattr(cell, "text", None)
+            if not txt or not txt.strip():
+                continue
+            bb = cell.rect.to_bounding_box()
+            if bb.area() > 0:
+                self._cell_bbox[cell.index] = bb
 
         # Build spatial indices once
         self.regular_index = SpatialClusterIndex(self.regular_clusters)
@@ -540,7 +550,12 @@ class LayoutPostprocessor:
         params = self.OVERLAP_PARAMS[cluster_type]
 
         for cluster in clusters:
-            candidates = spatial_index.find_candidates(cluster.bbox)
+            if cluster_type == "regular":
+                # Use R-tree only for regular clusters (faster, sufficient coverage)
+                candidates = set(spatial_index.spatial_index.intersection(cluster.bbox.as_tuple()))
+            else:
+                # Use full candidate search for picture/wrapper clusters
+                candidates = spatial_index.find_candidates(cluster.bbox)
             candidates &= valid_clusters.keys()  # Only keep existing candidates
             candidates.discard(cluster.id)
 
@@ -630,28 +645,34 @@ class LayoutPostprocessor:
         rtree_idx = self.regular_index.spatial_index
         id_to_cluster = {c.id: c for c in clusters}
 
-        # Cache cell bboxes once to avoid repeated conversions
-        valid_cells = []
-        cell_bboxes = []
-        for cell in self.cells:
-            if cell.text.strip():
-                cell_bbox = cell.rect.to_bounding_box()
-                if cell_bbox.area() > 0:
-                    valid_cells.append(cell)
-                    cell_bboxes.append(cell_bbox)
+        # Early exit for empty inputs
+        if not clusters or not self.cells:
+            return clusters
+            
+        # Use cached cell bboxes
+        valid_cells = [c for c in self.cells if c.index in self._cell_bbox]
 
         # Assign each cell to best overlapping cluster
-        for cell, cell_bbox in zip(valid_cells, cell_bboxes):
+        for cell in valid_cells:
+            cell_bbox = self._cell_bbox[cell.index]
             best_overlap = min_overlap
             best_cluster = None
 
+            # Get cell bbox coords once for AABB reject
+            lx, ty, rx, by = cell_bbox.as_tuple()
+
             # Query only candidate clusters whose bbox intersects the cell bbox  
-            for cluster_id in rtree_idx.intersection(cell_bbox.as_tuple()):
+            for cluster_id in rtree_idx.intersection((lx, ty, rx, by)):
                 cluster = id_to_cluster.get(cluster_id)
                 if cluster is None:
                     continue
+                
+                # Fast AABB reject before expensive overlap computation
+                bb = cluster.bbox
+                if bb.l >= rx or bb.r <= lx or bb.t >= by or bb.b <= ty:
+                    continue
                     
-                overlap_ratio = cell_bbox.intersection_over_self(cluster.bbox)
+                overlap_ratio = cell_bbox.intersection_over_self(bb)
                 if overlap_ratio > best_overlap:
                     best_overlap = overlap_ratio
                     best_cluster = cluster
@@ -683,11 +704,12 @@ class LayoutPostprocessor:
             if not cluster.cells:
                 continue
 
-            # Compute cell bbox coordinates in one pass to avoid repeated conversions
+            # Use cached cell bbox coordinates
             cell_coords = []
             for cell in cluster.cells:
-                cell_bbox = cell.rect.to_bounding_box()
-                cell_coords.append((cell_bbox.l, cell_bbox.t, cell_bbox.r, cell_bbox.b))
+                bb = self._cell_bbox.get(cell.index)
+                if bb:
+                    cell_coords.append((bb.l, bb.t, bb.r, bb.b))
             
             if cell_coords:
                 min_l = min(coords[0] for coords in cell_coords)

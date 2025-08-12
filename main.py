@@ -13,7 +13,7 @@ from lambda_preprocessor import distribute_preprocessing
 from gpu_processor import GPUProcessor
 
 # Configure logging to show debug messages
-logging.basicConfig(level=logging.DEBUG, format='%(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(message)s')
 
 if __name__ == '__main__':
     pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/a411a029-368f-4479-b416-25c404acca3d.pdf"  # DocLing paper
