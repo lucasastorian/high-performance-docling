@@ -54,12 +54,14 @@ class UnionFind:
 class SpatialClusterIndex:
     """Efficient spatial indexing for clusters using R-tree and interval trees."""
 
-    def __init__(self, clusters: List[Cluster]):
+    def __init__(self, clusters: List[Cluster], build_intervals: bool = True):
         p = index.Property()
         p.dimension = 2
         self.spatial_index = index.Index(properties=p)
-        self.x_intervals = IntervalTree()
-        self.y_intervals = IntervalTree()
+        self.build_intervals = build_intervals
+        if build_intervals:
+            self.x_intervals = IntervalTree()
+            self.y_intervals = IntervalTree()
         self.clusters_by_id: Dict[int, Cluster] = {}
 
         for cluster in clusters:
@@ -68,8 +70,9 @@ class SpatialClusterIndex:
     def add_cluster(self, cluster: Cluster):
         bbox = cluster.bbox
         self.spatial_index.insert(cluster.id, bbox.as_tuple())
-        self.x_intervals.insert(bbox.l, bbox.r, cluster.id)
-        self.y_intervals.insert(bbox.t, bbox.b, cluster.id)
+        if self.build_intervals:
+            self.x_intervals.insert(bbox.l, bbox.r, cluster.id)
+            self.y_intervals.insert(bbox.t, bbox.b, cluster.id)
         self.clusters_by_id[cluster.id] = cluster
 
     def remove_cluster(self, cluster: Cluster):
@@ -78,6 +81,10 @@ class SpatialClusterIndex:
 
     def find_candidates(self, bbox: BoundingBox) -> Set[int]:
         """Find potential overlapping cluster IDs using all indexes."""
+        if not self.build_intervals:
+            # Fallback: just spatial index
+            return set(self.spatial_index.intersection(bbox.as_tuple()))
+        
         spatial = set(self.spatial_index.intersection(bbox.as_tuple()))
         x_candidates = self.x_intervals.find_containing(
             bbox.l
@@ -240,13 +247,13 @@ class LayoutPostprocessor:
             if bb.area() > 0:
                 self._cell_bbox[cell.index] = bb
 
-        # Build spatial indices once
-        self.regular_index = SpatialClusterIndex(self.regular_clusters)
+        # Build spatial indices once (skip intervals for regular clusters)
+        self.regular_index = SpatialClusterIndex(self.regular_clusters, build_intervals=False)
         self.picture_index = SpatialClusterIndex(
-            [c for c in self.special_clusters if c.label == DocItemLabel.PICTURE]
+            [c for c in self.special_clusters if c.label == DocItemLabel.PICTURE], build_intervals=True
         )
         self.wrapper_index = SpatialClusterIndex(
-            [c for c in self.special_clusters if c.label in self.WRAPPER_TYPES]
+            [c for c in self.special_clusters if c.label in self.WRAPPER_TYPES], build_intervals=True
         )
 
     def postprocess(self) -> Tuple[List[Cluster], List[TextCell]]:
@@ -542,7 +549,7 @@ class LayoutPostprocessor:
             containment_threshold: float = 0.8,
     ) -> Tuple[List[Cluster], bool]:
         if not clusters:
-            return []
+            return [], False
 
         spatial_index = (
             self.regular_index
@@ -558,49 +565,39 @@ class LayoutPostprocessor:
         params = self.OVERLAP_PARAMS[cluster_type]
 
         if cluster_type == "regular":
-            # Fast path for regular clusters: R-tree only + optimizations
+            # Fast path for regular clusters: R-tree only + tuple optimizations
             inter = spatial_index.spatial_index.intersection
             boxes = {c.id: c.bbox.as_tuple() for c in clusters}
             areas = {c.id: c.bbox.area() for c in clusters}
             ovlp_thr = overlap_threshold - self.epsilon
             cont_thr = containment_threshold - self.epsilon
             
-            def fast_overlap_check(a_id, b_id):
-                """Inline tuple math for regular overlap check."""
-                l1, t1, r1, b1 = boxes[a_id]
-                l2, t2, r2, b2 = boxes[b_id]
-                # intersection
+            def overlaps(a, b):
+                """Inline tuple math for overlap check."""
+                l1, t1, r1, b1 = boxes[a]
+                l2, t2, r2, b2 = boxes[b]
                 l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
                 iw = r - l; ih = b - t
                 if iw <= 0 or ih <= 0:
                     return False
-                inter = iw * ih
-                aa, bb = areas[a_id], areas[b_id]
-                # containment (both ways)
-                if inter / aa >= cont_thr or inter / bb >= cont_thr:
+                interA = iw * ih
+                aa, bb = areas[a], areas[b]
+                if interA / aa >= cont_thr or interA / bb >= cont_thr:
                     return True
-                # IoU
-                union = aa + bb - inter
-                return (inter / union) >= ovlp_thr
+                return interA / (aa + bb - interA) >= ovlp_thr
             
-            for cluster in clusters:
-                cluster_id = cluster.id
-                cands = set(inter(cluster.bbox.as_tuple()))
-                cands &= valid_clusters.keys()
-                
-                # Half the comparisons: only check other_id > cluster_id
-                for other_id in cands:
-                    if other_id <= cluster_id:
+            for c in clusters:
+                cid = c.id
+                l1, t1, r1, b1 = boxes[cid]
+                # Compute candidates once, already filtered > cid
+                cands = {oid for oid in inter((l1, t1, r1, b1)) if oid > cid and oid in valid_clusters}
+                # Quick AABB reject using tuples (no object attr hits)
+                for oid in cands:
+                    l2, t2, r2, b2 = boxes[oid]
+                    if l2 >= r1 or r2 <= l1 or t2 >= b1 or b2 <= t1:
                         continue
-                    
-                    # Fast AABB reject before expensive overlap
-                    l1, t1, r1, b1 = boxes[cluster_id]
-                    o_bbox = valid_clusters[other_id].bbox
-                    if o_bbox.l >= r1 or o_bbox.r <= l1 or o_bbox.t >= b1 or o_bbox.b <= t1:
-                        continue
-                    
-                    if fast_overlap_check(cluster_id, other_id):
-                        uf.union(cluster_id, other_id)
+                    if overlaps(cid, oid):
+                        uf.union(cid, oid)
         else:
             # Keep existing logic for picture/wrapper clusters
             for cluster in clusters:
@@ -777,34 +774,40 @@ class LayoutPostprocessor:
     def _adjust_cluster_bboxes(self, clusters: List[Cluster]) -> Tuple[List[Cluster], bool]:
         """Adjust cluster bounding boxes to contain their cells. Returns (clusters, changed)."""
         changed = False
-        for cluster in clusters:
-            if not cluster.cells:
+        for cl in clusters:
+            if not cl.cells:
                 continue
-
-            # Use cached cell bbox coordinates
-            cell_coords = []
-            for cell in cluster.cells:
-                bb = self._cell_bbox.get(cell.index)
-                if bb:
-                    cell_coords.append((bb.l, bb.t, bb.r, bb.b))
             
-            if cell_coords:
-                nl = min(coords[0] for coords in cell_coords)
-                nt = min(coords[1] for coords in cell_coords)
-                nr = max(coords[2] for coords in cell_coords)
-                nb = max(coords[3] for coords in cell_coords)
+            # Single-pass min/max calculation
+            first = True
+            nl = nt = nr = nb = 0.0
+            for cell in cl.cells:
+                bb = self._cell_bbox.get(cell.index)
+                if not bb:
+                    continue
+                if first:
+                    nl, nt, nr, nb = bb.l, bb.t, bb.r, bb.b
+                    first = False
+                else:
+                    if bb.l < nl: nl = bb.l
+                    if bb.t < nt: nt = bb.t
+                    if bb.r > nr: nr = bb.r
+                    if bb.b > nb: nb = bb.b
+            
+            if first:  # No valid bb seen
+                continue
                 
-                if cluster.label == DocItemLabel.TABLE:
-                    # For tables, take union of current bbox and cells bbox
-                    nl = min(cluster.bbox.l, nl)
-                    nt = min(cluster.bbox.t, nt)
-                    nr = max(cluster.bbox.r, nr)
-                    nb = max(cluster.bbox.b, nb)
-                
-                # Compare without allocating new BoundingBox unless changed
-                if (nl, nt, nr, nb) != (cluster.bbox.l, cluster.bbox.t, cluster.bbox.r, cluster.bbox.b):
-                    cluster.bbox = BoundingBox(l=nl, t=nt, r=nr, b=nb)
-                    changed = True
+            if cl.label == DocItemLabel.TABLE:
+                # For tables, take union of current bbox and cells bbox
+                if cl.bbox.l < nl: nl = cl.bbox.l
+                if cl.bbox.t < nt: nt = cl.bbox.t
+                if cl.bbox.r > nr: nr = cl.bbox.r
+                if cl.bbox.b > nb: nb = cl.bbox.b
+            
+            # Compare without allocating new BoundingBox unless changed
+            if (nl, nt, nr, nb) != (cl.bbox.l, cl.bbox.t, cl.bbox.r, cl.bbox.b):
+                cl.bbox = BoundingBox(l=nl, t=nt, r=nr, b=nb)
+                changed = True
 
         return clusters, changed
 
