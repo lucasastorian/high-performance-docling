@@ -125,7 +125,7 @@ class GPUProcessor:
             f"total: {fmt_secs(t_all)}"
         )
 
-        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="baseline")
+        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="compare")
 
         return pages_with_tables
 
