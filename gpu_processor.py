@@ -84,7 +84,19 @@ class GPUProcessor:
         layout_timings = self._get_layout_timings()
         print(f"     ⏱ layout: {fmt_secs(t_layout)}")
         if layout_timings:
-            print(f"       └─ preprocess: {layout_timings['preprocess']:.1f} ms")
+            # Infer preprocessing time if not separately timed (GPU preprocessing case)
+            preprocess_time = layout_timings['preprocess']
+            if preprocess_time == 0.0:
+                # Calculate inferred preprocessing time
+                timed_components = (layout_timings['predict'] + 
+                                 layout_timings['postprocess'] + 
+                                 layout_timings['layout_postprocess'])
+                preprocess_time = max(0.0, t_layout * 1000 - timed_components)
+                preprocess_display = f"{preprocess_time:.1f} ms (inferred)"
+            else:
+                preprocess_display = f"{preprocess_time:.1f} ms"
+            
+            print(f"       └─ preprocess: {preprocess_display}")
             print(f"       └─ predict: {layout_timings['predict']:.1f} ms") 
             print(f"       └─ postprocess: {layout_timings['postprocess']:.1f} ms")
             print(f"       └─ layout-postprocess: {layout_timings['layout_postprocess']:.1f} ms")

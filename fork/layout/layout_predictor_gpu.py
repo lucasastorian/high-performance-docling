@@ -148,25 +148,20 @@ class LayoutPredictor:
         """
         boxes, scores, labels = res["boxes"], res["scores"], res["labels"]
         
-        # Create sort key: [labels, -scores, x1, y1, x2, y2]
+        # Create sort key: [label, -score, x1, y1, x2, y2]
         key = torch.stack([
             labels.to(torch.int64),
             (-scores).to(torch.float32),
             boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
         ], dim=1)
-        
-        # Sort by each column in order using lexsort or argsort
-        if hasattr(torch, "lexsort"):
-            idx = torch.lexsort(key.t())
-        else:
-            # Fallback: manual lexicographic sort
-            # Sort by the last column first, then work backwards
-            idx = torch.arange(len(boxes), device=boxes.device)
-            for col_idx in range(key.shape[1] - 1, -1, -1):
-                col = key[:, col_idx]
-                sort_idx = torch.argsort(col, stable=True)
-                idx = idx[sort_idx]
-        
+
+        # Lexicographic sort: sort by last column first, then work backwards
+        idx = torch.arange(key.size(0), device=key.device)
+        for col in range(key.size(1) - 1, -1, -1):  # last -> first
+            vals = key[idx, col]  # Use current permutation
+            order = torch.argsort(vals, stable=True)
+            idx = idx[order]
+
         return {
             "boxes": boxes[idx],
             "scores": scores[idx], 
@@ -182,7 +177,7 @@ class LayoutPredictor:
 
     def _store_timings(self, timer):
         """Store timing results from timer."""
-        self._t_preprocess_ms = timer.get_time('preprocess')
+        self._t_preprocess_ms = timer.get_time('preprocess')  # Will be 0 for GPU preprocessing
         self._t_predict_ms = timer.get_time('predict')
         self._t_postprocess_ms = timer.get_time('postprocess')
 
@@ -238,16 +233,15 @@ class LayoutPredictor:
         target_sizes = torch.tensor([img.size[::-1] for img in pil_images])
 
         if self._use_gpu_preprocess and self._gpu_preprocessor is not None:
-            # GPU preprocessing path
-            with timer.time_section('preprocess'):
-                preprocessed = self._gpu_preprocessor.preprocess_batch(pil_images)
-                
-                # The GPU preprocessor returns a dict with 'pixel_values' and optionally 'pixel_mask'
-                pixel_values = preprocessed['pixel_values']
-                
-                # Ensure pixel_values is on the right device
-                if pixel_values.device != self._device:
-                    pixel_values = pixel_values.to(self._device)
+            # GPU preprocessing path - timing handled externally
+            preprocessed = self._gpu_preprocessor.preprocess_batch(pil_images)
+            
+            # The GPU preprocessor returns a dict with 'pixel_values' and optionally 'pixel_mask'
+            pixel_values = preprocessed['pixel_values']
+            
+            # Ensure pixel_values is on the right device
+            if pixel_values.device != self._device:
+                pixel_values = pixel_values.to(self._device)
         else:
             # CPU preprocessing path (original HF)
             with timer.time_section('preprocess'):

@@ -7,12 +7,23 @@ from typing import List, Dict, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
 import os
+import contextlib
 
 
 def enable_strict_determinism():
     """
     Enable strict determinism for reproducible results.
     Disables TF32 and enables deterministic CUDA algorithms.
+    
+    IMPORTANT: Call this BEFORE any CUDA context is created (i.e., before the 
+    first tensor hits GPU). Recommended usage in CI/compatibility mode:
+    
+    ```python
+    if os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes"):
+        from fork.layout.gpu_preprocess import enable_strict_determinism
+        enable_strict_determinism()
+    ```
+    
     Call once at process start for CI/compatibility runs.
     """
     # Disable TF32 (Ampere+ GPUs use this by default and it changes scores slightly)
@@ -346,16 +357,16 @@ class GPUPreprocessorV2(nn.Module):
                 batch_gpu = batch_pinned.to(self.device, non_blocking=True)
                 # Keep in NHWC format (no channels_last hint needed for NHWC)
                 batch_gpu = batch_gpu.contiguous()
-            
-            # Wait for H2D to complete and start compute
-            torch.cuda.current_stream().wait_stream(stream_h2d)
         else:
             batch_gpu = batch_pinned.to(self.device)
         
-        if stream_compute:
-            with torch.cuda.stream(stream_compute):
-                # Convert to float
-                batch_float = batch_gpu.to(self.dtype)
+        # Make compute stream wait on H2D completion 
+        if stream_h2d and stream_compute:
+            stream_compute.wait_stream(stream_h2d)
+        
+        with (torch.cuda.stream(stream_compute) if stream_compute else contextlib.nullcontext()):
+            # Convert to float
+            batch_float = batch_gpu.to(self.dtype)
                 # Rescale if needed (in-place for efficiency)
                 if self.do_rescale:
                     batch_float.mul_(self.rescale_factor)
