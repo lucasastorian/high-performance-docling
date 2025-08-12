@@ -91,7 +91,18 @@ class GPUProcessor:
             print(f"       └─ preprocess: {layout_timings['preprocess']:.1f} ms")
             print(f"       └─ predict: {layout_timings['predict']:.1f} ms") 
             print(f"       └─ postprocess: {layout_timings['postprocess']:.1f} ms")
+            print(f"       └─ cluster-build: {layout_timings['cluster_build']:.1f} ms")
             print(f"       └─ layout-postprocess: {layout_timings['layout_postprocess']:.1f} ms")
+            
+            # Calculate any remaining unaccounted time
+            timed_components = (layout_timings['preprocess'] + 
+                             layout_timings['predict'] + 
+                             layout_timings['postprocess'] + 
+                             layout_timings['cluster_build'] + 
+                             layout_timings['layout_postprocess'])
+            remaining_time = max(0.0, t_layout * 1000 - timed_components)
+            if remaining_time > 10.0:  # Only show if significant
+                print(f"       └─ other: {remaining_time:.1f} ms")
 
         # Step 2: Identify regions needing OCR
         print("  2️⃣ Identifying OCR regions...")
@@ -284,8 +295,9 @@ class GPUProcessor:
             timings['predict'] = getattr(predictor, '_t_predict_ms', 0.0)
             timings['postprocess'] = getattr(predictor, '_t_postprocess_ms', 0.0)
         
-        # Get timings from layout model (layout postprocessing)
-        timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_ms', 0.0)
+        # Get timings from layout model (totals across all pages)
+        timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_total_ms', 0.0)
+        timings['cluster_build'] = getattr(self.layout_model, '_t_cluster_build_total_ms', 0.0)
         
         return timings
 

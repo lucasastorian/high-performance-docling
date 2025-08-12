@@ -269,6 +269,15 @@ class LayoutPredictor:
             # Apply stable sorting in compatibility mode
             if self._compat_mode:
                 results_list = [self._stable_sort_result(r) for r in results_list]
+            
+            # Move tensors to CPU in bulk to avoid hidden syncs later
+            results_cpu = []
+            for r in results_list:
+                results_cpu.append({
+                    "boxes": r["boxes"].detach().to("cpu"),
+                    "scores": r["scores"].detach().to("cpu"),
+                    "labels": r["labels"].detach().to("cpu"),
+                })
 
         timer.finalize()
         self._store_timings(timer)
@@ -276,7 +285,7 @@ class LayoutPredictor:
         # Convert results to standard format for each image
         all_predictions = []
 
-        for img, results in zip(pil_images, results_list):
+        for img, results in zip(pil_images, results_cpu):
             w, h = img.size
             predictions = []
 

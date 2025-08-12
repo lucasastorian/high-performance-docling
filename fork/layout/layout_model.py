@@ -180,6 +180,8 @@ class LayoutModel(BasePageModel):
                 )
 
         # Process each page with its predictions
+        self._t_layout_postprocess_total_ms = 0.0
+        self._t_cluster_build_total_ms = 0.0
         valid_page_idx = 0
         for page in pages:
             assert page._backend is not None
@@ -190,6 +192,8 @@ class LayoutModel(BasePageModel):
             page_predictions = batch_predictions[valid_page_idx]
             valid_page_idx += 1
 
+            # Time cluster building
+            t_cluster_build_start = time.perf_counter()
             clusters = []
             for ix, pred_item in enumerate(page_predictions):
                 label = DocItemLabel(
@@ -203,6 +207,7 @@ class LayoutModel(BasePageModel):
                     cells=[],
                 )
                 clusters.append(cluster)
+            self._t_cluster_build_total_ms += (time.perf_counter() - t_cluster_build_start) * 1000
 
             if settings.debug.visualize_raw_layout:
                 self.draw_clusters_and_cells_side_by_side(
@@ -214,7 +219,7 @@ class LayoutModel(BasePageModel):
             processed_clusters, processed_cells = LayoutPostprocessor(
                 page, clusters, self.options
             ).postprocess()
-            self._t_layout_postprocess_ms = (time.perf_counter() - t_layout_postprocess_start) * 1000
+            self._t_layout_postprocess_total_ms += (time.perf_counter() - t_layout_postprocess_start) * 1000
             # Note: LayoutPostprocessor updates page.cells and page.parsed_page internally
 
             with warnings.catch_warnings():
