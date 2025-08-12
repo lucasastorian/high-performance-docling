@@ -79,7 +79,7 @@ class LayoutPredictor:
             raise FileNotFoundError(f"Missing model config file: {self._model_config}")
 
         # Load model and move to device
-        self._image_preprocessor = RTDetrImageProcessor.from_json_file(
+        self._image_preprocessor = OptimizedRTDetrImageProcessor.from_json_file(
             self._processor_config
         )
 
@@ -229,7 +229,7 @@ class LayoutPredictor:
 
         # Post-process all results at once
         results_list: List[Dict[str, Tensor]] = (
-            self._image_preprocessor.post_process_object_detection(
+            self._image_postprocessor.post_process_object_detection(
                 outputs,
                 target_sizes=target_sizes,
                 threshold=self._threshold,
