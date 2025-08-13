@@ -116,6 +116,73 @@ class TableModel04_rs(BaseModel, nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
+        
+        # Block size for encoder batching
+        self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
+
+    def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
+        """
+        Encode images in fixed-size blocks with CUDA Graphs (Optimization 1 & 2).
+        Preallocates output to avoid cat() overhead.
+        """
+        B0, C, H, W = imgs.shape
+        device = imgs.device
+        
+        # Capture CUDA Graph on first call (includes warmup)
+        if device.type == 'cuda':
+            self._encoder._maybe_capture(C=C, H=H, W=W, device=str(device))
+        
+        # If batch is small, just run directly without blocking
+        if B0 <= block_bs // 2 or not getattr(self._encoder, "_gr", None):
+            return self._encoder(imgs.to(memory_format=torch.channels_last, non_blocking=True))
+        
+        # Calculate padding for block alignment
+        pad = (block_bs - (B0 % block_bs)) % block_bs
+        B_padded = B0 + pad
+        
+        # Preallocate output buffer (Optimization 2)
+        # First, get output shape by running a single sample
+        with torch.inference_mode():
+            sample = imgs[:1].to(memory_format=torch.channels_last)
+            y0 = self._encoder(sample)
+        _, out_C, out_H, out_W = y0.shape  # NCHW output
+        enc_out = torch.empty((B_padded, out_C, out_H, out_W), 
+                             device=device, dtype=y0.dtype)  # NCHW
+        
+        # Process in blocks
+        for i in range(0, B_padded, block_bs):
+            end_idx = min(i + block_bs, B0)
+            
+            if end_idx > i:  # We have real images
+                if end_idx - i == block_bs:
+                    # Full block of real images
+                    chunk = imgs[i:end_idx]
+                else:
+                    # Partial block - need padding
+                    real_chunk = imgs[i:end_idx]
+                    pad_size = block_bs - (end_idx - i)
+                    # Repeat last image for padding
+                    padding = real_chunk[-1:].repeat(pad_size, 1, 1, 1)
+                    chunk = torch.cat([real_chunk, padding], dim=0)
+            else:
+                # All padding (shouldn't happen with correct logic)
+                chunk = imgs[-1:].repeat(block_bs, 1, 1, 1)
+            
+            chunk = chunk.to(memory_format=torch.channels_last, non_blocking=True)
+            
+            # Use CUDA Graph if available
+            if getattr(self._encoder, "_gr", None) and chunk.shape[0] == block_bs:
+                y = self._encoder.graph_forward(chunk)
+                # Clone to detach from static buffer
+                y = y.clone()
+            else:
+                y = self._encoder(chunk)
+            
+            # Copy to preallocated buffer
+            enc_out[i:i+block_bs].copy_(y, non_blocking=True)
+        
+        # Return only the non-padded portion
+        return enc_out[:B0]
 
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
@@ -128,14 +195,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._encoder.eval()
         self._tag_transformer.eval()
         self._bbox_decoder.eval()
-        
-        # Convert to channels_last for better performance
-        imgs = imgs.to(memory_format=torch.channels_last, non_blocking=True)
 
         prof = AggProfiler()
         
         prof.begin("model_encoder", self._prof)
-        enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - NCHW format
+        # Use blocked encoding with CUDA Graphs and preallocated output
+        enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
         prof.end("model_encoder", self._prof)
 
         prof.begin("model_tag_transformer_input_filter", self._prof)
