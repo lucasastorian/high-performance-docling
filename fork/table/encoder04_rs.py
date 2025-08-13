@@ -119,9 +119,6 @@ class Encoder04(nn.Module):
         
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
-        
-        # Set module to use channels-last for both weights and activations
-        self._resnet = self._resnet.to(memory_format=torch.channels_last)
 
     def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
         """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
@@ -152,7 +149,7 @@ class Encoder04(nn.Module):
         self._fuse_conv_bn()
         
         self.eval()
-        self.to(device=dev, memory_format=torch.channels_last)
+        self.to(device=dev)  # Weights stay in default format, only activations are channels_last
         torch.cuda.synchronize()
         
         # Create static input buffer - ensure it's properly channels_last
