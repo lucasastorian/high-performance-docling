@@ -76,16 +76,23 @@ class Encoder04(nn.Module):
     def prepare_for_inference(self, device="cuda"):
         """Call this AFTER loading weights to prepare model for inference.
         This handles fusion, compilation, and graph capture in the correct order.
+        Returns self (or compiled wrapper if compilation is enabled).
         """
         dev = self._as_device(device)
+        encoder = self  # Track the encoder object (may be replaced by compile)
         
         # Step 1: Fuse Conv+BN layers if not already done
-        if not self._fused:
-            self._fuse_conv_bn()
+        if not encoder._fused:
+            encoder._fuse_conv_bn()
         
-        # Step 2: Compile if requested (mutually exclusive with manual graphs)
-        if self._use_compile and not self._compiled:
-            self._maybe_compile(device=dev)
+        # Step 2: Check if pool is no-op and replace with Identity BEFORE compile
+        # This avoids compiling unnecessary ops
+        if dev.type == "cuda":
+            encoder._check_adaptive_pool(H=448, W=448, device=dev)
+        
+        # Step 3: Compile if requested (mutually exclusive with manual graphs)
+        if encoder._use_compile and not encoder._compiled:
+            encoder = encoder.compile_self(device=dev)  # Returns compiled wrapper
             
             # CRITICAL: Warm up the compiled model so first real inference isn't slow
             # This triggers torch.compile's graph compilation/JIT outside of timing
@@ -98,17 +105,19 @@ class Encoder04(nn.Module):
                 
                 # 2-3 warmup runs to trigger compilation and cache
                 for i in range(3):
-                    _ = self.forward(dummy)
+                    _ = encoder.forward(dummy)
                     torch.cuda.synchronize()
                 
                 self._log().info("Compiled model warmup complete")
         
-        # Step 3: Capture CUDA graphs if requested (only if not compiled)
-        elif self._use_graphs and self._gr is None and dev.type == "cuda":
+        # Step 4: Capture CUDA graphs if requested (only if not compiled)
+        elif encoder._use_graphs and encoder._gr is None and dev.type == "cuda":
             # Will internally call _fuse_conv_bn if needed
-            self._maybe_capture(device=dev)
+            encoder._maybe_capture(device=dev)
         
-        self._log().info(f"Model prepared for inference - Fused: {self._fused}, Compiled: {self._compiled}, Graphs: {self._gr is not None}")
+        self._log().info(f"Model prepared for inference - Fused: {encoder._fused}, Compiled: {encoder._compiled}, Graphs: {encoder._gr is not None}")
+        
+        return encoder  # Return the encoder (may be compiled wrapper)
     
     def _fuse_conv_bn(self):
         """Fuse Conv+BN layers for inference (Optimization 3)"""
@@ -161,57 +170,36 @@ class Encoder04(nn.Module):
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
 
-    def _maybe_compile(self, device="cuda"):
-        """Compile the model with torch.compile if enabled"""
-        if not self._use_compile or self._compiled:
-            return
+    def compile_self(self, device="cuda"):
+        """Compile the ENTIRE encoder module with torch.compile
+        Returns the compiled module (since torch.compile returns a new wrapper)
+        """
+        if self._compiled:
+            return self
         
         # Default to CUDA if not specified
         dev = self._as_device(device)
         if dev.type != "cuda":
             self._log().warning("torch.compile only supported on CUDA, skipping compilation")
-            return
+            return self
         
-        # Move to device
+        # Move to device and eval mode
         self.eval()
         self.to(device=dev)
         
-        # Determine if we should use graphs in compilation
-        use_graph_in_compile = bool(int(os.getenv("ENCODER_USE_GRAPHS", "1")))
+        # ALWAYS use reduce-overhead for conv-heavy models like ResNet
+        # This mode uses CUDA graphs internally for best performance
+        compiled_encoder = torch.compile(
+            self,  # Compile the ENTIRE encoder, not submodules!
+            mode="reduce-overhead",  # Best for static shapes, uses CUDA graphs internally
+            fullgraph=True,  # No fallback to eager mode
+            dynamic=False  # Static shapes only (we always use same H,W,BS)
+        )
         
-        # Compile with appropriate settings
-        if use_graph_in_compile:
-            # Let torch.compile handle CUDA graphs
-            self._resnet = torch.compile(
-                self._resnet, 
-                mode="reduce-overhead",  # This mode uses CUDA graphs internally
-                fullgraph=True, 
-                dynamic=False
-            )
-            self._adaptive_pool = torch.compile(
-                self._adaptive_pool,
-                mode="reduce-overhead",
-                fullgraph=True,
-                dynamic=False
-            )
-            self._log().info("Model compiled with torch.compile (reduce-overhead mode with graphs)")
-        else:
-            # Compile without graphs
-            self._resnet = torch.compile(
-                self._resnet,
-                mode="default",  # No CUDA graphs
-                fullgraph=True,
-                dynamic=False
-            )
-            self._adaptive_pool = torch.compile(
-                self._adaptive_pool,
-                mode="default",
-                fullgraph=True,
-                dynamic=False
-            )
-            self._log().info("Model compiled with torch.compile (default mode without graphs)")
-        
+        self._log().info("Encoder compiled with torch.compile (reduce-overhead mode)")
         self._compiled = True
+        
+        return compiled_encoder  # Return the compiled wrapper
     
     def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
         """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
