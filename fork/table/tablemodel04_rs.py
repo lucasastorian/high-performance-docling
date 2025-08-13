@@ -173,7 +173,7 @@ class TableModel04_rs(BaseModel, nn.Module):
     def _flatten_hw_to_sbc(self, hwc):
         """Utility: [B,H,W,C] -> [S,B,C] for transformer"""
         B, H, W, C = hwc.shape
-        return hwc.flatten(1, 2).permute(1, 0, 2).contiguous()
+        return hwc.flatten(1, 2).permute(1, 0, 2)  # no .contiguous() - avoid copy
     
     def _predict_single_with_precomputed_stage2(self, enc_out: torch.Tensor, memory_enc: torch.Tensor, max_steps: int):
         """
@@ -186,17 +186,17 @@ class TableModel04_rs(BaseModel, nn.Module):
         prof = AggProfiler()
 
         # --- Preallocate decoded tags: [Tmax+1, 1] ---
-        Tmax = self._max_pred_len
+        Tmax = min(max_steps, self._max_pred_len)  # Honor max_steps
         decoded_tags = torch.empty((Tmax + 1, 1), dtype=torch.long, device=device)
         start_id = self._ids["<start>"]; end_id = self._ids["<end>"]
         decoded_tags[0, 0] = start_id
         t = 0
 
         # --- Flags on device ---
-        skip_next   = torch.tensor(True,  device=device)
-        prev_ucel   = torch.tensor(False, device=device)
-        first_lcel  = torch.tensor(True,  device=device)
+        skip_next   = torch.tensor(True,  device=device, dtype=torch.bool)
+        first_lcel  = torch.tensor(True,  device=device, dtype=torch.bool)
         line_num    = torch.zeros((), dtype=torch.long, device=device)
+        prev_ucel   = torch.tensor(False, device=device, dtype=torch.bool)
 
         # --- Optional ids (may be None) ---
         lcel_id = self._ids.get("lcel")
@@ -209,7 +209,6 @@ class TableModel04_rs(BaseModel, nn.Module):
         tag_H_buf: list[torch.Tensor] = []
         bboxes_to_merge: dict[int, int] = {}
         cur_bbox_ind = 0
-        bbox_ind = 0
         open_span_start = None
 
         cache = None
@@ -228,12 +227,12 @@ class TableModel04_rs(BaseModel, nn.Module):
             new_tag = torch.argmax(logits, dim=1)  # [1] Long (on device)
 
             # ---- Structure corrections (GPU) ----
-            if xcel_id is not None and lcel_id is not None:
+            if (xcel_id is not None) and (lcel_id is not None):
                 new_tag = torch.where((line_num == 0) & (new_tag == xcel_id),
                                       lcel_id.expand_as(new_tag), new_tag)
 
-            if prev_ucel and lcel_id is not None and fcel_id is not None:
-                new_tag = torch.where(new_tag == lcel_id,
+            if (prev_ucel) and (lcel_id is not None) and (fcel_id is not None):
+                new_tag = torch.where(prev_ucel & (new_tag == lcel_id),
                                       fcel_id.expand_as(new_tag), new_tag)
 
             # ---- Append token ----
@@ -244,46 +243,50 @@ class TableModel04_rs(BaseModel, nn.Module):
             if (new_tag == end_id).item():      # minimal unavoidable sync
                 break
 
-            # ---- BBox emission decisions (mostly GPU) ----
-            emit_bbox = (~skip_next) & (self._emit_ids.numel() > 0) \
-                        & torch.isin(new_tag, self._emit_ids)
-            is_lcel = (lcel_id is not None) and (new_tag == lcel_id)
+            # ---- BBox emission decisions ----
+            has_emit = (self._emit_ids.numel() > 0)
+            emit_mask = torch.isin(new_tag, self._emit_ids) if has_emit else torch.zeros_like(new_tag, dtype=torch.bool)
+            emit_bbox_t = (~skip_next) & emit_mask  # tensor predicate
 
-            # Append features for bbox head when emit OR first_lcel happens
-            if emit_bbox.item() or (is_lcel and first_lcel).item():
-                tag_H_buf.append(last_H)  # GPU tensor per cell
-                
-                # Handle span tracking
-                if is_lcel and first_lcel:
+            is_lcel_t = (new_tag == lcel_id) if lcel_id is not None else torch.zeros_like(new_tag, dtype=torch.bool)
+
+            # For Python control flow (single-item), convert ONCE:
+            emit_b        = bool(emit_bbox_t.item())
+            is_lcel_b     = bool(is_lcel_t.item()) if lcel_id is not None else False
+            first_lcel_b  = bool(first_lcel.item())
+
+            # Append features when 'emit' OR we are at the first lcel of a span
+            if emit_b or (is_lcel_b and first_lcel_b):
+                tag_H_buf.append(last_H)  # [1, D], stays on GPU
+
+                # Span bookkeeping (Python; indexes are small):
+                if is_lcel_b and first_lcel_b:
                     open_span_start = cur_bbox_ind
-                    bboxes_to_merge[open_span_start] = -1
+                    bboxes_to_merge[open_span_start] = -1  # placeholder until we know the end
                     cur_bbox_ind += 1
-                elif not first_lcel and open_span_start is not None:
-                    # Close the span
+                    first_lcel = torch.tensor(False, device=device, dtype=torch.bool)
+                elif (not first_lcel_b) and (open_span_start is not None) and emit_b:
+                    # End of horizontal span
                     bboxes_to_merge[open_span_start] = cur_bbox_ind
-                    open_span_start = None
                     cur_bbox_ind += 1
-                elif emit_bbox.item():
+                elif emit_b:
+                    # Non-span bbox
                     cur_bbox_ind += 1
 
-            # Update flags
-            if is_lcel:
-                first_lcel = torch.tensor(False, device=device)
-            else:
-                first_lcel = torch.tensor(True, device=device)
+            # Reset first_lcel whenever current token isn't lcel
+            if not is_lcel_b:
+                first_lcel = torch.tensor(True, device=device, dtype=torch.bool)
 
             # Update line number if nl
             if nl_id is not None:
                 line_num = line_num + (new_tag == nl_id).to(line_num.dtype)
 
-            # Next-step skip mask
-            if self._skip_ids.numel() > 0:
-                skip_next = torch.isin(new_tag, self._skip_ids)
-            else:
-                skip_next = torch.tensor(False, device=device)
+            # Next-step skip mask (tensor)
+            skip_next = torch.isin(new_tag, self._skip_ids) if (self._skip_ids.numel() > 0) \
+                        else torch.zeros_like(new_tag, dtype=torch.bool)
 
-            # prev_ucel
-            prev_ucel = (ucel_id is not None) and (new_tag == ucel_id)
+            # prev_ucel for next iteration
+            prev_ucel = (new_tag == ucel_id) if ucel_id is not None else torch.tensor(False, device=device, dtype=torch.bool)
 
         # --- Materialize sequence ---
         seq = decoded_tags[:t+1, 0].tolist()
