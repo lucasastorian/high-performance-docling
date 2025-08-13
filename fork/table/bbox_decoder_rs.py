@@ -152,9 +152,12 @@ class BBoxDecoder(nn.Module):
         device = enc_out_nchw.device
         dtype = enc_out_nchw.dtype
 
-        # Optional autocast (turn on after verifying parity)
-        autocast_cm = torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_amp else \
-            torch.cpu.amp.autocast(enabled=False)
+        # Optional autocast (only on CUDA, disabled otherwise)
+        if use_amp and device.type == 'cuda':
+            autocast_cm = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        else:
+            # No autocast on CPU or when disabled
+            autocast_cm = torch.autocast(device_type=device.type, enabled=False)
 
         with autocast_cm:
             # 1) Optional conv filter (kept to preserve weights/behavior)
