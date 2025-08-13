@@ -1,6 +1,7 @@
 # fork/table/batched_decoder_v3.py
-# Optimized Batched AR decoder with GPT-5 Phase 1 optimization implemented
+# Optimized Batched AR decoder with GPT-5 Phase 1 & 2 optimizations implemented
 # PHASE 1: Reduced GPU→CPU sync frequency - check "all finished" every 8 steps
+# PHASE 2: Avoid 3 nonzero() kernels per step - reuse append_idx with GPU subselection
 
 import torch
 from dataclasses import dataclass
@@ -261,22 +262,24 @@ class BatchedTableDecoderV2:
                     tag_H_buf.view(-1, D_embed).index_copy_(0, flat_idx, rows)  # Vectorized write
                     k_counters[append_idx] += 1  # Increment counters
 
-                    # OPTIMIZATION: Tensorized span tracking - no CPU syncs
-                    # Handle span starts (first_lcel)
-                    first_lcel_idx = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(1)
-                    if first_lcel_idx.numel() > 0:
+                    # PHASE 2 OPTIMIZATION: Span bookkeeping using the already found append_idx
+                    # Build masks over append_idx without new nonzero() calls
+                    m_first_on_app = m_first_lcel.index_select(0, append_idx)
+                    if m_first_on_app.any():
+                        first_lcel_idx = append_idx[m_first_on_app]
                         span_starts, span_ends, span_cnt = self._maybe_grow_spans(
                             span_starts, span_ends, span_cnt, first_lcel_idx
                         )
-                        slot = span_cnt[first_lcel_idx]  # Current slot for each sample
+                        slot = span_cnt[first_lcel_idx]
                         span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
                         span_cnt[first_lcel_idx] += 1
 
-                    # Handle span ends (emit but not first_lcel)
-                    end_idx = (m_emit_bbox & (~first_lcel) & append_mask & (~finished)).nonzero(as_tuple=False).squeeze(
-                        1)
-                    if end_idx.numel() > 0:
-                        # Write to the most recent start slot (cnt-1)
+                    # ends = append & emit & not first_lcel & alive
+                    m_emit_on_app = m_emit_bbox.index_select(0, append_idx)
+                    m_alive_on_app = (~finished).index_select(0, append_idx)
+                    m_end_on_app = m_emit_on_app & (~m_first_on_app) & m_alive_on_app
+                    if m_end_on_app.any():
+                        end_idx = append_idx[m_end_on_app]
                         slot = (span_cnt[end_idx] - 1).clamp_min(0)
                         span_ends[end_idx, slot] = bbox_ind[end_idx]
 
