@@ -163,27 +163,37 @@ class TableModel04_rs(BaseModel, nn.Module):
                              device=device, dtype=y0.dtype)  # NCHW
         
         # Process in blocks - Optimization 3: avoid cat() by preallocating chunk buffer
-        chunk_buffer = torch.empty((block_bs, C, H, W), device=device, dtype=imgs.dtype)
+        # CRITICAL: Allocate chunk_buffer in channels_last format from the start!
+        chunk_buffer = torch.empty((block_bs, C, H, W), device=device, dtype=imgs.dtype,
+                                  memory_format=torch.channels_last)
         
         for i in range(0, B_padded, block_bs):
             end_idx = min(i + block_bs, B0)
             
             if end_idx > i:  # We have real images
                 real_count = end_idx - i
-                # Copy real images to chunk buffer
-                chunk_buffer[:real_count] = imgs[i:end_idx]
+                # Copy real images to chunk buffer (ensure channels_last)
+                imgs_slice = imgs[i:end_idx]
+                if not imgs_slice.is_contiguous(memory_format=torch.channels_last):
+                    imgs_slice = imgs_slice.contiguous(memory_format=torch.channels_last)
+                chunk_buffer[:real_count] = imgs_slice
                 # Pad with last image if needed (no cat!)
                 if real_count < block_bs:
                     last_img = imgs[end_idx - 1]
+                    if not last_img.is_contiguous(memory_format=torch.channels_last):
+                        last_img = last_img.contiguous(memory_format=torch.channels_last)
                     for j in range(real_count, block_bs):
                         chunk_buffer[j] = last_img
             else:
                 # All padding (shouldn't happen with correct logic)
                 last_img = imgs[-1]
+                if not last_img.is_contiguous(memory_format=torch.channels_last):
+                    last_img = last_img.contiguous(memory_format=torch.channels_last)
                 for j in range(block_bs):
                     chunk_buffer[j] = last_img
             
-            chunk = chunk_buffer.to(memory_format=torch.channels_last, non_blocking=True)
+            # chunk_buffer is already channels_last, no conversion needed!
+            chunk = chunk_buffer
             
             # Use CUDA Graph if available
             if getattr(self._encoder, "_gr", None) and chunk.shape[0] == block_bs:

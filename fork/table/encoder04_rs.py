@@ -187,6 +187,12 @@ class Encoder04(nn.Module):
         self.eval()
         self.to(device=dev)
         
+        # Enable cudnn autotuning for better conv performance with compiled mode
+        # This helps compiled mode match eager performance for conv ops
+        old_benchmark = cudnn.benchmark
+        cudnn.benchmark = True
+        self._log().info(f"Set cudnn.benchmark=True for compiled mode (was {old_benchmark})")
+        
         # ALWAYS use reduce-overhead for conv-heavy models like ResNet
         # This mode uses CUDA graphs internally for best performance
         compiled_encoder = torch.compile(
@@ -282,17 +288,20 @@ class Encoder04(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            images: NCHW float tensor [B,3,H,W]. 
+            images: NCHW float tensor [B,3,H,W] in channels_last memory format
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        # Assert batch size is always 32 when graphs are enabled (manual graphs only)
-        if self._use_graphs and images.device.type == "cuda":
+        # Assert batch size is always 32 when graphs are CAPTURED and being used
+        # Allow shape probes (B=1) and other sizes when graphs aren't captured yet
+        if self._use_graphs and self._gr is not None and images.device.type == "cuda":
             assert images.shape[0] == self._gr_bs, f"Batch size must be {self._gr_bs} for CUDA graphs, got {images.shape[0]}"
         
-        # Fix 1: Ensure channels_last format (cheap if already channels_last)
-        if images.device.type == "cuda" and not images.is_contiguous(memory_format=torch.channels_last):
-            images = images.contiguous(memory_format=torch.channels_last)
+        # CRITICAL: Don't convert format here - that would be compiled into the graph!
+        # Caller MUST provide channels_last tensor for optimal performance
+        if images.device.type == "cuda":
+            assert images.is_contiguous(memory_format=torch.channels_last), \
+                "Input must be channels_last format. Call .contiguous(memory_format=torch.channels_last) before encoder"
         
         # Apply BF16 autocast if enabled (only for CUDA)
         if self._use_bf16 and images.device.type == 'cuda':
