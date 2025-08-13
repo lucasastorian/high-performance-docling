@@ -77,13 +77,13 @@ class BatchedTableDecoderV2:
     @torch.inference_mode()
     def predict_batched(
         self,
-        enc_out_batch: torch.Tensor,   # [B,C,H,W] NCHW - passed directly to bbox decoder
-        mem_enc: torch.Tensor,         # [S,B,D] encoder memory (precomputed, no duplicate processing)
+        enc_out_batch_nhwc: torch.Tensor,   # [B,H,W,C] NHWC - for bbox decoder (converted once in predict)
+        mem_enc: torch.Tensor,              # [S,B,D] encoder memory (precomputed, no duplicate processing)
         max_steps: int
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
         device = self.device
         tt = self.tt
-        B = enc_out_batch.size(0)
+        B = enc_out_batch_nhwc.size(0)
         
         # Clamp to model's max
         Tmax = min(max_steps, self.model._max_pred_len)
@@ -258,10 +258,10 @@ class BatchedTableDecoderV2:
         for b in range(B):
             tag_H_buf_b = tag_H_per_sample[b]
             if self.model._bbox and len(tag_H_buf_b) > 0:
-                # Pass NCHW directly to bbox decoder
-                enc_nchw = enc_out_batch[b:b+1]  # [1, 256, 28, 28] NCHW
+                # Use NHWC directly (already converted once in predict)
+                enc_nhwc = enc_out_batch_nhwc[b:b+1]  # [1, 28, 28, 256] NHWC
                 cls_logits, coords = self.model._bbox_decoder.inference(
-                    enc_nchw, tag_H_buf_b
+                    enc_nhwc, tag_H_buf_b
                 )
             else:
                 cls_logits = torch.empty(0, device=device)

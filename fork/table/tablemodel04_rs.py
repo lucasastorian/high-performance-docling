@@ -139,19 +139,24 @@ class TableModel04_rs(BaseModel, nn.Module):
         prof.end("model_encoder", self._prof)
 
         prof.begin("model_tag_transformer_input_filter", self._prof)
-        # Apply input_filter in NCHW, then convert directly to transformer format [S,B,C]
+        # Option B: input_filter expects NCHW, returns NCHW
         filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
+        # Convert to NHWC for transformer flatten (semantic requirement)
+        filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
         prof.end("model_tag_transformer_input_filter", self._prof)
 
-        B_, C, h, w = filtered_nchw.shape
-        mem = filtered_nchw.flatten(2).permute(2, 0, 1).contiguous()  # [B,C,h*w] -> [h*w,B,C] = [S,B,C]
+        B_, h, w, C = filtered_nhwc.shape
+        mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
 
         prof.begin("model_tag_transformer_encoder", self._prof)
         mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
         prof.end("model_tag_transformer_encoder", self._prof)
 
-        # Pass both enc_out (for bbox) and mem_enc (for tag decode) to avoid duplicate processing
-        return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+        # Option B: Convert NCHW→NHWC once for bbox decoder (semantic requirement)
+        enc_out_batch_nhwc = enc_out_batch.permute(0, 2, 3, 1)  # [B, 28, 28, 256] NHWC
+        
+        # Pass both enc_out_nhwc (for bbox) and mem_enc (for tag decode) to avoid duplicate processing
+        return self._batched_decoder.predict_batched(enc_out_batch_nhwc, mem_enc, max_steps)
 
     def _log(self):
         # Setup a custom logger
