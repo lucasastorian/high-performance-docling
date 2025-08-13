@@ -181,31 +181,25 @@ class LayoutPredictor:
     # ----------- hot path (fixed shape + graphs) -----------
 
     @torch.inference_mode()
-    def _preprocess_batch(self, pil_images: List[Image.Image]) -> torch.Tensor:
+    def _preprocess_batch(self, pil_images: List[Image.Image], b: int) -> torch.Tensor:
         """
-        Returns CPU tensor [B,3,640,640], channels_last, pinned for async H2D.
-        Pads or truncates to FIXED_BS by design (caller ensures size).
+        Preprocess only the first b images (real images), zero out padding.
+        Returns device tensor [FIXED_BS,3,640,640] with stable address for CUDA graphs.
         """
+        # Preprocess only b real images (not the padded duplicates)
         if self._use_gpu_preprocess and self._gpu_preprocessor is not None:
-            # GPU preprocessor emits device tensor; we still copy into self._static_in (stable address).
-            pre = self._gpu_preprocessor.preprocess_batch(pil_images)
-            pixel_values = pre["pixel_values"]  # [B,3,640,640] on device
-            # Ensure channels_last; then copy into persistent buffer
-            pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
-            self._static_in.copy_(pixel_values, non_blocking=True)
-            return self._static_in  # already on device, correct address
+            pre = self._gpu_preprocessor.preprocess_batch(pil_images[:b])  # only b images
+            pv = pre["pixel_values"].contiguous(memory_format=torch.channels_last)
+            self._static_in[:b].copy_(pv, non_blocking=True)
         else:
-            # CPU path via HF processor; create pinned tensor for async H2D
-            inputs = self._image_preprocessor(images=pil_images, return_tensors="pt")
-            pixel_values = inputs.pixel_values  # [B,3,640,640] on CPU
-            # pin + channels_last + async H2D into persistent buffer
-            pixel_values = pixel_values.pin_memory()
-            # Copy into persistent buffer, maintaining stable device address
-            self._static_in.copy_(
-                pixel_values.to(dtype=self._static_in.dtype, non_blocking=True),
-                non_blocking=True
-            )
-            return self._static_in
+            inputs = self._image_preprocessor(images=pil_images[:b], return_tensors="pt")  # only b images
+            pv = inputs.pixel_values.pin_memory()
+            self._static_in[:b].copy_(pv.to(self._static_in.dtype, non_blocking=True), non_blocking=True)
+        
+        # Zero the padded part (fast set; fixed address, fixed shape)
+        if b < FIXED_BS:
+            self._static_in[b:].zero_()
+        return self._static_in
 
     def _to_pil_rgb(self, images: List[Union[Image.Image, np.ndarray]]) -> List[Image.Image]:
         out = []
@@ -279,7 +273,7 @@ class LayoutPredictor:
 
             with timer.time_section('preprocess'):
                 # Prepare static device input with stable address/shape
-                device_input = self._preprocess_batch(chunk)
+                device_input = self._preprocess_batch(chunk, b)  # only preprocess b real images
                 # Sanity: enforce memory format + shape
                 assert device_input.shape == (FIXED_BS, 3, FIXED_H, FIXED_W)
                 assert device_input.is_contiguous(memory_format=torch.channels_last)
