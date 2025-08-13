@@ -17,10 +17,11 @@ from docling.datamodel.settings import settings
 from docling.models.base_model import BasePageModel
 from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
-from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
 
+from standard.layout.layout_postprocessor import LayoutPostprocessor
+from standard.layout.layout_predictor import LayoutPredictor
 from base_models import BoundingBox, Cluster, LayoutPrediction, Page
 
 _log = logging.getLogger(__name__)
@@ -53,7 +54,6 @@ class LayoutModel(BasePageModel):
         accelerator_options: AcceleratorOptions,
         options: LayoutOptions,
     ):
-        from docling_ibm_models.layoutmodel.layout_predictor import LayoutPredictor
 
         self.options = options
 
