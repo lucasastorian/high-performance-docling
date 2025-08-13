@@ -64,6 +64,16 @@ class BatchedTableDecoderV2:
             [wm[t] for t in skip_names if t in wm],
             device=device, dtype=torch.long
         )
+        
+        # OPTIMIZATION 1: Replace torch.isin with LUTs for O(1) lookup
+        V = model._tag_transformer._fc.out_features  # Vocabulary size
+        self.emit_lut = torch.zeros(V, dtype=torch.bool, device=device)
+        if self.emit_ids.numel() > 0:
+            self.emit_lut[self.emit_ids] = True
+        
+        self.skip_lut = torch.zeros(V, dtype=torch.bool, device=device)
+        if self.skip_ids.numel() > 0:
+            self.skip_lut[self.skip_ids] = True
     
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
@@ -73,6 +83,23 @@ class BatchedTableDecoderV2:
             return seq_list[:idx + 1]
         except ValueError:
             return seq_list
+    
+    def _maybe_grow_buffer(self, buf: torch.Tensor, counters: torch.Tensor, needed_idx: torch.Tensor):
+        """FIX 2: Grow buffer on demand if any sample is about to overflow"""
+        if needed_idx.numel() == 0:
+            return buf, counters
+        
+        # Check if any sample needs more space
+        need = (counters[needed_idx] >= buf.size(1)).any()
+        if not bool(need):
+            return buf, counters
+        
+        # Grow by 50% + 8
+        new_K = int(buf.size(1) * 1.5 + 8)
+        B, Kold, D = buf.shape
+        grown = torch.empty(B, new_K, D, device=buf.device, dtype=buf.dtype)
+        grown[:, :Kold].copy_(buf)
+        return grown, counters
     
     @torch.inference_mode()
     def predict_batched(
@@ -104,16 +131,14 @@ class BatchedTableDecoderV2:
         line_num = torch.zeros(B, dtype=torch.long, device=device)
         bbox_ind = torch.zeros(B, dtype=torch.long, device=device)
         
-        # Per-sample bbox tracking (minimize CPU lists)
-        tag_H_flat = []
-        tag_H_sample_ids = []
-        open_span_start = [-1] * B  # Track one open span per sample
+        # OPTIMIZATION 2: Preallocate tag hidden states buffer [B, Kmax, D]
+        D = tt._embedding.embedding_dim
+        Kmax = max(1, Tmax // 2)  # Safe upper bound for tag hidden states
+        tag_H_buf = torch.empty(B, Kmax, D, device=device)
+        k_counters = torch.zeros(B, dtype=torch.int32, device=device)  # Track count per sample
         
-        # Helper for isin with guard
-        def safe_isin(vals: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-            if ids.numel() == 0:
-                return torch.zeros_like(vals, dtype=torch.bool)
-            return torch.isin(vals, ids)
+        # Per-sample span tracking
+        open_span_start = [-1] * B  # Track one open span per sample
         
         prof = AggProfiler()
         prof.begin("batched_ar_loop_v2", self._prof)
@@ -121,12 +146,17 @@ class BatchedTableDecoderV2:
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
-        pe = tt._positional_encoding.pe  # [max_len, D] positional encoding buffer
+        
+        # FIX 1: Clean PE shape handling - extract [Tmax+1, D] directly
+        pe = tt._positional_encoding.pe  # [max_len, 1, D] positional encoding buffer
+        pos_rows = pe[:Tmax + 1, 0]  # [Tmax+1, D] - clean 2D tensor, no awkward broadcasting
+        
+        # FIX 4: Prebuild end vector once
+        end_vec = torch.full((B,), self.end_id.item(), device=device, dtype=torch.long)
         
         # Initialize first step with start tokens
         start_row = decoded_tags[0, :]  # [B] start tokens
-        pos0 = pe[0].unsqueeze(0)  # [1, D] - extract position 0
-        tgt_emb_buf[0] = tt._embedding(start_row) + pos0  # [B,D]
+        tgt_emb_buf[0] = tt._embedding(start_row) + pos_rows[0]  # [B,D] + [D] broadcasts cleanly
         
         # Track current step
         t = 0
@@ -143,9 +173,10 @@ class BatchedTableDecoderV2:
             )
             prof.end("decoder_step", self._prof)
             
-            last_H = decoded[-1, :, :]       # [B,D]
-            logits = tt._fc(last_H)          # [B,V]
-            new_tags = logits.argmax(dim=1)  # [B] Long
+            # FIX: Ensure contiguous for better memory layout
+            last_H = decoded[-1].contiguous()  # [B,D]
+            logits = tt._fc(last_H)            # [B,V]
+            new_tags = logits.argmax(dim=1)    # [B] Long
             
             # ---- Structure corrections (all on GPU) ----
             if self.xcel_id is not None and self.lcel_id is not None:
@@ -157,8 +188,8 @@ class BatchedTableDecoderV2:
                 mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
                 new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
             
-            # Force <end> for already finished sequences
-            new_tags = torch.where(finished, self.end_id.expand(B), new_tags)
+            # Force <end> for already finished sequences - FIX 4: Use prebuilt end_vec
+            new_tags = torch.where(finished, end_vec, new_tags)
             
             # Write to preallocated buffer
             t += 1
@@ -166,8 +197,8 @@ class BatchedTableDecoderV2:
             
             # Update incremental embedding buffer for next step
             if t < Tmax:  # Only if we'll do another step
-                pos_t = pe[t].unsqueeze(0)  # [1, D] - extract position t
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_t  # [B,D]
+                # FIX 1: Use clean pos_rows without unsqueeze
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_rows[t]  # [B,D] + [D]
             
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
@@ -181,7 +212,9 @@ class BatchedTableDecoderV2:
                 break
             
             # ---- BBox emission decisions (minimize syncs) ----
-            m_emit_bbox = (~skip_next) & safe_isin(new_tags, self.emit_ids) & (~finished)
+            # OPTIMIZATION 1: Use LUT instead of torch.isin for O(1) lookup
+            emit_mask = self.emit_lut[new_tags]  # [B] bool - O(1) lookup
+            m_emit_bbox = (~skip_next) & emit_mask & (~finished)
             m_is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else torch.zeros(B, dtype=torch.bool, device=device)
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
             
@@ -190,13 +223,15 @@ class BatchedTableDecoderV2:
             if append_mask.any():
                 append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
                 if append_idx.numel() > 0:
-                    # Batch extract hidden states
+                    # FIX 2: Check and grow buffer if needed before writing
+                    tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
+                    
+                    # OPTIMIZATION 2: Write to preallocated buffer instead of list
                     rows = last_H.index_select(0, append_idx)  # [K,D]
-                    # Store flat with sample IDs (defer .tolist() to minimize syncs)
-                    append_idx_list = append_idx.tolist()  # Single sync point
-                    for i, (idx, row) in enumerate(zip(append_idx_list, rows)):
-                        tag_H_flat.append(row)
-                        tag_H_sample_ids.append(idx)
+                    slots = k_counters[append_idx].long()      # [K] - current slot for each sample
+                    flat_idx = append_idx * tag_H_buf.size(1) + slots  # [K] - use current buffer size
+                    tag_H_buf.view(-1, D).index_copy_(0, flat_idx, rows)  # Vectorized write
+                    k_counters[append_idx] += 1  # Increment counters
                     
                     # Handle span tracking (device operations where possible)
                     first_lcel_mask = m_first_lcel & append_mask
@@ -225,8 +260,8 @@ class BatchedTableDecoderV2:
             # Reset first_lcel=True on every non-lcel step (matches serial semantics)
             first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
             
-            # Update skip_next
-            skip_next = safe_isin(new_tags, self.skip_ids)
+            # Update skip_next - OPTIMIZATION 1: Use LUT instead of torch.isin
+            skip_next = self.skip_lut[new_tags]  # [B] bool - O(1) lookup
             
             # Update prev_ucel for NEXT iteration
             prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags, dtype=torch.bool)
@@ -246,22 +281,18 @@ class BatchedTableDecoderV2:
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
         
-        # Reconstruct per-sample tag_H buffers
-        tag_H_per_sample = [[] for _ in range(B)]
-        for h, sid in zip(tag_H_flat, tag_H_sample_ids):
-            if sid < B:
-                tag_H_per_sample[sid].append(h.unsqueeze(0))  # Keep [1,D] shape
-        
         # ---- Per-table bbox head (already vectorized) ----
         outputs = []
         prof.begin("batched_bbox_decode_v2", self._prof)
         for b in range(B):
-            tag_H_buf_b = tag_H_per_sample[b]
-            if self.model._bbox and len(tag_H_buf_b) > 0:
+            # OPTIMIZATION 2: Extract from preallocated buffer
+            k_b = int(k_counters[b].item())
+            if self.model._bbox and k_b > 0:
                 # Pass NCHW directly (bbox decoder optimized for NCHW)
                 enc_nchw = enc_out_batch[b:b+1]  # [1, 256, 28, 28] NCHW
+                tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] - extract used portion
                 cls_logits, coords = self.model._bbox_decoder.inference(
-                    enc_nchw, tag_H_buf_b
+                    enc_nchw, tag_H_tensor
                 )
             else:
                 cls_logits = torch.empty(0, device=device)

@@ -53,6 +53,7 @@ class Encoder04(nn.Module):
         self._gr_in = None
         self._gr_out = None
         self._gr = None
+
         self._gr_reuses_output = True  # caller must .clone() if they need a fresh tensor
         self._fused = False  # Track if Conv+BN fusion has been applied
         self._pool_checked = False  # Track if we've checked for no-op pool

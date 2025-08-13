@@ -173,16 +173,26 @@ class BBoxDecoder(nn.Module):
             enc_flat = enc_out_nchw.reshape(1, C, P).permute(0, 2, 1).reshape(P, C).contiguous()  # [P,C]
 
             # 3) Stack tag hidden states -> [N, D]
-            if len(tag_H) == 0:
-                empty = torch.empty(0, device=device, dtype=dtype)
-                return empty, empty
-
-            tag_H_stacked = []
-            for t in tag_H:
-                t = t.squeeze(0) if (t.dim() == 2 and t.size(0) == 1) else t.reshape(-1)
-                tag_H_stacked.append(t)
-            tag_H_stacked = torch.stack(tag_H_stacked, dim=0).to(device=device, dtype=dtype)  # [N, D]
-            N = tag_H_stacked.size(0)
+            # OPTIMIZATION 2: Handle both tensor and list inputs efficiently
+            if isinstance(tag_H, torch.Tensor):
+                # Already a tensor [N, D] from preallocated buffer
+                if tag_H.numel() == 0:
+                    empty = torch.empty(0, device=device, dtype=dtype)
+                    return empty, empty
+                tag_H_stacked = tag_H.to(device=device, dtype=dtype)
+                N = tag_H_stacked.size(0)
+            else:
+                # Legacy list path
+                if len(tag_H) == 0:
+                    empty = torch.empty(0, device=device, dtype=dtype)
+                    return empty, empty
+                
+                tag_H_stacked = []
+                for t in tag_H:
+                    t = t.squeeze(0) if (t.dim() == 2 and t.size(0) == 1) else t.reshape(-1)
+                    tag_H_stacked.append(t)
+                tag_H_stacked = torch.stack(tag_H_stacked, dim=0).to(device=device, dtype=dtype)  # [N, D]
+                N = tag_H_stacked.size(0)
 
             # 4) Precompute linear pieces (no broadcasts yet)
             # att layers (shared with original CellAttention to keep weights identical)
