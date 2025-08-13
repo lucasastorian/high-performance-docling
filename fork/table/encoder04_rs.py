@@ -8,6 +8,7 @@ import docling_ibm_models.tableformer.settings as s
 
 LOG_LEVEL = 20  # INFO
 
+
 class Encoder04(nn.Module):
     """
     ResNet-18 stem producing 256-channel feature maps at stride 16.
