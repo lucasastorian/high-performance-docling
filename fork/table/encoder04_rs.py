@@ -137,12 +137,16 @@ class Encoder04(nn.Module):
         self._pool_checked = True
 
     def _maybe_capture(self, C=3, H=448, W=448, device="cuda"):
-        """Capture CUDA Graph for fixed batch size encoding (Optimization 1)"""
+        """Capture CUDA Graph for fixed batch size encoding (Optimization 1)
+        
+        IMPORTANT: H and W should match your actual runtime image dimensions
+        to properly detect if adaptive pool is a no-op.
+        """
         dev = self._as_device(device)
         if not self._use_graphs or self._gr is not None or dev.type != "cuda":
             return
         
-        # Check for no-op pool (Optimization 2)
+        # Check for no-op pool with actual runtime dimensions (Optimization 2)
         self._check_adaptive_pool(H, W, dev)
         
         # Fuse Conv+BN before capturing graph (Optimization 3)
@@ -157,44 +161,35 @@ class Encoder04(nn.Module):
         
         # Warmup runs (3x) to ensure cuDNN algo selection and cache warming
         # cudnn.benchmark stays at its default (False) to avoid per-shape algo search
-        with torch.inference_mode():
-            if self._use_bf16:
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    for _ in range(3):
-                        y = self._adaptive_pool(self._resnet(static_in))
-                        torch.cuda.synchronize()
-                    # Get output shape for buffer allocation
-                    y = self._adaptive_pool(self._resnet(static_in))
-            else:
-                for _ in range(3):
-                    y = self._adaptive_pool(self._resnet(static_in))
-                    torch.cuda.synchronize()
-                # Get output shape for buffer allocation
-                y = self._adaptive_pool(self._resnet(static_in))
+        for _ in range(3):
+            _ = self.forward(static_in)
+            torch.cuda.synchronize()
         
-        # Allocate static output buffer
-        self._gr_out = torch.empty_like(y)  # same shape as output
+        # Get output shape for buffer allocation
+        y = self.forward(static_in)
+        self._gr_out = torch.empty_like(y)
         
-        # Capture graph - inline operations without calling forward()
+        # Capture graph using the same forward() path as runtime
         g = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         
-        if self._use_bf16:
-            # Capture with BF16 autocast
-            with torch.cuda.graph(g):
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                    y2 = self._adaptive_pool(self._resnet(static_in))
-                self._gr_out.copy_(y2)  # write into static buffer (outside autocast)
-        else:
-            # Capture without autocast
-            with torch.cuda.graph(g):
-                y2 = self._adaptive_pool(self._resnet(static_in))  # inline, no .to() calls
-                self._gr_out.copy_(y2)  # write into static buffer
+        with torch.cuda.graph(g):
+            y2 = self.forward(static_in)
+            self._gr_out.copy_(y2)  # write into static buffer
         
         self._gr_in = static_in
         self._gr = g
         self._log().info(f"CUDA Graph captured for encoder with BS={self._gr_bs} after warmup")
 
+    def get_graph_input_buffer(self) -> torch.Tensor:
+        """Get the static input buffer for direct writing (avoids copy)"""
+        return self._gr_in  # NHWC contiguous, shape [gr_bs, C, H, W]
+    
+    def graph_replay(self):
+        """Replay the graph (assumes input buffer already filled)"""
+        self._gr.replay()
+        return self._gr_out
+    
     def graph_forward(self, x):
         """Execute captured CUDA Graph (x must be [32,3,H,W] channels_last)"""
         assert x.is_contiguous(memory_format=torch.channels_last), "Input must be channels_last for graph replay"
