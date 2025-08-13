@@ -1,7 +1,7 @@
 # fork/table/batched_decoder_v3.py
 # Optimized Batched AR decoder with GPT-5 Phase 1 & 2 optimizations implemented
 # PHASE 1: Reduced GPU→CPU sync frequency - check "all finished" every 8 steps
-# PHASE 2: Reduced nonzero() calls from 3 to 2 per step - use global masks for span tracking
+# PHASE 2: Reduced nonzero() calls from 3 to 2 per step - CRITICAL: keep ~first_lcel in end condition
 
 import torch
 from dataclasses import dataclass
@@ -251,7 +251,6 @@ class BatchedTableDecoderV2:
             append_mask = m_emit_bbox | m_first_lcel
             append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
             if append_idx.numel() > 0:
-                if append_idx.numel() > 0:
                     # FIX 2: Check and grow buffer if needed before writing
                     tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
 
@@ -274,8 +273,9 @@ class BatchedTableDecoderV2:
                         span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
                         span_cnt[first_lcel_idx] += 1
 
-                    # ends: emit only & alive
-                    m_end_global = m_emit_bbox & (~finished)  # no need to subselect by append again
+                    # ends: emit only & already inside an open span (i.e., not first_lcel)
+                    # first_lcel==False means we've seen the first lcel and the span is open
+                    m_end_global = m_emit_bbox & (~first_lcel) & (~finished)
                     if m_end_global.any():
                         end_idx = m_end_global.nonzero(as_tuple=False).squeeze(1)
                         slot = (span_cnt[end_idx] - 1).clamp_min(0)
