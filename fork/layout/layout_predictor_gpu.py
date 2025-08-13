@@ -218,6 +218,16 @@ class LayoutPredictor:
                 raise TypeError("Unsupported input image format")
         return out
 
+    def _slice_model_output(self, outputs, b: int, full_bs: int):
+        """Preserve the exact HF ModelOutput subclass while slicing batch dimension."""
+        data = {}
+        for k, v in outputs.items():  # ModelOutput is dict-like
+            if isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == full_bs:
+                data[k] = v[:b]
+            else:
+                data[k] = v
+        return outputs.__class__(**data)
+
     def _postprocess(
         self,
         outputs,
@@ -280,10 +290,7 @@ class LayoutPredictor:
             # target_sizes is (H, W) per *real* image
             with timer.time_section('postprocess'):
                 # Slice model outputs to real batch size b before postprocessing
-                outputs_b = {
-                    "logits": outputs.logits[:b],
-                    "pred_boxes": outputs.pred_boxes[:b],
-                }
+                outputs_b = self._slice_model_output(outputs, b=b, full_bs=FIXED_BS)
                 target_sizes = torch.tensor([img.size[::-1] for img in chunk[:b]], dtype=torch.long)
                 res_cpu = self._postprocess(outputs_b, target_sizes=target_sizes)
 
