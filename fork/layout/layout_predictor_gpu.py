@@ -21,7 +21,7 @@ _log = logging.getLogger(__name__)
 _model_init_lock = threading.Lock()
 
 # ---- Static shape constants (graph-friendly) ----
-FIXED_BS = int(os.getenv("LAYOUT_FIXED_BS", "64"))
+FIXED_BS = int(os.getenv("LAYOUT_FIXED_BS", "32"))
 FIXED_H, FIXED_W = 640, 640
 
 # Recommended allocator setting (set in the environment before import/process start):
