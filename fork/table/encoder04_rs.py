@@ -39,9 +39,6 @@ class Encoder04(nn.Module):
         # Optional BF16
         self._use_bf16 = os.getenv("TABLE_ENCODER_BF16", "0") == "1"
 
-        # Move parameters and future activations to channels_last
-        self.to(device="cuda", memory_format=torch.channels_last)
-
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 

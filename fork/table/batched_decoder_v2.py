@@ -101,6 +101,23 @@ class BatchedTableDecoderV2:
         grown[:, :Kold].copy_(buf)
         return grown, counters
     
+    def _maybe_grow_spans(self, starts: torch.Tensor, ends: torch.Tensor, cnt: torch.Tensor, idx: torch.Tensor):
+        """Grow span buffers on demand if any sample is about to overflow"""
+        if idx.numel() == 0:
+            return starts, ends, cnt
+        
+        need = (cnt[idx] >= starts.size(1)).any()
+        if not bool(need):
+            return starts, ends, cnt
+        
+        newK = int(starts.size(1) * 1.5 + 8)
+        B = starts.size(0)
+        s2 = torch.full((B, newK), -1, device=starts.device, dtype=starts.dtype)
+        s2[:, :starts.size(1)] = starts
+        e2 = torch.full((B, newK), -1, device=ends.device, dtype=ends.dtype)
+        e2[:, :ends.size(1)] = ends
+        return s2, e2, cnt
+    
     @torch.inference_mode()
     def predict_batched(
         self,
@@ -119,9 +136,6 @@ class BatchedTableDecoderV2:
         decoded_tags = torch.full((Tmax + 1, B), self.end_id.item(), dtype=torch.long, device=device)
         decoded_tags[0, :] = self.start_id
         
-        # Initialize span maps correctly - one dict per sample
-        span_maps: List[Dict[int, int]] = [dict() for _ in range(B)]
-        
         # Device-only state tracking
         lengths = torch.zeros(B, dtype=torch.int32, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -137,8 +151,11 @@ class BatchedTableDecoderV2:
         tag_H_buf = torch.empty(B, Kmax, D, device=device)
         k_counters = torch.zeros(B, dtype=torch.int32, device=device)  # Track count per sample
         
-        # Per-sample span tracking
-        open_span_start = [-1] * B  # Track one open span per sample
+        # OPTIMIZATION: Tensorized span tracking - no more Python dicts/lists
+        Kspan = max(1, Tmax // 2)  # rough upper bound for spans
+        span_starts = torch.full((B, Kspan), -1, device=device, dtype=torch.long)
+        span_ends = torch.full((B, Kspan), -1, device=device, dtype=torch.long)
+        span_cnt = torch.zeros(B, device=device, dtype=torch.long)
         
         prof = AggProfiler()
         prof.begin("batched_ar_loop_v2", self._prof)
@@ -153,6 +170,10 @@ class BatchedTableDecoderV2:
         
         # FIX 4: Prebuild end vector once
         end_vec = torch.full((B,), self.end_id.item(), device=device, dtype=torch.long)
+        
+        # OPTIMIZATION 2: Prebuild mask constants to avoid re-allocations
+        onesB = torch.ones(B, dtype=torch.bool, device=device)
+        zerosB = torch.zeros(B, dtype=torch.bool, device=device)
         
         # Initialize first step with start tokens
         start_row = decoded_tags[0, :]  # [B] start tokens
@@ -178,17 +199,22 @@ class BatchedTableDecoderV2:
             logits = tt._fc(last_H)            # [B,V]
             new_tags = logits.argmax(dim=1)    # [B] Long
             
+            # OPTIMIZATION 2: Compute masks once and reuse
+            is_end = (new_tags == self.end_id)
+            is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB
+            emit = self.emit_lut[new_tags]
+            skip_now = self.skip_lut[new_tags]
+            
             # ---- Structure corrections (all on GPU) ----
             if self.xcel_id is not None and self.lcel_id is not None:
-                mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
-                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
+                new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
             
             # For ucel->lcel correction, check prev_ucel from PREVIOUS step
             if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
-                new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
+                new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
             
-            # Force <end> for already finished sequences - FIX 4: Use prebuilt end_vec
+            # Update finished and force <end> for already finished sequences
+            finished |= is_end
             new_tags = torch.where(finished, end_vec, new_tags)
             
             # Write to preallocated buffer
@@ -203,20 +229,14 @@ class BatchedTableDecoderV2:
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
             
-            # Update finished status
-            newly_finished = (new_tags == self.end_id)
-            finished |= newly_finished
-            
             # Early exit if all finished
             if finished.all():
                 break
             
             # ---- BBox emission decisions (minimize syncs) ----
-            # OPTIMIZATION 1: Use LUT instead of torch.isin for O(1) lookup
-            emit_mask = self.emit_lut[new_tags]  # [B] bool - O(1) lookup
-            m_emit_bbox = (~skip_next) & emit_mask & (~finished)
-            m_is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else torch.zeros(B, dtype=torch.bool, device=device)
-            m_first_lcel = first_lcel & m_is_lcel & (~finished)
+            # OPTIMIZATION 2: Use precomputed masks
+            m_emit_bbox = (~skip_next) & emit & (~finished)
+            m_first_lcel = first_lcel & is_lcel & (~finished)
             
             # Collect indices that need bbox features (minimize CPU syncs)
             append_mask = m_emit_bbox | m_first_lcel
@@ -233,38 +253,37 @@ class BatchedTableDecoderV2:
                     tag_H_buf.view(-1, D).index_copy_(0, flat_idx, rows)  # Vectorized write
                     k_counters[append_idx] += 1  # Increment counters
                     
-                    # Handle span tracking (device operations where possible)
-                    first_lcel_mask = m_first_lcel & append_mask
-                    if first_lcel_mask.any():
-                        first_lcel_idx = first_lcel_mask.nonzero(as_tuple=False).squeeze(1)
-                        # Record span starts - use bbox_ind BEFORE increment
-                        start_indices = bbox_ind[first_lcel_idx].tolist()  # Batch sync
-                        for sid, start in zip(first_lcel_idx.tolist(), start_indices):
-                            open_span_start[sid] = start  # Track open span start index
+                    # OPTIMIZATION: Tensorized span tracking - no CPU syncs
+                    # Handle span starts (first_lcel)
+                    first_lcel_idx = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(1)
+                    if first_lcel_idx.numel() > 0:
+                        span_starts, span_ends, span_cnt = self._maybe_grow_spans(
+                            span_starts, span_ends, span_cnt, first_lcel_idx
+                        )
+                        slot = span_cnt[first_lcel_idx]  # Current slot for each sample
+                        span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
+                        span_cnt[first_lcel_idx] += 1
                     
-                    # Handle span ends
-                    end_span_mask = m_emit_bbox & (~first_lcel) & append_mask
-                    if end_span_mask.any():
-                        end_idx = end_span_mask.nonzero(as_tuple=False).squeeze(1)
-                        end_indices = bbox_ind[end_idx].tolist()  # Batch sync
-                        for sid, end in zip(end_idx.tolist(), end_indices):
-                            start = open_span_start[sid]
-                            if start >= 0:  # -1 means no open span
-                                span_maps[sid][start] = end  # Record span for merging
-                                open_span_start[sid] = -1  # Close span
+                    # Handle span ends (emit but not first_lcel)
+                    end_idx = (m_emit_bbox & (~first_lcel) & append_mask & (~finished)).nonzero(as_tuple=False).squeeze(1)
+                    if end_idx.numel() > 0:
+                        # Write to the most recent start slot (cnt-1)
+                        slot = (span_cnt[end_idx] - 1).clamp_min(0)
+                        span_ends[end_idx, slot] = bbox_ind[end_idx]
                     
                     # Increment bbox indices
                     bbox_ind[append_idx] += 1
             
             # ---- Update flags (all on GPU) ----
-            # Reset first_lcel=True on every non-lcel step (matches serial semantics)
-            first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
+            # OPTIMIZATION 2: Simplified flag updates with precomputed masks
+            # first_lcel: true unless current is lcel (one kernel instead of where)
+            first_lcel = ~is_lcel | finished
             
-            # Update skip_next - OPTIMIZATION 1: Use LUT instead of torch.isin
-            skip_next = self.skip_lut[new_tags]  # [B] bool - O(1) lookup
+            # Update skip_next
+            skip_next = skip_now
             
             # Update prev_ucel for NEXT iteration
-            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags, dtype=torch.bool)
+            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else zerosB
             
             # Update line number
             if self.nl_id is not None:
@@ -298,12 +317,59 @@ class BatchedTableDecoderV2:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
             
-            # Merge spans
-            merged_cls, merged_coord = self._merge_spans(cls_logits, coords, span_maps[b])
+            # Merge spans using tensorized version
+            merged_cls, merged_coord = self._merge_spans_tensor(
+                cls_logits, coords, span_starts[b:b+1], span_ends[b:b+1], span_cnt[b:b+1]
+            )
             outputs.append((seqs[b], merged_cls, merged_coord))
         prof.end("batched_bbox_decode_v2", self._prof)
         
         return outputs
+    
+    def _merge_spans_tensor(self, cls_logits: torch.Tensor, coords: torch.Tensor, 
+                             starts: torch.Tensor, ends: torch.Tensor, cnt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tensorized span merging - no Python dicts"""
+        device = coords.device if coords is not None and coords.numel() > 0 else self.device
+        
+        if coords.numel() == 0:
+            return torch.empty(0, device=device), torch.empty(0, device=device)
+        
+        N = coords.size(0)
+        keep = torch.ones(N, device=device, dtype=torch.bool)
+        merged_cls = []
+        merged_coord = []
+        
+        # Build a dense map for start->end lookup
+        end_map = torch.full((N,), -1, device=device, dtype=torch.long)
+        nspans = int(cnt[0].item()) if cnt.numel() > 0 else 0
+        
+        if nspans > 0:
+            # Extract valid spans from the first sample (b=0)
+            valid = (starts[0, :nspans] >= 0) & (ends[0, :nspans] >= 0)
+            if valid.any():
+                st = starts[0, :nspans][valid]
+                ed = ends[0, :nspans][valid]
+                # Ensure indices are within bounds
+                valid_idx = (st < N) & (ed < N)
+                if valid_idx.any():
+                    st = st[valid_idx]
+                    ed = ed[valid_idx]
+                    end_map[st] = ed
+        
+        for i in range(N):
+            if not keep[i]:
+                continue
+            j = int(end_map[i].item())
+            if 0 <= j < N:
+                keep[j] = False
+                merged_cls.append(cls_logits[i])
+                merged_coord.append(self.model.mergebboxes(coords[i], coords[j]))
+            else:
+                merged_cls.append(cls_logits[i])
+                merged_coord.append(coords[i])
+        
+        return (torch.stack(merged_cls) if merged_cls else torch.empty(0, device=device),
+                torch.stack(merged_coord) if merged_coord else torch.empty(0, device=device))
     
     def _merge_spans(self, cls_logits: torch.Tensor, coords: torch.Tensor, merge_map: Dict[int, int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Merge bbox spans according to merge_map"""
