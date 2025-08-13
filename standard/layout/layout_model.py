@@ -10,7 +10,6 @@ from docling_core.types.doc import DocItemLabel
 from PIL import Image
 
 from docling.datamodel.accelerator_options import AcceleratorOptions
-from docling.datamodel.base_models import BoundingBox, Cluster, LayoutPrediction, Page
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_V2, LayoutModelConfig
 from docling.datamodel.pipeline_options import LayoutOptions
@@ -21,6 +20,8 @@ from docling.utils.accelerator_utils import decide_device
 from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import TimeRecorder
 from docling.utils.visualization import draw_clusters
+
+from base_models import BoundingBox, Cluster, LayoutPrediction, Page
 
 _log = logging.getLogger(__name__)
 

@@ -8,7 +8,6 @@ from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell
 from docling_core.types.doc.page import BoundingRectangle, TextCellUnit
 
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-from docling.datamodel.base_models import Table, TableStructurePrediction
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import TableFormerMode, TableStructureOptions
 from docling.datamodel.settings import settings
@@ -17,8 +16,7 @@ from docling.models.utils.hf_model_download import download_hf_model
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import TimeRecorder
 
-from page_model import Page
-
+from base_models import Table, TableStructurePrediction, Page
 from standard.table.tf_predictor import TFPredictor
 
 
