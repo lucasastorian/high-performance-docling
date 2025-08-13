@@ -736,7 +736,9 @@ class TFPredictor:
         AggProfiler().start_agg(self._prof)
         
         # Create timer for detailed TF predictor timing
-        timer = _CudaTimer() if self._device == 'cuda' else _CPUTimer()
+        # Fix: Check device type properly (handles 'cuda:0', 'cuda:1', etc.)
+        is_cuda = str(self._device).startswith('cuda')
+        timer = _CudaTimer() if is_cuda else _CPUTimer()
 
         # --- 1) Image preprocessing (original semantics, but batched) ---
         with timer.time_section('image_preprocessing'):

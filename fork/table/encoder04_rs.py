@@ -86,6 +86,22 @@ class Encoder04(nn.Module):
         # Step 2: Compile if requested (mutually exclusive with manual graphs)
         if self._use_compile and not self._compiled:
             self._maybe_compile(device=dev)
+            
+            # CRITICAL: Warm up the compiled model so first real inference isn't slow
+            # This triggers torch.compile's graph compilation/JIT outside of timing
+            if dev.type == "cuda":
+                self._log().info("Warming up compiled model...")
+                B = self._gr_bs
+                C, H, W = 3, 448, 448  # Standard input dimensions
+                dummy = torch.zeros(B, C, H, W, device=dev).contiguous(memory_format=torch.channels_last)
+                torch.cuda.synchronize()
+                
+                # 2-3 warmup runs to trigger compilation and cache
+                for i in range(3):
+                    _ = self.forward(dummy)
+                    torch.cuda.synchronize()
+                
+                self._log().info("Compiled model warmup complete")
         
         # Step 3: Capture CUDA graphs if requested (only if not compiled)
         elif self._use_graphs and self._gr is None and dev.type == "cuda":
