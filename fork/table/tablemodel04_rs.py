@@ -40,8 +40,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Encoder
         self._enc_image_size = config["model"]["enc_image_size"]
         self._encoder = Encoder04(self._enc_image_size).to(device)
-        # Use actual encoder dim (256) not config dim (often 512)
-        self._encoder_dim = self._encoder.get_encoder_dim()  # 256
+        # CRITICAL: use config hidden_dim (512) to match checkpoint bbox decoder shapes
+        self._encoder_dim = config["model"]["hidden_dim"]  # 512, not actual encoder output (256)
 
         tag_vocab_size = len(word_map["word_map_tag"])
 

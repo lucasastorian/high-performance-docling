@@ -77,7 +77,7 @@ class BatchedTableDecoderV2:
     @torch.inference_mode()
     def predict_batched(
         self,
-        enc_out_batch: torch.Tensor,   # [B,C,H,W] NCHW for bbox head
+        enc_out_batch: torch.Tensor,   # [B,C,H,W] NCHW - converted to NHWC for bbox decoder
         mem_enc: torch.Tensor,         # [S,B,D] encoder memory
         max_steps: int
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
@@ -258,10 +258,10 @@ class BatchedTableDecoderV2:
         for b in range(B):
             tag_H_buf_b = tag_H_per_sample[b]
             if self.model._bbox and len(tag_H_buf_b) > 0:
-                # enc_out_batch is now NCHW format, pass directly to bbox decoder
-                enc_nchw = enc_out_batch[b:b+1]  # Already NCHW
+                # Convert NCHW to NHWC for bbox decoder (expects NHWC)
+                enc_nhwc = enc_out_batch[b:b+1].permute(0, 2, 3, 1)
                 cls_logits, coords = self.model._bbox_decoder.inference(
-                    enc_nchw, tag_H_buf_b
+                    enc_nhwc, tag_H_buf_b
                 )
             else:
                 cls_logits = torch.empty(0, device=device)
