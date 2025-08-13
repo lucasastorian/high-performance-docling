@@ -4,7 +4,6 @@
 import torch
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
-from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 
 @dataclass
@@ -123,7 +122,8 @@ class BatchedTableDecoderV2:
         self,
         enc_out_batch: torch.Tensor,   # [B,C,H,W] NCHW - bbox decoder optimized for NCHW
         mem_enc: torch.Tensor,         # [S,B,D] encoder memory (precomputed, no duplicate processing)
-        max_steps: int
+        max_steps: int,
+        timer=None                      # Optional timer for detailed profiling
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
         device = self.device
         tt = self.tt
@@ -163,8 +163,9 @@ class BatchedTableDecoderV2:
         span_ends = torch.full((B, Kspan), -1, device=device, dtype=torch.long)
         span_cnt = torch.zeros(B, device=device, dtype=torch.long)
         
-        prof = AggProfiler()
-        prof.begin("batched_ar_loop_v2", self._prof)
+        # ===== AR LOOP TIMING =====
+        if timer:
+            timer.start_section('ar_loop')
         
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = E.embedding_dim
@@ -189,16 +190,15 @@ class BatchedTableDecoderV2:
         t = 0
         cache = None
         
+        # AR LOOP
         for step in range(Tmax):
             # Use incremental embedding buffer - only pass what we've computed so far
             tgt = tgt_emb_buf[:t+1, :, :]  # [t+1,B,D] - grows each step
             
             # Transformer decoder with cache
-            prof.begin("decoder_step", self._prof)
             decoded, cache = decoder(
                 tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
             )
-            prof.end("decoder_step", self._prof)
             
             # FIX: Ensure contiguous for better memory layout
             last_H = decoded[-1].contiguous()  # [B,D]
@@ -234,9 +234,9 @@ class BatchedTableDecoderV2:
             
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
-            
-            # Early exit if all finished
-            if finished.all():
+
+            alive = (~finished).sum()
+            if int(alive.item()) == 0:  # one sync, not each step
                 break
             
             # ---- BBox emission decisions (minimize syncs) ----
@@ -246,8 +246,8 @@ class BatchedTableDecoderV2:
             
             # Collect indices that need bbox features (minimize CPU syncs)
             append_mask = m_emit_bbox | m_first_lcel
-            if append_mask.any():
-                append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
+            append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
+            if append_idx.numel() > 0:
                 if append_idx.numel() > 0:
                     # FIX 2: Check and grow buffer if needed before writing
                     tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
@@ -295,7 +295,9 @@ class BatchedTableDecoderV2:
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
         
-        prof.end("batched_ar_loop_v2", self._prof)
+        # End AR loop timing
+        if timer:
+            timer.end_section('ar_loop')
         
         # ---- Materialize outputs (minimal sync points) ----
         # Trim sequences to actual length
@@ -308,27 +310,34 @@ class BatchedTableDecoderV2:
         
         # ---- Per-table bbox head (already vectorized) ----
         outputs = []
-        prof.begin("batched_bbox_decode_v2", self._prof)
-        for b in range(B):
-            # OPTIMIZATION 2: Extract from preallocated buffer
-            k_b = int(k_counters[b].item())
+        
+        if timer:
+            timer.start_section('bbox_decode')
+
+        # ONE sync here instead of B syncs
+        k_list = k_counters.detach().cpu().tolist()  # length B
+        cnt_list = span_cnt.detach().cpu().tolist()  # length B
+
+        for b, k_b in enumerate(k_list):
             if self.model._bbox and k_b > 0:
-                # Pass NCHW directly (bbox decoder optimized for NCHW)
-                enc_nchw = enc_out_batch[b:b+1]  # [1, 256, 28, 28] NCHW
-                tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] - extract used portion
-                cls_logits, coords = self.model._bbox_decoder.inference(
-                    enc_nchw, tag_H_tensor
-                )
+                enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
+                tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
+                cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
             else:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
-            
-            # Merge spans using tensorized version
+
+            # Use the already-host materialized span count for indexing safety
+            nspans_b = cnt_list[b]
             merged_cls, merged_coord = self._merge_spans_tensor(
-                cls_logits, coords, span_starts[b:b+1], span_ends[b:b+1], span_cnt[b:b+1]
+                cls_logits, coords,
+                span_starts[b:b + 1], span_ends[b:b + 1],
+                span_cnt[b:b + 1]  # ok to pass the GPU tensors; we just avoided per-step .item()
             )
             outputs.append((seqs[b], merged_cls, merged_coord))
-        prof.end("batched_bbox_decode_v2", self._prof)
+
+        if timer:
+            timer.end_section('bbox_decode')
         
         return outputs
     

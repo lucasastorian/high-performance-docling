@@ -11,6 +11,7 @@ import torch.nn as nn
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
+from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
@@ -152,48 +153,52 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._tag_transformer.eval()
         self._bbox_decoder.eval()
 
-        prof = AggProfiler()
+        # Use proper timer based on device
+        is_cuda = str(self._device).startswith('cuda')
+        timer = _CudaTimer() if is_cuda else _CPUTimer()
 
         # ===== ENCODER TIMING =====
-        prof.begin("total_encoder", self._prof)
-        
-        # Image encoding
-        prof.begin("encoder_forward", self._prof)
-        enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
-        prof.end("encoder_forward", self._prof)
-        
-        prof.end("total_encoder", self._prof)
+        with timer.time_section('encoder_forward'):
+            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
 
         # ===== MEMORY PREPARATION =====
-        prof.begin("memory_preparation", self._prof)
+        with timer.time_section('tag_input_filter'):
+            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
         
-        # Input filter (conv layer)
-        prof.begin("tag_input_filter", self._prof)
-        filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
-        prof.end("tag_input_filter", self._prof)
-        
-        # Memory reshape and permute
-        prof.begin("memory_reshape", self._prof)
-        filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
-        B_, h, w, C = filtered_nhwc.shape
-        mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
-        prof.end("memory_reshape", self._prof)
-        
-        prof.end("memory_preparation", self._prof)
+        with timer.time_section('memory_reshape'):
+            filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
+            B_, h, w, C = filtered_nhwc.shape
+            mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
         
         # ===== TAG TRANSFORMER ENCODER =====
-        prof.begin("tag_encoder", self._prof)
-        mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
-        prof.end("tag_encoder", self._prof)
+        with timer.time_section('tag_encoder'):
+            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
 
         # ===== BATCHED DECODER =====
-        prof.begin("total_decoder", self._prof)
-        results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
-        prof.end("total_decoder", self._prof)
+        with timer.time_section('batched_ar_decoder'):
+            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps, timer)
         
-        # Print timing summary if profiling enabled
+        # Finalize and print timing if profiling enabled
         if self._prof:
-            prof.print_summary()
+            timer.finalize()
+            total_time = (timer.get_time('encoder_forward') + timer.get_time('tag_input_filter') + 
+                         timer.get_time('memory_reshape') + timer.get_time('tag_encoder') + 
+                         timer.get_time('batched_ar_decoder'))
+            print(f"\n=== TableModel Timing (B={B}) ===")
+            print(f"  encoder_forward:    {timer.get_time('encoder_forward'):7.1f} ms")
+            print(f"  tag_input_filter:   {timer.get_time('tag_input_filter'):7.1f} ms")
+            print(f"  memory_reshape:     {timer.get_time('memory_reshape'):7.1f} ms")
+            print(f"  tag_encoder:        {timer.get_time('tag_encoder'):7.1f} ms")
+            print(f"  batched_ar_decoder: {timer.get_time('batched_ar_decoder'):7.1f} ms")
+            
+            # Print decoder breakdown if available
+            if timer.get_time('ar_loop') > 0:
+                print(f"\n  === Decoder Breakdown ===")
+                print(f"    ar_loop:          {timer.get_time('ar_loop'):7.1f} ms")
+                print(f"    bbox_decode:      {timer.get_time('bbox_decode'):7.1f} ms")
+            
+            print(f"  ---------------------------")
+            print(f"  TOTAL:              {total_time:7.1f} ms\n")
         
         return results
 
