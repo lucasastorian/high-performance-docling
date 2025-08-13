@@ -353,32 +353,27 @@ class BatchedTableDecoderV3:
         if timer:
             timer.end_section('bbox_prep')
 
-        if timer:
-            timer.start_section('bbox_inference')
-        
         for b, k_b in enumerate(k_list):
-            if self.model._bbox and k_b > 0:
-                enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
-                tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
-                cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
-            else:
-                cls_logits = torch.empty(0, device=device)
-                coords = torch.empty(0, device=device)
+            with timer.time_section('bbox_inference') if timer else nullcontext():
+                if self.model._bbox and k_b > 0:
+                    enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
+                    tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
+                    cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
+                else:
+                    cls_logits = torch.empty(0, device=device)
+                    coords = torch.empty(0, device=device)
 
-            # Use the already-host materialized span count for indexing safety
-            nspans_b = cnt_list[b]
-            merged_cls, merged_coord = self._merge_spans_tensor(
-                cls_logits, coords,
-                span_starts[b:b + 1], span_ends[b:b + 1],
-                span_cnt[b:b + 1]  # ok to pass the GPU tensors; we just avoided per-step .item()
-            )
-            outputs.append((seqs[b], merged_cls, merged_coord))
+            with timer.time_section('span_merging') if timer else nullcontext():
+                # Use the already-host materialized span count for indexing safety
+                nspans_b = cnt_list[b]
+                merged_cls, merged_coord = self._merge_spans_tensor(
+                    cls_logits, coords,
+                    span_starts[b:b + 1], span_ends[b:b + 1],
+                    span_cnt[b:b + 1]  # ok to pass the GPU tensors; we just avoided per-step .item()
+                )
+                outputs.append((seqs[b], merged_cls, merged_coord))
 
         if timer:
-            timer.end_section('bbox_inference')
-            timer.start_section('span_merging')
-            # Span merging happens inside _merge_spans_tensor for each table
-            timer.end_section('span_merging')
             timer.end_section('bbox_decode')
             
             # Print detailed timing breakdown
