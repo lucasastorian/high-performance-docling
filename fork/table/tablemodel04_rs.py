@@ -14,6 +14,7 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
 from fork.table.transformer_rs import Tag_Transformer
+from fork.table.batched_decoder import BatchedTableDecoder
 
 LOG_LEVEL = logging.WARN
 
@@ -105,6 +106,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._skip_ids = torch.stack([self._ids[n] for n in _skip_names if n in self._ids]) \
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
+        self._batched_decoder = BatchedTableDecoder(self, self._device)
+
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
         """
@@ -132,11 +135,6 @@ class TableModel04_rs(BaseModel, nn.Module):
         prof.begin("model_tag_transformer_encoder", self._prof)
         mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
         prof.end("model_tag_transformer_encoder", self._prof)
-
-        # Stage 3: one AR loop for the whole batch
-        if not hasattr(self, "_batched_decoder"):
-            from optimized.table.batched_decoder import BatchedTableDecoder
-            self._batched_decoder = BatchedTableDecoder(self, self._device)
 
         return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
