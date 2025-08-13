@@ -33,7 +33,7 @@ class TableModel04_rs(BaseModel, nn.Module):
     def __init__(self, config, init_data, device):
         super(TableModel04_rs, self).__init__(config, init_data, device)
 
-        self._prof = config["predict"].get("profiling", False)
+        self._prof = True
         self._device = device
         # Extract the word_map from the init_data
         word_map = init_data["word_map"]
