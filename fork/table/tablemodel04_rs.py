@@ -109,7 +109,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
         self._batched_decoder = BatchedTableDecoderV2(self, self._device)
-        
+
         # Enable fast kernels where safe
         if device == 'cuda':
             # Don't enable benchmark globally - it interferes with CUDA Graphs!
@@ -117,97 +117,62 @@ class TableModel04_rs(BaseModel, nn.Module):
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
-        
+
         # Optimization 8: Optionally disable gradients globally for inference
         if os.getenv("DISABLE_GRAD", "1") == "1":
             torch.set_grad_enabled(False)
-        
+
         # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
     def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
-        """
-        Encode images in fixed-size blocks with CUDA Graphs (Optimization 1 & 2).
-        Preallocates output to avoid cat() overhead.
-        """
         B0, C, H, W = imgs.shape
         device = imgs.device
-        
-        # Ensure Conv+BN fusion and pool check on first call
+
+        # Ensure encoder is prepared
         if not self._encoder._fused and not self._encoder.training:
             self._encoder._fuse_conv_bn()
         if not self._encoder._pool_checked and device.type == 'cuda':
             self._encoder._check_adaptive_pool(H, W, device)
-        
-        # Capture CUDA Graph on first call (includes warmup)
         if device.type == 'cuda':
             self._encoder._maybe_capture(C=C, H=H, W=W, device=device)
-        
-        # If batch is small, just run directly without blocking
+
+        # Small batch or no captured graph → just run directly
         if B0 <= block_bs // 2 or not getattr(self._encoder, "_gr", None):
-            # Ensure channels_last format
-            imgs_cl = imgs.contiguous(memory_format=torch.channels_last) if not imgs.is_contiguous(memory_format=torch.channels_last) else imgs
+            imgs_cl = imgs if imgs.is_contiguous(memory_format=torch.channels_last) \
+                else imgs.contiguous(memory_format=torch.channels_last)
             return self._encoder(imgs_cl)
-        
-        # Calculate padding for block alignment
-        pad = (block_bs - (B0 % block_bs)) % block_bs
-        B_padded = B0 + pad
-        
-        # Preallocate output buffer (Optimization 2)
-        # First, get output shape by running a single sample
+
+        # Preallocate output with real size (no padding)
         with torch.inference_mode():
-            sample = imgs[:1].to(memory_format=torch.channels_last)
-            y0 = self._encoder(sample)
-        _, out_C, out_H, out_W = y0.shape  # NCHW output
-        enc_out = torch.empty((B_padded, out_C, out_H, out_W), 
-                             device=device, dtype=y0.dtype)  # NCHW
-        
-        # Process in blocks - Optimization 3: avoid cat() by preallocating chunk buffer
-        # CRITICAL: Allocate chunk_buffer in channels_last format from the start!
-        chunk_buffer = torch.empty((block_bs, C, H, W), device=device, dtype=imgs.dtype,
-                                  memory_format=torch.channels_last)
-        
-        for i in range(0, B_padded, block_bs):
-            end_idx = min(i + block_bs, B0)
-            
-            if end_idx > i:  # We have real images
-                real_count = end_idx - i
-                # Copy real images to chunk buffer (ensure channels_last)
-                imgs_slice = imgs[i:end_idx]
-                if not imgs_slice.is_contiguous(memory_format=torch.channels_last):
-                    imgs_slice = imgs_slice.contiguous(memory_format=torch.channels_last)
-                chunk_buffer[:real_count] = imgs_slice
-                # Pad with last image if needed (no cat!)
-                if real_count < block_bs:
-                    last_img = imgs[end_idx - 1]
-                    if not last_img.is_contiguous(memory_format=torch.channels_last):
-                        last_img = last_img.contiguous(memory_format=torch.channels_last)
-                    for j in range(real_count, block_bs):
-                        chunk_buffer[j] = last_img
-            else:
-                # All padding (shouldn't happen with correct logic)
-                last_img = imgs[-1]
-                if not last_img.is_contiguous(memory_format=torch.channels_last):
-                    last_img = last_img.contiguous(memory_format=torch.channels_last)
-                for j in range(block_bs):
-                    chunk_buffer[j] = last_img
-            
-            # chunk_buffer is already channels_last, no conversion needed!
-            chunk = chunk_buffer
-            
-            # Use CUDA Graph if available
-            if getattr(self._encoder, "_gr", None) and chunk.shape[0] == block_bs:
-                y = self._encoder.graph_forward(chunk)
-                # Clone to detach from static buffer
-                y = y.clone()
-            else:
-                y = self._encoder(chunk)
-            
-            # Copy to preallocated buffer
-            enc_out[i:i+block_bs].copy_(y, non_blocking=True)
-        
-        # Return only the non-padded portion
-        return enc_out[:B0]
+            y0 = self._encoder(imgs[:1].contiguous(memory_format=torch.channels_last))
+        _, out_C, out_H, out_W = y0.shape
+        enc_out = torch.empty((B0, out_C, out_H, out_W), device=device, dtype=y0.dtype)
+
+        # Full blocks with CUDA graph
+        full = (B0 // block_bs) * block_bs
+        if full > 0:
+            chunk_buffer = torch.empty((block_bs, C, H, W), device=device, dtype=imgs.dtype,
+                                       memory_format=torch.channels_last)
+            for i in range(0, full, block_bs):
+                # Always slice → rank 4
+                slice_ = imgs[i:i + block_bs]
+                if not slice_.is_contiguous(memory_format=torch.channels_last):
+                    slice_ = slice_.contiguous(memory_format=torch.channels_last)
+                chunk_buffer.copy_(slice_, non_blocking=True)
+                y = self._encoder.graph_forward(chunk_buffer).clone()
+                enc_out[i:i + block_bs].copy_(y, non_blocking=True)
+
+        # Remainder (no graph, no padding)
+        rem = B0 - full
+        if rem:
+            tail = imgs[full:B0]
+            if not tail.is_contiguous(memory_format=torch.channels_last):
+                tail = tail.contiguous(memory_format=torch.channels_last)
+            y_tail = self._encoder(tail)
+            enc_out[full:B0].copy_(y_tail, non_blocking=True)
+
+        return enc_out
 
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
@@ -222,7 +187,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._bbox_decoder.eval()
 
         prof = AggProfiler()
-        
+
         prof.begin("model_encoder", self._prof)
         # Use blocked encoding with CUDA Graphs and preallocated output
         enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
