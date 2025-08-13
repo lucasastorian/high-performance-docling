@@ -93,18 +93,18 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Setup a custom logger
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
-    def mergebboxes(self, bbox1, bbox2):
+    def mergebboxes(self, bbox1: torch.Tensor, bbox2: torch.Tensor) -> torch.Tensor:
+        """Merge two bboxes using pure tensor ops to avoid CPU sync"""
         new_w = (bbox2[0] + bbox2[2] / 2) - (bbox1[0] - bbox1[2] / 2)
         new_h = (bbox2[1] + bbox2[3] / 2) - (bbox1[1] - bbox1[3] / 2)
 
         new_left = bbox1[0] - bbox1[2] / 2
-        new_top = min((bbox2[1] - bbox2[3] / 2), (bbox1[1] - bbox1[3] / 2))
+        new_top = torch.minimum(bbox2[1] - bbox2[3] / 2, bbox1[1] - bbox1[3] / 2)
 
         new_cx = new_left + new_w / 2
         new_cy = new_top + new_h / 2
 
-        bboxm = torch.tensor([new_cx, new_cy, new_w, new_h])
-        return bboxm
+        return torch.stack([new_cx, new_cy, new_w, new_h])  # stays on same device/dtype
 
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
@@ -115,21 +115,32 @@ class TableModel04_rs(BaseModel, nn.Module):
         """
         B = imgs.size(0)
         
+        # Set modules to eval mode for deterministic behavior
+        self._encoder.eval()
+        self._tag_transformer.eval()
+        self._bbox_decoder.eval()
+        
         # Stage 1: Batch the image encoder for all images at once
         # enc_out_batch: [B, H, W, C] where H=W=28, C=256
+        AggProfiler().begin("model_encoder", self._prof)
         enc_out_batch = self._encoder(imgs)
+        AggProfiler().end("model_encoder", self._prof)
         
         # Stage 1: Apply input_filter to entire batch and prepare transformer memory
         # Apply CNN filter: [B,C,H,W] -> [B,h,w,C] where h=w=28, C=512  
+        AggProfiler().begin("model_tag_transformer_input_filter", self._prof)
         filtered_batch = self._tag_transformer._input_filter(
             enc_out_batch.permute(0, 3, 1, 2)
         ).permute(0, 2, 3, 1)
+        AggProfiler().end("model_tag_transformer_input_filter", self._prof)
         
         # Flatten spatial dims and transpose for transformer: [B,h,w,C] -> [S,B,C]
         memory_batch = self._flatten_hw_to_sbc(filtered_batch)
         
         # Stage 1: Run transformer encoder once for the entire batch with no mask
+        AggProfiler().begin("model_tag_transformer_encoder", self._prof)
         encoder_out_batch = self._tag_transformer._encoder(memory_batch, mask=None)
+        AggProfiler().end("model_tag_transformer_encoder", self._prof)
         
         # Decoder still runs per-item (Stage 2 will batch this too)
         results = []
@@ -191,7 +202,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                 decoded_embedding,
                 encoder_out,  # Use precomputed encoder output
                 cache,
-                memory_key_padding_mask=encoder_mask,
+                memory_key_padding_mask=None,  # No padding mask for dense image features
             )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
@@ -285,8 +296,11 @@ class TableModel04_rs(BaseModel, nn.Module):
         else:
             outputs_class, outputs_coord = None, None
 
-        outputs_class.to(self._device)
-        outputs_coord.to(self._device)
+        # Guard .to() calls and actually use the return values
+        if outputs_class is not None:
+            outputs_class = outputs_class.to(self._device)
+        if outputs_coord is not None:
+            outputs_coord = outputs_coord.to(self._device)
 
         ########################################################################################
         # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
@@ -300,11 +314,16 @@ class TableModel04_rs(BaseModel, nn.Module):
             box1 = outputs_coord[box_ind].to(self._device)
             cls1 = outputs_class[box_ind].to(self._device)
             if box_ind in bboxes_to_merge:
-                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
-                boxes_to_skip.append(bboxes_to_merge[box_ind])
-                boxm = self.mergebboxes(box1, box2).to(self._device)
-                outputs_coord1.append(boxm)
-                outputs_class1.append(cls1)
+                j = bboxes_to_merge[box_ind]
+                if j >= 0:  # Valid merge target
+                    box2 = outputs_coord[j].to(self._device)
+                    boxes_to_skip.append(j)
+                    boxm = self.mergebboxes(box1, box2)
+                    outputs_coord1.append(boxm)
+                    outputs_class1.append(cls1)
+                else:  # Open span (-1): keep box1 as-is
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
             else:
                 if box_ind not in boxes_to_skip:
                     outputs_coord1.append(box1)
@@ -371,15 +390,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         enc_inputs = enc_inputs.permute(1, 0, 2)
         positions = enc_inputs.shape[0]
 
-        encoder_mask = torch.zeros(
-            (batch_size * n_heads, positions, positions), device=self._device
-        ) == torch.ones(
-            (batch_size * n_heads, positions, positions), device=self._device
-        )
+        # No mask needed for dense image features (Stage 1 consistency)
+        encoder_mask = None
 
         # Invoking tag transformer encoder before the loop to save time
         AggProfiler().begin("model_tag_transformer_encoder", self._prof)
-        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=encoder_mask)
+        encoder_out = self._tag_transformer._encoder(enc_inputs, mask=None)
         AggProfiler().end("model_tag_transformer_encoder", self._prof)
 
         decoded_tags = (
@@ -410,7 +426,7 @@ class TableModel04_rs(BaseModel, nn.Module):
                 decoded_embedding,
                 encoder_out,
                 cache,
-                memory_key_padding_mask=encoder_mask,
+                memory_key_padding_mask=None,  # No padding mask for dense image features
             )
             AggProfiler().end("model_tag_transformer_decoder", self._prof)
             # Grab last feature to produce token
@@ -520,11 +536,16 @@ class TableModel04_rs(BaseModel, nn.Module):
             box1 = outputs_coord[box_ind].to(self._device)
             cls1 = outputs_class[box_ind].to(self._device)
             if box_ind in bboxes_to_merge:
-                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
-                boxes_to_skip.append(bboxes_to_merge[box_ind])
-                boxm = self.mergebboxes(box1, box2).to(self._device)
-                outputs_coord1.append(boxm)
-                outputs_class1.append(cls1)
+                j = bboxes_to_merge[box_ind]
+                if j >= 0:  # Valid merge target
+                    box2 = outputs_coord[j].to(self._device)
+                    boxes_to_skip.append(j)
+                    boxm = self.mergebboxes(box1, box2)
+                    outputs_coord1.append(boxm)
+                    outputs_class1.append(cls1)
+                else:  # Open span (-1): keep box1 as-is
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
             else:
                 if box_ind not in boxes_to_skip:
                     outputs_coord1.append(box1)
