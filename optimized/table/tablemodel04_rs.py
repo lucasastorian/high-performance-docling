@@ -139,6 +139,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         imgs: [B, 3, 448, 448]
         Returns: list of tuples (seq, outputs_class, outputs_coord) per table.
         """
+        print(f"Running optimized predict inference.")
         prof = AggProfiler()
         prof.begin("predict_total", self._prof)
 
