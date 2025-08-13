@@ -16,6 +16,7 @@
 #   - span_merging: Merging spans (measured on last table)
 
 import torch
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
@@ -211,42 +212,38 @@ class BatchedTableDecoderV3:
 
         # AR LOOP
         for step in range(Tmax):
-            if timer:
-                timer.start_section('ar_transformer')  # Time transformer forward passes
             # Use incremental embedding buffer - only pass what we've computed so far
             tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
 
             # Transformer decoder with cache
-            decoded, cache = decoder(
-                tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
-            )
+            with timer.time_section('ar_transformer') if timer else nullcontext():
+                decoded, cache = decoder(
+                    tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
+                )
 
-            # FIX: Ensure contiguous for better memory layout
-            last_H = decoded[-1].contiguous()  # [B,D]
-            logits = FC(last_H)  # [B,V] - use cached reference
-            new_tags = logits.argmax(dim=1)  # [B] Long
-
-            if timer:
-                timer.end_section('ar_transformer')
-                timer.start_section('ar_masking')  # Time mask computations
+                # FIX: Ensure contiguous for better memory layout
+                last_H = decoded[-1].contiguous()  # [B,D]
+                logits = FC(last_H)  # [B,V] - use cached reference
+                new_tags = logits.argmax(dim=1)  # [B] Long
 
             # OPTIMIZATION 2: Compute masks once and reuse
-            is_end = (new_tags == self.end_id)
-            is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB
-            emit = self.emit_lut[new_tags]
-            skip_now = self.skip_lut[new_tags]
+            with timer.time_section('ar_masking') if timer else nullcontext():
+                is_end = (new_tags == self.end_id)
+                is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB
+                emit = self.emit_lut[new_tags]
+                skip_now = self.skip_lut[new_tags]
 
-            # ---- Structure corrections (all on GPU) ----
-            if self.xcel_id is not None and self.lcel_id is not None:
-                new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
+                # ---- Structure corrections (all on GPU) ----
+                if self.xcel_id is not None and self.lcel_id is not None:
+                    new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
 
-            # For ucel->lcel correction, check prev_ucel from PREVIOUS step
-            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
+                # For ucel->lcel correction, check prev_ucel from PREVIOUS step
+                if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
+                    new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
 
-            # Update finished and force <end> for already finished sequences
-            finished |= is_end
-            new_tags = torch.where(finished, end_vec, new_tags)
+                # Update finished and force <end> for already finished sequences
+                finished |= is_end
+                new_tags = torch.where(finished, end_vec, new_tags)
 
             # Write to preallocated buffer
             t += 1
@@ -265,19 +262,16 @@ class BatchedTableDecoderV3:
                 if not (~finished).any().item():
                     break
 
-            if timer:
-                timer.end_section('ar_masking')
-                timer.start_section('ar_bbox_emit')  # Time bbox emission logic
-
             # ---- BBox emission decisions (minimize syncs) ----
             # OPTIMIZATION 2: Use precomputed masks
-            m_emit_bbox = (~skip_next) & emit & (~finished)
-            m_first_lcel = first_lcel & is_lcel & (~finished)
+            with timer.time_section('ar_bbox_emit') if timer else nullcontext():
+                m_emit_bbox = (~skip_next) & emit & (~finished)
+                m_first_lcel = first_lcel & is_lcel & (~finished)
 
-            # Collect indices that need bbox features (minimize CPU syncs)
-            append_mask = m_emit_bbox | m_first_lcel
-            append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
-            if append_idx.numel() > 0:
+                # Collect indices that need bbox features (minimize CPU syncs)
+                append_mask = m_emit_bbox | m_first_lcel
+                append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
+                if append_idx.numel() > 0:
                     # FIX 2: Check and grow buffer if needed before writing
                     tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
 
@@ -310,9 +304,6 @@ class BatchedTableDecoderV3:
 
                     # Increment bbox indices
                     bbox_ind[append_idx] += 1
-
-            if timer:
-                timer.end_section('ar_bbox_emit')
 
             # ---- Update flags (all on GPU) ----
             # OPTIMIZATION 2: Simplified flag updates with precomputed masks
@@ -362,10 +353,10 @@ class BatchedTableDecoderV3:
         if timer:
             timer.end_section('bbox_prep')
 
+        if timer:
+            timer.start_section('bbox_inference')
+        
         for b, k_b in enumerate(k_list):
-            if timer and b == 0:
-                timer.start_section('bbox_inference')
-            
             if self.model._bbox and k_b > 0:
                 enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
                 tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
@@ -373,10 +364,6 @@ class BatchedTableDecoderV3:
             else:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
-
-            if timer and b == 0:
-                timer.end_section('bbox_inference')
-                timer.start_section('span_merging')
 
             # Use the already-host materialized span count for indexing safety
             nspans_b = cnt_list[b]
@@ -388,6 +375,9 @@ class BatchedTableDecoderV3:
             outputs.append((seqs[b], merged_cls, merged_coord))
 
         if timer:
+            timer.end_section('bbox_inference')
+            timer.start_section('span_merging')
+            # Span merging happens inside _merge_spans_tensor for each table
             timer.end_section('span_merging')
             timer.end_section('bbox_decode')
             
