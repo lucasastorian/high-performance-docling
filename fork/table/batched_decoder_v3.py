@@ -2,6 +2,18 @@
 # Optimized Batched AR decoder with GPT-5 Phase 1 & 2 optimizations implemented
 # PHASE 1: Reduced GPU→CPU sync frequency - check "all finished" every 8 steps
 # PHASE 2: Reduced nonzero() calls from 3 to 2 per step - CRITICAL: keep ~first_lcel in end condition
+#
+# TIMING SECTIONS (when timer is provided):
+# - ar_loop: Total AR loop time
+#   - ar_setup: Initial setup before AR loop
+#   - ar_transformer: Transformer forward pass (first step only)
+#   - ar_masking: Mask computations (first step only)
+#   - ar_bbox_emit: BBox emission logic (first step only)
+# - output_materialization: Converting tensors to output format
+# - bbox_decode: Total bbox decoding time
+#   - bbox_prep: Preparing counters and lists
+#   - bbox_inference: Actual bbox inference (first table only)
+#   - span_merging: Merging spans (measured on last table)
 
 import torch
 from dataclasses import dataclass
@@ -33,7 +45,7 @@ class BatchState:
     open_span_start: List[int]  # [-1 if no open span, else start index] per sample
 
 
-class BatchedTableDecoderV2:
+class BatchedTableDecoderV3:
     def __init__(self, model, device: str):
         self.model = model
         self.device = device
@@ -168,6 +180,8 @@ class BatchedTableDecoderV2:
         # ===== AR LOOP TIMING =====
         if timer:
             timer.start_section('ar_loop')
+            # Add sub-timers for detailed profiling
+            timer.start_section('ar_setup')
 
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = E.embedding_dim
@@ -192,8 +206,13 @@ class BatchedTableDecoderV2:
         t = 0
         cache = None
 
+        if timer:
+            timer.end_section('ar_setup')
+
         # AR LOOP
         for step in range(Tmax):
+            if timer and step == 0:
+                timer.start_section('ar_transformer')  # Time transformer forward passes
             # Use incremental embedding buffer - only pass what we've computed so far
             tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
 
@@ -206,6 +225,10 @@ class BatchedTableDecoderV2:
             last_H = decoded[-1].contiguous()  # [B,D]
             logits = FC(last_H)  # [B,V] - use cached reference
             new_tags = logits.argmax(dim=1)  # [B] Long
+
+            if timer and step == 0:
+                timer.end_section('ar_transformer')
+                timer.start_section('ar_masking')  # Time mask computations
 
             # OPTIMIZATION 2: Compute masks once and reuse
             is_end = (new_tags == self.end_id)
@@ -241,6 +264,10 @@ class BatchedTableDecoderV2:
             if (step & 7) == 7:
                 if not (~finished).any().item():
                     break
+
+            if timer and step == 0:
+                timer.end_section('ar_masking')
+                timer.start_section('ar_bbox_emit')  # Time bbox emission logic
 
             # ---- BBox emission decisions (minimize syncs) ----
             # OPTIMIZATION 2: Use precomputed masks
@@ -284,6 +311,9 @@ class BatchedTableDecoderV2:
                     # Increment bbox indices
                     bbox_ind[append_idx] += 1
 
+            if timer and step == 0:
+                timer.end_section('ar_bbox_emit')
+
             # ---- Update flags (all on GPU) ----
             # OPTIMIZATION 2: Simplified flag updates with precomputed masks
             # first_lcel: true unless current is lcel (one kernel instead of where)
@@ -304,6 +334,9 @@ class BatchedTableDecoderV2:
             timer.end_section('ar_loop')
 
         # ---- Materialize outputs (minimal sync points) ----
+        if timer:
+            timer.start_section('output_materialization')
+        
         # Trim sequences to actual length
         end_id_int = self.end_id.item()
         seqs = []
@@ -311,18 +344,28 @@ class BatchedTableDecoderV2:
             seq_len = min(t + 1, lengths[b].item() + 1)  # +1 for start token
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
+        
+        if timer:
+            timer.end_section('output_materialization')
 
         # ---- Per-table bbox head (already vectorized) ----
         outputs = []
 
         if timer:
             timer.start_section('bbox_decode')
+            timer.start_section('bbox_prep')
 
         # ONE sync here instead of B syncs
         k_list = k_counters.detach().cpu().tolist()  # length B
         cnt_list = span_cnt.detach().cpu().tolist()  # length B
 
+        if timer:
+            timer.end_section('bbox_prep')
+
         for b, k_b in enumerate(k_list):
+            if timer and b == 0:
+                timer.start_section('bbox_inference')
+            
             if self.model._bbox and k_b > 0:
                 enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
                 tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
@@ -330,6 +373,10 @@ class BatchedTableDecoderV2:
             else:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
+
+            if timer and b == 0:
+                timer.end_section('bbox_inference')
+                timer.start_section('span_merging')
 
             # Use the already-host materialized span count for indexing safety
             nspans_b = cnt_list[b]
@@ -341,6 +388,7 @@ class BatchedTableDecoderV2:
             outputs.append((seqs[b], merged_cls, merged_coord))
 
         if timer:
+            timer.end_section('span_merging')
             timer.end_section('bbox_decode')
 
         return outputs
