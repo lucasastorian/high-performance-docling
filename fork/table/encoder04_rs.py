@@ -53,6 +53,11 @@ class Encoder04(nn.Module):
         self._gr_reuses_output = True  # caller must .clone() if they need a fresh tensor
         self._fused = False  # Track if Conv+BN fusion has been applied
         self._pool_checked = False  # Track if we've checked for no-op pool
+        
+        # BF16 support - OFF by default (controlled by TABLE_ENCODER_BF16)
+        self._use_bf16 = bool(int(os.getenv("TABLE_ENCODER_BF16", "0")))
+        if self._use_bf16:
+            self._log().info("BF16 enabled for encoder via TABLE_ENCODER_BF16=1")
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
@@ -159,11 +164,19 @@ class Encoder04(nn.Module):
         
         # Warmup runs (3x) to ensure cuDNN algo selection and cache warming
         with torch.inference_mode():
-            for _ in range(3):
+            if self._use_bf16:
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    for _ in range(3):
+                        y = self._adaptive_pool(self._resnet(static_in))
+                        torch.cuda.synchronize()
+                    # Get output shape for buffer allocation
+                    y = self._adaptive_pool(self._resnet(static_in))
+            else:
+                for _ in range(3):
+                    y = self._adaptive_pool(self._resnet(static_in))
+                    torch.cuda.synchronize()
+                # Get output shape for buffer allocation
                 y = self._adaptive_pool(self._resnet(static_in))
-                torch.cuda.synchronize()
-            # Get output shape for buffer allocation
-            y = self._adaptive_pool(self._resnet(static_in))
         
         # Restore benchmark setting after warmup
         cudnn.benchmark = old_benchmark
@@ -174,9 +187,18 @@ class Encoder04(nn.Module):
         # Capture graph - inline operations without calling forward()
         g = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
-        with torch.cuda.graph(g):
-            y2 = self._adaptive_pool(self._resnet(static_in))  # inline, no .to() calls
-            self._gr_out.copy_(y2)  # write into static buffer
+        
+        if self._use_bf16:
+            # Capture with BF16 autocast
+            with torch.cuda.graph(g):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    y2 = self._adaptive_pool(self._resnet(static_in))
+                self._gr_out.copy_(y2)  # write into static buffer (outside autocast)
+        else:
+            # Capture without autocast
+            with torch.cuda.graph(g):
+                y2 = self._adaptive_pool(self._resnet(static_in))  # inline, no .to() calls
+                self._gr_out.copy_(y2)  # write into static buffer
         
         self._gr_in = static_in
         self._gr = g
@@ -199,6 +221,13 @@ class Encoder04(nn.Module):
         """
         # Assume caller already provides channels_last input
         # (no conversion in hot path for graph compatibility)
-        y = self._resnet(images)
-        y = self._adaptive_pool(y)
+        
+        # Apply BF16 autocast if enabled (only for CUDA)
+        if self._use_bf16 and images.device.type == 'cuda':
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                y = self._resnet(images)
+                y = self._adaptive_pool(y)
+        else:
+            y = self._resnet(images)
+            y = self._adaptive_pool(y)
         return y

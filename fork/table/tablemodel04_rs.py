@@ -112,7 +112,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         
         # Enable fast kernels where safe
         if device == 'cuda':
-            torch.backends.cudnn.benchmark = True
+            # Don't enable benchmark globally - it interferes with CUDA Graphs!
+            # torch.backends.cudnn.benchmark = True  # REMOVED - causes slowdown with graphs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
