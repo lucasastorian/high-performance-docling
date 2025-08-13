@@ -14,7 +14,7 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
 from fork.table.transformer_rs import Tag_Transformer
-from fork.table.batched_decoder import BatchedTableDecoder
+from fork.table.batched_decoder_v2 import BatchedTableDecoderV2
 
 LOG_LEVEL = logging.WARN
 
@@ -106,7 +106,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._skip_ids = torch.stack([self._ids[n] for n in _skip_names if n in self._ids]) \
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
-        self._batched_decoder = BatchedTableDecoder(self, self._device)
+        self._batched_decoder = BatchedTableDecoderV2(self, self._device)
 
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
