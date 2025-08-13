@@ -178,12 +178,6 @@ class BatchedTableDecoderV3:
         span_ends = torch.full((B, Kspan), -1, device=device, dtype=torch.long)
         span_cnt = torch.zeros(B, device=device, dtype=torch.long)
 
-        # ===== AR LOOP TIMING =====
-        if timer:
-            timer.start_section('ar_loop')
-            # Add sub-timers for detailed profiling
-            timer.start_section('ar_setup')
-
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = E.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
@@ -207,43 +201,49 @@ class BatchedTableDecoderV3:
         t = 0
         cache = None
 
+        # SIMPLE TIMING
         if timer:
-            timer.end_section('ar_setup')
+            timer.start_section('ar_loop')
 
         # AR LOOP
         for step in range(Tmax):
+            if timer:
+                timer.start_section('ar_transformer')
+            
             # Use incremental embedding buffer - only pass what we've computed so far
             tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
 
             # Transformer decoder with cache
-            with timer.time_section('ar_transformer') if timer else nullcontext():
-                decoded, cache = decoder(
-                    tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
-                )
+            decoded, cache = decoder(
+                tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
+            )
 
-                # FIX: Ensure contiguous for better memory layout
-                last_H = decoded[-1].contiguous()  # [B,D]
-                logits = FC(last_H)  # [B,V] - use cached reference
-                new_tags = logits.argmax(dim=1)  # [B] Long
+            # FIX: Ensure contiguous for better memory layout
+            last_H = decoded[-1].contiguous()  # [B,D]
+            logits = FC(last_H)  # [B,V] - use cached reference
+            new_tags = logits.argmax(dim=1)  # [B] Long
+
+            if timer:
+                timer.end_section('ar_transformer')
+                timer.start_section('ar_other')
 
             # OPTIMIZATION 2: Compute masks once and reuse
-            with timer.time_section('ar_masking') if timer else nullcontext():
-                is_end = (new_tags == self.end_id)
-                is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB
-                emit = self.emit_lut[new_tags]
-                skip_now = self.skip_lut[new_tags]
+            is_end = (new_tags == self.end_id)
+            is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB
+            emit = self.emit_lut[new_tags]
+            skip_now = self.skip_lut[new_tags]
 
-                # ---- Structure corrections (all on GPU) ----
-                if self.xcel_id is not None and self.lcel_id is not None:
-                    new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
+            # ---- Structure corrections (all on GPU) ----
+            if self.xcel_id is not None and self.lcel_id is not None:
+                new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
 
-                # For ucel->lcel correction, check prev_ucel from PREVIOUS step
-                if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                    new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
+            # For ucel->lcel correction, check prev_ucel from PREVIOUS step
+            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
+                new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
 
-                # Update finished and force <end> for already finished sequences
-                finished |= is_end
-                new_tags = torch.where(finished, end_vec, new_tags)
+            # Update finished and force <end> for already finished sequences
+            finished |= is_end
+            new_tags = torch.where(finished, end_vec, new_tags)
 
             # Write to preallocated buffer
             t += 1
@@ -260,50 +260,51 @@ class BatchedTableDecoderV3:
             # PHASE 1 OPTIMIZATION: reduce GPU→CPU syncs: check "all finished" every 8 steps
             if (step & 7) == 7:
                 if not (~finished).any().item():
+                    if timer:
+                        timer.end_section('ar_other')
                     break
 
             # ---- BBox emission decisions (minimize syncs) ----
             # OPTIMIZATION 2: Use precomputed masks
-            with timer.time_section('ar_bbox_emit') if timer else nullcontext():
-                m_emit_bbox = (~skip_next) & emit & (~finished)
-                m_first_lcel = first_lcel & is_lcel & (~finished)
+            m_emit_bbox = (~skip_next) & emit & (~finished)
+            m_first_lcel = first_lcel & is_lcel & (~finished)
 
-                # Collect indices that need bbox features (minimize CPU syncs)
-                append_mask = m_emit_bbox | m_first_lcel
-                append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
-                if append_idx.numel() > 0:
-                    # FIX 2: Check and grow buffer if needed before writing
-                    tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
+            # Collect indices that need bbox features (minimize CPU syncs)
+            append_mask = m_emit_bbox | m_first_lcel
+            append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)
+            if append_idx.numel() > 0:
+                # FIX 2: Check and grow buffer if needed before writing
+                tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
 
-                    # OPTIMIZATION 2: Write to preallocated buffer instead of list
-                    rows = last_H.index_select(0, append_idx)  # [K,D]
-                    slots = k_counters[append_idx].long()  # [K] - current slot for each sample
-                    flat_idx = append_idx * tag_H_buf.size(1) + slots  # [K] - use current buffer size
-                    tag_H_buf.view(-1, D_embed).index_copy_(0, flat_idx, rows)  # Vectorized write
-                    k_counters[append_idx] += 1  # Increment counters
+                # OPTIMIZATION 2: Write to preallocated buffer instead of list
+                rows = last_H.index_select(0, append_idx)  # [K,D]
+                slots = k_counters[append_idx].long()  # [K] - current slot for each sample
+                flat_idx = append_idx * tag_H_buf.size(1) + slots  # [K] - use current buffer size
+                tag_H_buf.view(-1, D_embed).index_copy_(0, flat_idx, rows)  # Vectorized write
+                k_counters[append_idx] += 1  # Increment counters
 
-                    # PHASE 2 CORRECTED: Use global masks to preserve exact semantics
-                    # --- SPANS (use global masks to preserve semantics) ---
-                    # starts: m_first_lcel
-                    if m_first_lcel.any():
-                        first_lcel_idx = m_first_lcel.nonzero(as_tuple=False).squeeze(1)
-                        span_starts, span_ends, span_cnt = self._maybe_grow_spans(
-                            span_starts, span_ends, span_cnt, first_lcel_idx
-                        )
-                        slot = span_cnt[first_lcel_idx]
-                        span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
-                        span_cnt[first_lcel_idx] += 1
+                # PHASE 2 CORRECTED: Use global masks to preserve exact semantics
+                # --- SPANS (use global masks to preserve semantics) ---
+                # starts: m_first_lcel
+                if m_first_lcel.any():
+                    first_lcel_idx = m_first_lcel.nonzero(as_tuple=False).squeeze(1)
+                    span_starts, span_ends, span_cnt = self._maybe_grow_spans(
+                        span_starts, span_ends, span_cnt, first_lcel_idx
+                    )
+                    slot = span_cnt[first_lcel_idx]
+                    span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
+                    span_cnt[first_lcel_idx] += 1
 
-                    # ends: emit only & already inside an open span (i.e., not first_lcel)
-                    # first_lcel==False means we've seen the first lcel and the span is open
-                    m_end_global = m_emit_bbox & (~first_lcel) & (~finished)
-                    if m_end_global.any():
-                        end_idx = m_end_global.nonzero(as_tuple=False).squeeze(1)
-                        slot = (span_cnt[end_idx] - 1).clamp_min(0)
-                        span_ends[end_idx, slot] = bbox_ind[end_idx]
+                # ends: emit only & already inside an open span (i.e., not first_lcel)
+                # first_lcel==False means we've seen the first lcel and the span is open
+                m_end_global = m_emit_bbox & (~first_lcel) & (~finished)
+                if m_end_global.any():
+                    end_idx = m_end_global.nonzero(as_tuple=False).squeeze(1)
+                    slot = (span_cnt[end_idx] - 1).clamp_min(0)
+                    span_ends[end_idx, slot] = bbox_ind[end_idx]
 
-                    # Increment bbox indices
-                    bbox_ind[append_idx] += 1
+                # Increment bbox indices
+                bbox_ind[append_idx] += 1
 
             # ---- Update flags (all on GPU) ----
             # OPTIMIZATION 2: Simplified flag updates with precomputed masks
@@ -320,14 +321,13 @@ class BatchedTableDecoderV3:
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
-        # End AR loop timing
+            if timer:
+                timer.end_section('ar_other')
+
         if timer:
             timer.end_section('ar_loop')
 
         # ---- Materialize outputs (minimal sync points) ----
-        if timer:
-            timer.start_section('output_materialization')
-        
         # Trim sequences to actual length
         end_id_int = self.end_id.item()
         seqs = []
@@ -335,60 +335,37 @@ class BatchedTableDecoderV3:
             seq_len = min(t + 1, lengths[b].item() + 1)  # +1 for start token
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
-        
-        if timer:
-            timer.end_section('output_materialization')
 
         # ---- Per-table bbox head (already vectorized) ----
         outputs = []
 
         if timer:
             timer.start_section('bbox_decode')
-            timer.start_section('bbox_prep')
 
         # ONE sync here instead of B syncs
         k_list = k_counters.detach().cpu().tolist()  # length B
         cnt_list = span_cnt.detach().cpu().tolist()  # length B
 
-        if timer:
-            timer.end_section('bbox_prep')
-
         for b, k_b in enumerate(k_list):
-            with timer.time_section('bbox_inference') if timer else nullcontext():
-                if self.model._bbox and k_b > 0:
-                    enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
-                    tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
-                    cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
-                else:
-                    cls_logits = torch.empty(0, device=device)
-                    coords = torch.empty(0, device=device)
+            if self.model._bbox and k_b > 0:
+                enc_nchw = enc_out_batch[b:b + 1]  # [1, C, H, W] on GPU
+                tag_H_tensor = tag_H_buf[b, :k_b]  # [k_b, D] on GPU
+                cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
+            else:
+                cls_logits = torch.empty(0, device=device)
+                coords = torch.empty(0, device=device)
 
-            with timer.time_section('span_merging') if timer else nullcontext():
-                # Use the already-host materialized span count for indexing safety
-                nspans_b = cnt_list[b]
-                merged_cls, merged_coord = self._merge_spans_tensor(
-                    cls_logits, coords,
-                    span_starts[b:b + 1], span_ends[b:b + 1],
-                    span_cnt[b:b + 1]  # ok to pass the GPU tensors; we just avoided per-step .item()
-                )
-                outputs.append((seqs[b], merged_cls, merged_coord))
+            # Use the already-host materialized span count for indexing safety
+            nspans_b = cnt_list[b]
+            merged_cls, merged_coord = self._merge_spans_tensor(
+                cls_logits, coords,
+                span_starts[b:b + 1], span_ends[b:b + 1],
+                span_cnt[b:b + 1]  # ok to pass the GPU tensors; we just avoided per-step .item()
+            )
+            outputs.append((seqs[b], merged_cls, merged_coord))
 
         if timer:
             timer.end_section('bbox_decode')
-            
-            # Print detailed timing breakdown
-            timer.finalize()
-            print("\n  === Detailed Decoder Timing ===")
-            print(f"    ar_loop:             {timer.get_time('ar_loop'):7.1f} ms")
-            print(f"      ar_setup:          {timer.get_time('ar_setup'):7.1f} ms")
-            print(f"      ar_transformer:    {timer.get_time('ar_transformer'):7.1f} ms")
-            print(f"      ar_masking:        {timer.get_time('ar_masking'):7.1f} ms")
-            print(f"      ar_bbox_emit:      {timer.get_time('ar_bbox_emit'):7.1f} ms")
-            print(f"    output_material:     {timer.get_time('output_materialization'):7.1f} ms")
-            print(f"    bbox_decode:         {timer.get_time('bbox_decode'):7.1f} ms")
-            print(f"      bbox_prep:         {timer.get_time('bbox_prep'):7.1f} ms")
-            print(f"      bbox_inference:    {timer.get_time('bbox_inference'):7.1f} ms")
-            print(f"      span_merging:      {timer.get_time('span_merging'):7.1f} ms")
 
         return outputs
 
