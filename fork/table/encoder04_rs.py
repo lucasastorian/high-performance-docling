@@ -44,8 +44,11 @@ class Encoder04(nn.Module):
 
         self._adaptive_pool = nn.AdaptiveAvgPool2d((self.enc_image_size, self.enc_image_size))
         
-        # CUDA Graphs support - ON by default
-        self._use_graphs = bool(int(os.getenv("ENCODER_USE_GRAPHS", "1")))
+        # Compilation support - OFF by default
+        self._use_compile = bool(int(os.getenv("ENCODER_COMPILE", "0")))
+        
+        # CUDA Graphs support - ON by default (but disabled if compile is on)
+        self._use_graphs = bool(int(os.getenv("ENCODER_USE_GRAPHS", "1"))) and not self._use_compile
         self._gr_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
         self._gr_in = None
         self._gr_out = None
@@ -53,6 +56,7 @@ class Encoder04(nn.Module):
         self._gr_reuses_output = True  # caller must .clone() if they need a fresh tensor
         self._fused = False  # Track if Conv+BN fusion has been applied
         self._pool_checked = False  # Track if we've checked for no-op pool
+        self._compiled = False  # Track if model has been compiled
         
         # BF16 support - OFF by default (controlled by TABLE_ENCODER_BF16)
         self._use_bf16 = bool(int(os.getenv("TABLE_ENCODER_BF16", "0")))
@@ -120,6 +124,60 @@ class Encoder04(nn.Module):
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
 
+    def _maybe_compile(self, device="cuda"):
+        """Compile the model with torch.compile if enabled"""
+        if not self._use_compile or self._compiled:
+            return
+        
+        dev = self._as_device(device)
+        if dev.type != "cuda":
+            self._log().warning("torch.compile only supported on CUDA, skipping compilation")
+            return
+        
+        # Fuse Conv+BN before compiling
+        self._fuse_conv_bn()
+        
+        # Move to device
+        self.eval()
+        self.to(device=dev)
+        
+        # Determine if we should use graphs in compilation
+        use_graph_in_compile = bool(int(os.getenv("ENCODER_USE_GRAPHS", "1")))
+        
+        # Compile with appropriate settings
+        if use_graph_in_compile:
+            # Let torch.compile handle CUDA graphs
+            self._resnet = torch.compile(
+                self._resnet, 
+                mode="reduce-overhead",  # This mode uses CUDA graphs internally
+                fullgraph=True, 
+                dynamic=False
+            )
+            self._adaptive_pool = torch.compile(
+                self._adaptive_pool,
+                mode="reduce-overhead",
+                fullgraph=True,
+                dynamic=False
+            )
+            self._log().info("Model compiled with torch.compile (reduce-overhead mode with graphs)")
+        else:
+            # Compile without graphs
+            self._resnet = torch.compile(
+                self._resnet,
+                mode="default",  # No CUDA graphs
+                fullgraph=True,
+                dynamic=False
+            )
+            self._adaptive_pool = torch.compile(
+                self._adaptive_pool,
+                mode="default",
+                fullgraph=True,
+                dynamic=False
+            )
+            self._log().info("Model compiled with torch.compile (default mode without graphs)")
+        
+        self._compiled = True
+    
     def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
         """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
         if self._pool_checked:
@@ -205,6 +263,14 @@ class Encoder04(nn.Module):
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
+        # Compile on first use if enabled
+        if self._use_compile and not self._compiled:
+            self._maybe_compile(device=images.device)
+        
+        # Assert batch size is always 32 when graphs are enabled (manual graphs only)
+        if self._use_graphs and images.device.type == "cuda":
+            assert images.shape[0] == self._gr_bs, f"Batch size must be {self._gr_bs} for CUDA graphs, got {images.shape[0]}"
+        
         # Fix 1: Ensure channels_last format (cheap if already channels_last)
         if images.device.type == "cuda" and not images.is_contiguous(memory_format=torch.channels_last):
             images = images.contiguous(memory_format=torch.channels_last)
