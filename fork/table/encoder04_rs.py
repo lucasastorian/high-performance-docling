@@ -62,6 +62,10 @@ class Encoder04(nn.Module):
         self._use_bf16 = bool(int(os.getenv("TABLE_ENCODER_BF16", "0")))
         if self._use_bf16:
             self._log().info("BF16 enabled for encoder via TABLE_ENCODER_BF16=1")
+        
+        # Compile during initialization if enabled
+        if self._use_compile:
+            self._maybe_compile()
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
@@ -129,6 +133,7 @@ class Encoder04(nn.Module):
         if not self._use_compile or self._compiled:
             return
         
+        # Default to CUDA if not specified
         dev = self._as_device(device)
         if dev.type != "cuda":
             self._log().warning("torch.compile only supported on CUDA, skipping compilation")
@@ -263,10 +268,6 @@ class Encoder04(nn.Module):
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        # Compile on first use if enabled
-        if self._use_compile and not self._compiled:
-            self._maybe_compile(device=images.device)
-        
         # Assert batch size is always 32 when graphs are enabled (manual graphs only)
         if self._use_graphs and images.device.type == "cuda":
             assert images.shape[0] == self._gr_bs, f"Batch size must be {self._gr_bs} for CUDA graphs, got {images.shape[0]}"
