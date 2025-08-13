@@ -28,10 +28,8 @@ class BatchState:
     # Bbox indexing (device counters)
     bbox_ind: torch.Tensor              # [B] Long (running index)
     
-    # Span bookkeeping - keep on device as much as possible
-    span_starts_flat: List[int]         # flat list of all span starts
-    span_ends_flat: List[int]           # flat list of all span ends
-    span_sample_ids: List[int]          # which sample each span belongs to
+    # Span bookkeeping - track one open span per sample
+    open_span_start: List[int]          # [-1 if no open span, else start index] per sample
 
 
 class BatchedTableDecoderV2:
@@ -94,6 +92,9 @@ class BatchedTableDecoderV2:
         decoded_tags = torch.full((Tmax + 1, B), self.end_id.item(), dtype=torch.long, device=device)
         decoded_tags[0, :] = self.start_id
         
+        # Initialize span maps correctly - one dict per sample
+        span_maps: List[Dict[int, int]] = [dict() for _ in range(B)]
+        
         state = BatchState(
             decoded_tags=decoded_tags,
             lengths=torch.zeros(B, dtype=torch.int32, device=device),
@@ -106,9 +107,7 @@ class BatchedTableDecoderV2:
             prev_ucel=torch.zeros(B, dtype=torch.bool, device=device),
             line_num=torch.zeros(B, dtype=torch.long, device=device),
             bbox_ind=torch.zeros(B, dtype=torch.long, device=device),
-            span_starts_flat=[],
-            span_ends_flat=[],
-            span_sample_ids=[],
+            open_span_start=[-1] * B,  # Track one open span per sample
         )
         
         # Helper for isin with guard
@@ -192,28 +191,24 @@ class BatchedTableDecoderV2:
                         state.tag_H_flat.append(row)
                         state.tag_H_sample_ids.append(idx)
                     
-                    # Handle span tracking (minimal Python work)
+                    # Handle span tracking inline (much simpler!)
                     first_lcel_idx = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(1)
                     if first_lcel_idx.numel() > 0:
-                        # Record span starts
+                        # Record span starts - use bbox_ind BEFORE increment
                         start_indices = state.bbox_ind[first_lcel_idx].tolist()
-                        for idx, start in zip(first_lcel_idx.tolist(), start_indices):
-                            state.span_starts_flat.append(start)
-                            state.span_ends_flat.append(-1)  # placeholder
-                            state.span_sample_ids.append(idx)
+                        for sid, start in zip(first_lcel_idx.tolist(), start_indices):
+                            state.open_span_start[sid] = start
                     
                     # Handle span ends
                     end_span_mask = m_emit_bbox & (~state.first_lcel) & append_mask
                     if end_span_mask.any():
                         end_idx = end_span_mask.nonzero(as_tuple=False).squeeze(1)
                         end_indices = state.bbox_ind[end_idx].tolist()
-                        # Find and update corresponding open spans
-                        for idx, end in zip(end_idx.tolist(), end_indices):
-                            # Find last open span for this sample
-                            for i in range(len(state.span_sample_ids) - 1, -1, -1):
-                                if state.span_sample_ids[i] == idx and state.span_ends_flat[i] == -1:
-                                    state.span_ends_flat[i] = end
-                                    break
+                        for sid, end in zip(end_idx.tolist(), end_indices):
+                            start = state.open_span_start[sid]
+                            if start >= 0:
+                                span_maps[sid][start] = end
+                                state.open_span_start[sid] = -1
                     
                     # Increment bbox indices
                     state.bbox_ind[append_idx] += 1
@@ -243,15 +238,7 @@ class BatchedTableDecoderV2:
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
         
-        # Reconstruct per-sample span maps
-        span_maps: List[Dict[int, int]] = [{}] * B
-        for i, sample_id in enumerate(state.span_sample_ids):
-            if sample_id < B:  # safety check
-                if sample_id not in span_maps:
-                    span_maps[sample_id] = {}
-                start = state.span_starts_flat[i]
-                end = state.span_ends_flat[i]
-                span_maps[sample_id][start] = end
+        # Span maps are already built inline during the loop - no reconstruction needed!
         
         # Reconstruct per-sample tag_H buffers
         tag_H_per_sample = [[] for _ in range(B)]
