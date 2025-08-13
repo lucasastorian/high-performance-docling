@@ -8,6 +8,8 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.backends.cudnn as cudnn
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 import torchvision
 
 import docling_ibm_models.tableformer.settings as s
@@ -24,8 +26,14 @@ class Encoder04(nn.Module):
 
     def __init__(self, enc_image_size: int, enc_dim: int = 512):
         super().__init__()
-        torch.backends.cudnn.benchmark = True
-
+        
+        # Torch backend optimizations (Optimization 4)
+        # Enable TF32 for faster matmuls on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        cudnn.allow_tf32 = True
+        # Disable benchmark to avoid overhead (we have fixed shapes with CUDA graphs)
+        cudnn.benchmark = False
+        
         self.enc_image_size = enc_image_size
         self._encoder_dim = 256  # ResNet18 layer3 output channels
 
@@ -43,17 +51,72 @@ class Encoder04(nn.Module):
         self._gr_out = None
         self._gr = None
         self._gr_reuses_output = True  # caller must .clone() if they need a fresh tensor
+        self._fused = False  # Track if Conv+BN fusion has been applied
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
     def get_encoder_dim(self) -> int:
         return self._encoder_dim
+    
+    def _fuse_conv_bn(self):
+        """Fuse Conv+BN layers for inference (Optimization 3)"""
+        if self._fused:
+            return
+            
+        self.eval()  # Must be in eval mode for fusion
+        
+        # Fuse conv1+bn1 in the stem
+        modules = dict(self._resnet.named_children())
+        if '0' in modules and '1' in modules:  # conv1 and bn1
+            conv1 = modules['0']
+            bn1 = modules['1']
+            if isinstance(conv1, nn.Conv2d) and isinstance(bn1, nn.BatchNorm2d):
+                fused_conv1 = fuse_conv_bn_eval(conv1, bn1)
+                # Replace in the sequential
+                new_modules = []
+                for name, module in self._resnet.named_children():
+                    if name == '0':
+                        new_modules.append(fused_conv1)
+                    elif name == '1':
+                        new_modules.append(nn.Identity())  # Replace BN with identity
+                    else:
+                        new_modules.append(module)
+                self._resnet = nn.Sequential(*new_modules)
+        
+        # Fuse Conv+BN in BasicBlocks (layers 1, 2, 3)
+        for module in self._resnet.modules():
+            if isinstance(module, torchvision.models.resnet.BasicBlock):
+                # Fuse conv1+bn1
+                if hasattr(module, 'conv1') and hasattr(module, 'bn1'):
+                    module.conv1 = fuse_conv_bn_eval(module.conv1, module.bn1)
+                    module.bn1 = nn.Identity()
+                # Fuse conv2+bn2
+                if hasattr(module, 'conv2') and hasattr(module, 'bn2'):
+                    module.conv2 = fuse_conv_bn_eval(module.conv2, module.bn2)
+                    module.bn2 = nn.Identity()
+                # Handle downsample if present
+                if module.downsample is not None:
+                    # downsample is typically Sequential(conv, bn)
+                    if len(module.downsample) == 2:
+                        conv = module.downsample[0]
+                        bn = module.downsample[1]
+                        if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
+                            module.downsample = nn.Sequential(
+                                fuse_conv_bn_eval(conv, bn),
+                                nn.Identity()
+                            )
+        
+        self._fused = True
+        self._log().info("Conv+BN layers fused for inference")
 
     def _maybe_capture(self, C=3, H=448, W=448, device="cuda"):
         """Capture CUDA Graph for fixed batch size encoding (Optimization 1)"""
         if not self._use_graphs or self._gr is not None or device != "cuda":
             return
+        
+        # Fuse Conv+BN before capturing graph (Optimization 3)
+        self._fuse_conv_bn()
         
         self.eval()
         self.to(device=device, memory_format=torch.channels_last)
@@ -62,10 +125,12 @@ class Encoder04(nn.Module):
         # Create static input buffer
         static_in = torch.zeros(self._gr_bs, C, H, W, device=device).to(memory_format=torch.channels_last)
         
-        # Run once to materialize shapes & cuDNN algo choices
+        # Warmup runs (2x) to ensure cuDNN algo selection and cache warming
         with torch.inference_mode():
-            _ = self._resnet(static_in)
-            _ = self._adaptive_pool(_)
+            for _ in range(2):
+                _ = self._resnet(static_in)
+                _ = self._adaptive_pool(_)
+                torch.cuda.synchronize()
         
         # Allocate static output buffer by running full forward
         with torch.inference_mode():
@@ -81,7 +146,7 @@ class Encoder04(nn.Module):
         
         self._gr_in = static_in
         self._gr = g
-        self._log().info(f"CUDA Graph captured for encoder with BS={self._gr_bs}")
+        self._log().info(f"CUDA Graph captured for encoder with BS={self._gr_bs} after warmup")
 
     def graph_forward(self, x):
         """Execute captured CUDA Graph (x must be [32,3,H,W] channels_last)"""
@@ -98,6 +163,11 @@ class Encoder04(nn.Module):
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
         assert images.dim() == 4 and images.size(1) == 3, "images should be [B,3,H,W]"
+        
+        # Ensure Conv+BN fusion for non-graph path too
+        if not self._fused and not self.training:
+            self._fuse_conv_bn()
+        
         x = images.to(memory_format=torch.channels_last)  # perf-safe, doesn't affect state_dict
         y = self._resnet(x)
         y = self._adaptive_pool(y)
