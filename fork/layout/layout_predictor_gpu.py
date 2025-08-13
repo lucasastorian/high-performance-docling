@@ -105,18 +105,21 @@ class LayoutPredictor:
                 # Avoid per-batch layout conversions
                 self._model.to(memory_format=torch.channels_last)
 
-                # Inductor compile settings
-                from torch._inductor import config as ind_cfg
-                ind_cfg.triton.cudagraphs = True          # enable graph capture
-                ind_cfg.max_autotune_gemm = False         # stable; re-test later if desired
-                ind_cfg.coordinate_descent_tuning = False
+                # Optional torch.compile via TORCH_COMPILE environment variable
+                if os.getenv("TORCH_COMPILE", "").lower() in ("1", "true", "yes"):
+                    # Inductor compile settings
+                    from torch._inductor import config as ind_cfg
+                    ind_cfg.triton.cudagraphs = True          # enable graph capture
+                    ind_cfg.max_autotune_gemm = False         # stable; re-test later if desired
+                    ind_cfg.coordinate_descent_tuning = False
 
-                self._model = torch.compile(
-                    self._model,
-                    dynamic=False,          # STATIC shapes/strides/dtypes
-                    fullgraph=True,         # avoid graph breaks
-                    mode="reduce-overhead"  # low-latency small graphs
-                )
+                    self._model = torch.compile(
+                        self._model,
+                        dynamic=False,          # STATIC shapes/strides/dtypes
+                        fullgraph=True,         # avoid graph breaks
+                        mode="reduce-overhead"  # low-latency small graphs
+                    )
+                    _log.info("Torch compile enabled via TORCH_COMPILE environment variable")
 
             # ---- Persistent device input buffer (stable address for graphs) ----
             if self._device.type == "cuda":
