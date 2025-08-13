@@ -152,11 +152,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
         prof.end("model_tag_transformer_encoder", self._prof)
 
-        # Option B: Convert NCHW→NHWC once for bbox decoder (semantic requirement)
-        enc_out_batch_nhwc = enc_out_batch.permute(0, 2, 3, 1)  # [B, 28, 28, 256] NHWC
-        
-        # Pass both enc_out_nhwc (for bbox) and mem_enc (for tag decode) to avoid duplicate processing
-        return self._batched_decoder.predict_batched(enc_out_batch_nhwc, mem_enc, max_steps)
+        # Pass enc_out_batch as NCHW (bbox decoder has been optimized for NCHW input)
+        return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
     def _log(self):
         # Setup a custom logger
