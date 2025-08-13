@@ -17,7 +17,6 @@ import numpy as np
 # from fork.table.table_structure_model import TableStructureModel
 from fork.layout.layout_model import LayoutModel
 from fork.table.table_structure_model import TableStructureModel
-from optimized.table.table_timing_debug import print_timing_summary
 
 from table_regression_runner import TableRegressionRunner, Tolerances
 from layout_regression_runner import LayoutRegressionRunner, LayoutTol
@@ -145,7 +144,6 @@ class GPUProcessor:
             pages_with_tables = list(self.table_model(conv_res, pages_with_ocr))
             t_tables = time.perf_counter() - t_tables_start
             print(f"     ⏱ tables: {fmt_secs(t_tables)}")
-            print_timing_summary()
         else:
             pages_with_tables = pages_with_ocr
 

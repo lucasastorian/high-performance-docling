@@ -26,6 +26,7 @@ from docling_ibm_models.tableformer.data_management.matching_post_processor impo
 
 from fork.table.tablemodel04_rs import TableModel04_rs
 # from optimized.table.matching_post_processor import MatchingPostProcessor
+from fork.timers import _CPUTimer, _CudaTimer
 
 LOG_LEVEL = logging.WARN
 
@@ -724,51 +725,56 @@ class TFPredictor:
             "All batched inputs must be same length"
 
         AggProfiler().start_agg(self._prof)
+        
+        # Create timer for detailed TF predictor timing
+        timer = _CudaTimer() if self._device == 'cuda' else _CPUTimer()
 
         # --- 1) Image preprocessing (original semantics, but batched) ---
-        # Equivalent to per-item: _prepare_image(table_image)
-        # i.e., Normalize -> Resize to (S,S) -> transpose to (C,W,H) -> /255 -> to(device) -> add batch dim
-        normalize = T.Normalize(
-            mean=self._config["dataset"]["image_normalization"]["mean"],
-            std=self._config["dataset"]["image_normalization"]["std"],
-        )
-        resized_size = self._config["dataset"]["resized_image"]
-        resize = T.Resize([resized_size, resized_size])
+        with timer.time_section('image_preprocessing'):
+            # Equivalent to per-item: _prepare_image(table_image)
+            # i.e., Normalize -> Resize to (S,S) -> transpose to (C,W,H) -> /255 -> to(device) -> add batch dim
+            normalize = T.Normalize(
+                mean=self._config["dataset"]["image_normalization"]["mean"],
+                std=self._config["dataset"]["image_normalization"]["std"],
+            )
+            resized_size = self._config["dataset"]["resized_image"]
+            resize = T.Resize([resized_size, resized_size])
 
-        batch_tensors = []
-        for table_img in table_images:
-            img, _ = normalize(table_img, None)
-            img, _ = resize(img, None)
-            img = img.transpose(2, 1, 0)  # (channels, width, height)
-            img = torch.FloatTensor(img / 255.0)  # float32 in [0,1]
-            batch_tensors.append(img)
+            batch_tensors = []
+            for table_img in table_images:
+                img, _ = normalize(table_img, None)
+                img, _ = resize(img, None)
+                img = img.transpose(2, 1, 0)  # (channels, width, height)
+                img = torch.FloatTensor(img / 255.0)  # float32 in [0,1]
+                batch_tensors.append(img)
 
-        if len(batch_tensors) == 0:
-            return []
+            if len(batch_tensors) == 0:
+                return []
 
-        image_batch = torch.stack(batch_tensors, dim=0)  # (N, C, W, H) — matches original quirk
-        image_batch = image_batch.to(device=self._device)
+            image_batch = torch.stack(batch_tensors, dim=0)  # (N, C, W, H) — matches original quirk
+            image_batch = image_batch.to(device=self._device)
 
         # --- 2) Model inference (batched) ---
-        max_steps = self._config["predict"]["max_steps"]
-        beam_size = self._config["predict"]["beam_size"]
+        with timer.time_section('model_inference'):
+            max_steps = self._config["predict"]["max_steps"]
+            beam_size = self._config["predict"]["beam_size"]
 
-        all_predictions: list[dict] = []
+            all_predictions: list[dict] = []
 
-        with torch.no_grad():
-            if eval_res_preds is not None:
-                # Use provided eval predictions (expects a per-item list of dicts)
-                for ev in eval_res_preds:
-                    pred = {
-                        "bboxes": ev.get("bboxes", []),
-                        "tag_seq": ev.get("tag_seq", []),
-                    }
-                    pred["rs_seq"] = self._get_html_tags(pred["tag_seq"])
-                    pred["html_seq"] = otsl_to_html(pred["rs_seq"], False)
-                    all_predictions.append(pred)
-            else:
-                # Model may return batched tuples or per-item tuples; support both
-                model_result = self._model.predict(image_batch, max_steps, beam_size)
+            with torch.no_grad():
+                if eval_res_preds is not None:
+                    # Use provided eval predictions (expects a per-item list of dicts)
+                    for ev in eval_res_preds:
+                        pred = {
+                            "bboxes": ev.get("bboxes", []),
+                            "tag_seq": ev.get("tag_seq", []),
+                        }
+                        pred["rs_seq"] = self._get_html_tags(pred["tag_seq"])
+                        pred["html_seq"] = otsl_to_html(pred["rs_seq"], False)
+                        all_predictions.append(pred)
+                else:
+                    # Model may return batched tuples or per-item tuples; support both
+                    model_result = self._model.predict(image_batch, max_steps, beam_size)
 
                 # Normalize to per-item list of (seq, outputs_class, outputs_coord)
                 def _normalize_model_batch_outputs(model_result):
@@ -827,76 +833,83 @@ class TFPredictor:
                     all_predictions.append(pred)
 
         # --- 3) Per-item: bbox/tag sync, matching, (optional) postproc, docling response, merge ---
-        outputs: list[tuple[list[dict], dict]] = []
+        with timer.time_section('cell_matching_and_postprocess'):
+            outputs: list[tuple[list[dict], dict]] = []
 
-        for i, prediction in enumerate(all_predictions):
-            iocr_page = iocr_pages[i]
-            scaled_bbox = table_bboxes[i]  # coords in RESIZED-PAGE space
-            scale_factor = scale_factors[i]
+            for i, prediction in enumerate(all_predictions):
+                iocr_page = iocr_pages[i]
+                scaled_bbox = table_bboxes[i]  # coords in RESIZED-PAGE space
+                scale_factor = scale_factors[i]
 
-            # Logically identical checks to original
-            self._log().debug("----- rs_seq -----")
-            self._log().debug(prediction["rs_seq"])
-            self._log().debug(len(prediction["rs_seq"]))
-            otsl_sqr_chk(prediction["rs_seq"], False)
+                # Logically identical checks to original
+                self._log().debug("----- rs_seq -----")
+                self._log().debug(prediction["rs_seq"])
+                self._log().debug(len(prediction["rs_seq"]))
+                otsl_sqr_chk(prediction["rs_seq"], False)
 
-            # Sync bboxes vs tags
-            sync, corrected_bboxes = self._check_bbox_sync(prediction)
-            if not sync:
-                prediction["bboxes"] = corrected_bboxes
+                # Sync bboxes vs tags
+                sync, corrected_bboxes = self._check_bbox_sync(prediction)
+                if not sync:
+                    prediction["bboxes"] = corrected_bboxes
 
-            # Prepare matching details
-            matching_details = {
-                "table_cells": [],
-                "matches": {},
-                "pdf_cells": [],
-                "prediction_bboxes_page": [],
-            }
+                # Prepare matching details
+                matching_details = {
+                    "table_cells": [],
+                    "matches": {},
+                    "pdf_cells": [],
+                    "prediction_bboxes_page": [],
+                }
 
-            # Convert table bbox back to ORIGINAL page_input coords (undo page resize)
-            tbl_bbox_for_match = [
-                scaled_bbox[0] / scale_factor,
-                scaled_bbox[1] / scale_factor,
-                scaled_bbox[2] / scale_factor,
-                scaled_bbox[3] / scale_factor,
-            ]
+                # Convert table bbox back to ORIGINAL page_input coords (undo page resize)
+                tbl_bbox_for_match = [
+                    scaled_bbox[0] / scale_factor,
+                    scaled_bbox[1] / scale_factor,
+                    scaled_bbox[2] / scale_factor,
+                    scaled_bbox[3] / scale_factor,
+                ]
 
-            # Matching (faithful to original)
-            if len(prediction["bboxes"]) > 0:
-                if do_matching:
-                    matching_details = self._cell_matcher.match_cells(
-                        iocr_page, tbl_bbox_for_match, prediction
-                    )
-                    # Post-processing if tokens exist and post-process enabled
-                    if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
-                        AggProfiler().begin("post_process", self._prof)
-                        matching_details = self._post_processor.process(
-                            matching_details, correct_overlapping_cells
+                # Matching (faithful to original)
+                if len(prediction["bboxes"]) > 0:
+                    if do_matching:
+                        matching_details = self._cell_matcher.match_cells(
+                            iocr_page, tbl_bbox_for_match, prediction
                         )
-                        AggProfiler().end("post_process", self._prof)
-                else:
-                    matching_details = self._cell_matcher.match_cells_dummy(
-                        iocr_page, tbl_bbox_for_match, prediction
+                        # Post-processing if tokens exist and post-process enabled
+                        if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
+                            AggProfiler().begin("post_process", self._prof)
+                            matching_details = self._post_processor.process(
+                                matching_details, correct_overlapping_cells
+                            )
+                            AggProfiler().end("post_process", self._prof)
+                    else:
+                        matching_details = self._cell_matcher.match_cells_dummy(
+                            iocr_page, tbl_bbox_for_match, prediction
+                        )
+
+                # Generate Docling responses (as in original)
+                AggProfiler().begin("generate_docling_response", self._prof)
+                if do_matching:
+                    docling_output = self._generate_tf_response(
+                        matching_details["table_cells"], matching_details["matches"]
                     )
+                else:
+                    docling_output = self._generate_tf_response_dummy(
+                        matching_details["table_cells"]
+                    )
+                AggProfiler().end("generate_docling_response", self._prof)
 
-            # Generate Docling responses (as in original)
-            AggProfiler().begin("generate_docling_response", self._prof)
-            if do_matching:
-                docling_output = self._generate_tf_response(
-                    matching_details["table_cells"], matching_details["matches"]
-                )
-            else:
-                docling_output = self._generate_tf_response_dummy(
-                    matching_details["table_cells"]
-                )
-            AggProfiler().end("generate_docling_response", self._prof)
+                # Sort and merge to TF output
+                docling_output.sort(key=lambda item: item["cell_id"])
+                matching_details["docling_responses"] = docling_output
+                tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
 
-            # Sort and merge to TF output
-            docling_output.sort(key=lambda item: item["cell_id"])
-            matching_details["docling_responses"] = docling_output
-            tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
-
-            outputs.append((tf_output, matching_details))
+                outputs.append((tf_output, matching_details))
+        
+        # Finalize timing and log results
+        timer.finalize()
+        print(f"     └─ tf predictor breakdown: preprocess={timer.get_time('image_preprocessing'):.1f}ms "
+              f"inference={timer.get_time('model_inference'):.1f}ms "
+              f"matching={timer.get_time('cell_matching_and_postprocess'):.1f}ms")
 
         return outputs
 

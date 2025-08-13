@@ -19,6 +19,7 @@ from docling.utils.profiling import TimeRecorder
 from base_models import Table, TableStructurePrediction, Page
 
 from fork.table.tf_predictor import TFPredictor
+from fork.timers import _CPUTimer, _CudaTimer
 
 
 class TableStructureModel(BasePageModel):
@@ -226,28 +227,39 @@ class TableStructureModel(BasePageModel):
             yield from pages_list
             return
 
+        # Create timer for detailed table structure timing
+        device_type = getattr(self.tf_predictor, '_device', 'cpu')
+        timer = _CudaTimer() if device_type == 'cuda' else _CPUTimer()
+        
         # Predictor call over the whole batch (order-preserving; predictor does not reorder)
         with TimeRecorder(conv_res, "table_structure_predict"):
-            all_outputs = self.tf_predictor.multi_table_predict(
-                page_inputs,
-                table_bboxes_list,
-                do_matching=self.do_cell_matching,
-                # IMPORTANT: do not pass additional flags; keep original semantics
-            )
+            with timer.time_section('tf_predictor_call'):
+                all_outputs = self.tf_predictor.multi_table_predict(
+                    page_inputs,
+                    table_bboxes_list,
+                    do_matching=self.do_cell_matching,
+                    # IMPORTANT: do not pass additional flags; keep original semantics
+                )
 
         # Map outputs back to pages/tables in strict order
-        result_idx = 0
-        for i, page_batch_idx in enumerate(batched_page_indexes):
-            page = pages_list[page_batch_idx]
-            clusters = page_clusters_list[i]
-            n_tables = len(clusters)
+        with timer.time_section('output_processing'):
+            result_idx = 0
+            for i, page_batch_idx in enumerate(batched_page_indexes):
+                page = pages_list[page_batch_idx]
+                clusters = page_clusters_list[i]
+                n_tables = len(clusters)
 
-            page_outputs = all_outputs[result_idx: result_idx + n_tables]
-            result_idx += n_tables
+                page_outputs = all_outputs[result_idx: result_idx + n_tables]
+                result_idx += n_tables
 
-            for output, table_cluster in zip(page_outputs, clusters):
-                table = self._process_table_output(page, table_cluster, output)
-                page.predictions.tablestructure.table_map[table_cluster.id] = table
+                for output, table_cluster in zip(page_outputs, clusters):
+                    table = self._process_table_output(page, table_cluster, output)
+                    page.predictions.tablestructure.table_map[table_cluster.id] = table
+        
+        # Finalize timing and log results
+        timer.finalize()
+        print(f"   └─ table structure breakdown: tf_call={timer.get_time('tf_predictor_call'):.1f}ms "
+              f"output_proc={timer.get_time('output_processing'):.1f}ms")
 
         # Optional debug viz; unchanged
         if settings.debug.visualize_tables:
