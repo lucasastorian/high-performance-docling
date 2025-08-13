@@ -145,7 +145,9 @@ class TableModel04_rs(BaseModel, nn.Module):
         
         # If batch is small, just run directly without blocking
         if B0 <= block_bs // 2 or not getattr(self._encoder, "_gr", None):
-            return self._encoder(imgs.to(memory_format=torch.channels_last, non_blocking=True))
+            # Ensure channels_last format
+            imgs_cl = imgs.contiguous(memory_format=torch.channels_last) if not imgs.is_contiguous(memory_format=torch.channels_last) else imgs
+            return self._encoder(imgs_cl)
         
         # Calculate padding for block alignment
         pad = (block_bs - (B0 % block_bs)) % block_bs

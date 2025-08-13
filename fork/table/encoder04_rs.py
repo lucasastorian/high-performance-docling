@@ -119,9 +119,6 @@ class Encoder04(nn.Module):
         
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
-        
-        # Set module to use channels-last for activations (not weights!)
-        self._resnet.to(memory_format=torch.channels_last)
 
     def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
         """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
@@ -152,17 +149,14 @@ class Encoder04(nn.Module):
         self._fuse_conv_bn()
         
         self.eval()
-        self.to(device=dev, memory_format=torch.channels_last)
+        self.to(device=dev)
         torch.cuda.synchronize()
         
-        # Create static input buffer
-        static_in = torch.zeros(self._gr_bs, C, H, W, device=dev).to(memory_format=torch.channels_last)
-        
-        # Enable benchmark for warmup to find best algorithm (Optimization 6)
-        old_benchmark = cudnn.benchmark
-        cudnn.benchmark = True
+        # Create static input buffer - ensure it's properly channels_last
+        static_in = torch.zeros(self._gr_bs, C, H, W, device=dev).contiguous(memory_format=torch.channels_last)
         
         # Warmup runs (3x) to ensure cuDNN algo selection and cache warming
+        # cudnn.benchmark stays at its default (False) to avoid per-shape algo search
         with torch.inference_mode():
             if self._use_bf16:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -177,9 +171,6 @@ class Encoder04(nn.Module):
                     torch.cuda.synchronize()
                 # Get output shape for buffer allocation
                 y = self._adaptive_pool(self._resnet(static_in))
-        
-        # Restore benchmark setting after warmup
-        cudnn.benchmark = old_benchmark
         
         # Allocate static output buffer
         self._gr_out = torch.empty_like(y)  # same shape as output
@@ -206,6 +197,7 @@ class Encoder04(nn.Module):
 
     def graph_forward(self, x):
         """Execute captured CUDA Graph (x must be [32,3,H,W] channels_last)"""
+        assert x.is_contiguous(memory_format=torch.channels_last), "Input must be channels_last for graph replay"
         self._gr_in.copy_(x, non_blocking=True)
         self._gr.replay()
         return self._gr_out  # NCHW view onto static buffer
@@ -215,12 +207,12 @@ class Encoder04(nn.Module):
         """
         Args:
             images: NCHW float tensor [B,3,H,W]. 
-            Should already be in channels_last format from caller.
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        # Assume caller already provides channels_last input
-        # (no conversion in hot path for graph compatibility)
+        # Fix 1: Ensure channels_last format (cheap if already channels_last)
+        if images.device.type == "cuda" and not images.is_contiguous(memory_format=torch.channels_last):
+            images = images.contiguous(memory_format=torch.channels_last)
         
         # Apply BF16 autocast if enabled (only for CUDA)
         if self._use_bf16 and images.device.type == 'cuda':
