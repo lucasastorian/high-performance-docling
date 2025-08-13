@@ -125,8 +125,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         returns: list of (seq, outputs_class, outputs_coord)
         """
         B = imgs.size(0)
-        self._encoder.eval();
-        self._tag_transformer.eval();
+        self._encoder.eval()
+        self._tag_transformer.eval()
         self._bbox_decoder.eval()
         
         # Convert to channels_last for better performance
@@ -134,26 +134,23 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         prof = AggProfiler()
         
-        # Use autocast for encoder and tag-encoder (safe for bfloat16) - gated by USE_AMP
-        use_amp = (torch.device(self._device).type == "cuda") and (os.getenv("USE_AMP", "0") == "1")
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-            prof.begin("model_encoder", self._prof)
-            enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - now NCHW format
-            prof.end("model_encoder", self._prof)
+        prof.begin("model_encoder", self._prof)
+        enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - NCHW format
+        prof.end("model_encoder", self._prof)
 
-            prof.begin("model_tag_transformer_input_filter", self._prof)
-            # Direct call to input_filter (NCHW) then single permute to NHWC
-            x = self._tag_transformer._input_filter(enc_out_batch).permute(0, 2, 3, 1)  # [B,h,w,C]
-            prof.end("model_tag_transformer_input_filter", self._prof)
+        prof.begin("model_tag_transformer_input_filter", self._prof)
+        # Direct call to input_filter (NCHW) then single permute to NHWC
+        x = self._tag_transformer._input_filter(enc_out_batch).permute(0, 2, 3, 1)  # [B,h,w,C]
+        prof.end("model_tag_transformer_input_filter", self._prof)
 
-            B_, h, w, C = x.shape
-            mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
+        B_, h, w, C = x.shape
+        mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
 
-            prof.begin("model_tag_transformer_encoder", self._prof)
-            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
-            prof.end("model_tag_transformer_encoder", self._prof)
+        prof.begin("model_tag_transformer_encoder", self._prof)
+        mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
+        prof.end("model_tag_transformer_encoder", self._prof)
 
-        # Pass encoder output as NCHW directly (bbox decoder expects NCHW)
+        # Pass both enc_out (for bbox) and mem_enc (for tag decode) to avoid duplicate processing
         return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
     def _log(self):
