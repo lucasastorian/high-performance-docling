@@ -211,7 +211,7 @@ class BatchedTableDecoderV3:
 
         # AR LOOP
         for step in range(Tmax):
-            if timer and step == 0:
+            if timer:
                 timer.start_section('ar_transformer')  # Time transformer forward passes
             # Use incremental embedding buffer - only pass what we've computed so far
             tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
@@ -226,7 +226,7 @@ class BatchedTableDecoderV3:
             logits = FC(last_H)  # [B,V] - use cached reference
             new_tags = logits.argmax(dim=1)  # [B] Long
 
-            if timer and step == 0:
+            if timer:
                 timer.end_section('ar_transformer')
                 timer.start_section('ar_masking')  # Time mask computations
 
@@ -265,7 +265,7 @@ class BatchedTableDecoderV3:
                 if not (~finished).any().item():
                     break
 
-            if timer and step == 0:
+            if timer:
                 timer.end_section('ar_masking')
                 timer.start_section('ar_bbox_emit')  # Time bbox emission logic
 
@@ -311,7 +311,7 @@ class BatchedTableDecoderV3:
                     # Increment bbox indices
                     bbox_ind[append_idx] += 1
 
-            if timer and step == 0:
+            if timer:
                 timer.end_section('ar_bbox_emit')
 
             # ---- Update flags (all on GPU) ----
@@ -390,6 +390,20 @@ class BatchedTableDecoderV3:
         if timer:
             timer.end_section('span_merging')
             timer.end_section('bbox_decode')
+            
+            # Print detailed timing breakdown
+            timer.finalize()
+            print("\n  === Detailed Decoder Timing ===")
+            print(f"    ar_loop:             {timer.get_time('ar_loop'):7.1f} ms")
+            print(f"      ar_setup:          {timer.get_time('ar_setup'):7.1f} ms")
+            print(f"      ar_transformer:    {timer.get_time('ar_transformer'):7.1f} ms")
+            print(f"      ar_masking:        {timer.get_time('ar_masking'):7.1f} ms")
+            print(f"      ar_bbox_emit:      {timer.get_time('ar_bbox_emit'):7.1f} ms")
+            print(f"    output_material:     {timer.get_time('output_materialization'):7.1f} ms")
+            print(f"    bbox_decode:         {timer.get_time('bbox_decode'):7.1f} ms")
+            print(f"      bbox_prep:         {timer.get_time('bbox_prep'):7.1f} ms")
+            print(f"      bbox_inference:    {timer.get_time('bbox_inference'):7.1f} ms")
+            print(f"      span_merging:      {timer.get_time('span_merging'):7.1f} ms")
 
         return outputs
 
