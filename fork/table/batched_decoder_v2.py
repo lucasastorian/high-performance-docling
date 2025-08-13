@@ -77,7 +77,7 @@ class BatchedTableDecoderV2:
     @torch.inference_mode()
     def predict_batched(
         self,
-        enc_out_batch: torch.Tensor,   # [B,H,W,C] for bbox head
+        enc_out_batch: torch.Tensor,   # [B,C,H,W] NCHW for bbox head
         mem_enc: torch.Tensor,         # [S,B,D] encoder memory
         max_steps: int
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
@@ -126,7 +126,8 @@ class BatchedTableDecoderV2:
         
         # Initialize first step with start tokens
         start_row = decoded_tags[0, :]  # [B] start tokens
-        tgt_emb_buf[0] = tt._embedding(start_row) + pe[0].unsqueeze(0)  # [B,D]
+        pos0 = pe[0, 0]  # [D] - extract position 0
+        tgt_emb_buf[0] = tt._embedding(start_row) + pos0  # [B,D]
         
         # Track current step
         t = 0
@@ -165,7 +166,8 @@ class BatchedTableDecoderV2:
             
             # Update incremental embedding buffer for next step
             if t < Tmax:  # Only if we'll do another step
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pe[t].unsqueeze(0)  # [B,D]
+                pos_t = pe[t, 0]  # [D] - extract position t
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_t  # [B,D]
             
             # Update lengths for non-finished sequences
             state.lengths = torch.where(~state.finished, state.lengths + 1, state.lengths)
@@ -201,7 +203,7 @@ class BatchedTableDecoderV2:
                         # Record span starts - use bbox_ind BEFORE increment
                         start_indices = state.bbox_ind[first_lcel_idx].tolist()
                         for sid, start in zip(first_lcel_idx.tolist(), start_indices):
-                            state.open_span_start[sid] = start
+                            state.open_span_start[sid] = start  # Track open span start index
                     
                     # Handle span ends
                     end_span_mask = m_emit_bbox & (~state.first_lcel) & append_mask
@@ -210,15 +212,15 @@ class BatchedTableDecoderV2:
                         end_indices = state.bbox_ind[end_idx].tolist()
                         for sid, end in zip(end_idx.tolist(), end_indices):
                             start = state.open_span_start[sid]
-                            if start >= 0:
-                                span_maps[sid][start] = end
-                                state.open_span_start[sid] = -1
+                            if start >= 0:  # -1 means no open span
+                                span_maps[sid][start] = end  # Record span for merging
+                                state.open_span_start[sid] = -1  # Close span
                     
                     # Increment bbox indices
                     state.bbox_ind[append_idx] += 1
             
             # ---- Update flags (all on GPU) ----
-            # Reset first_lcel when not lcel
+            # Reset first_lcel=True on every non-lcel step (matches serial semantics)
             state.first_lcel = torch.where(m_is_lcel, torch.zeros_like(state.first_lcel), torch.ones_like(state.first_lcel))
             
             # Update skip_next
@@ -256,8 +258,8 @@ class BatchedTableDecoderV2:
         for b in range(B):
             tag_H_buf_b = tag_H_per_sample[b]
             if self.model._bbox and len(tag_H_buf_b) > 0:
-                # Convert NHWC to NCHW for bbox decoder (expects NCHW)
-                enc_nchw = enc_out_batch[b:b+1].permute(0, 3, 1, 2).contiguous()
+                # enc_out_batch is now NCHW format, pass directly to bbox decoder
+                enc_nchw = enc_out_batch[b:b+1]  # Already NCHW
                 cls_logits, coords = self.model._bbox_decoder.inference(
                     enc_nchw, tag_H_buf_b
                 )

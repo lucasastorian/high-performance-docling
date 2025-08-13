@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 #
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -38,9 +39,9 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # Encoder
         self._enc_image_size = config["model"]["enc_image_size"]
-        self._encoder_dim = config["model"]["hidden_dim"]
-        self._encoder = Encoder04(self._enc_image_size, self._encoder_dim).to(device)
-        # Note: channels_last is applied only to input tensors in predict(), not to module weights
+        self._encoder = Encoder04(self._enc_image_size).to(device)
+        # Use actual encoder dim (256) not config dim (often 512)
+        self._encoder_dim = self._encoder.get_encoder_dim()  # 256
 
         tag_vocab_size = len(word_map["word_map_tag"])
 
@@ -133,8 +134,9 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         prof = AggProfiler()
         
-        # Use autocast for encoder and tag-encoder (safe for bfloat16)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(self._device == 'cuda')):
+        # Use autocast for encoder and tag-encoder (safe for bfloat16) - gated by USE_AMP
+        use_amp = (torch.device(self._device).type == "cuda") and (os.getenv("USE_AMP", "0") == "1")
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
             prof.begin("model_encoder", self._prof)
             enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - now NCHW format
             prof.end("model_encoder", self._prof)
@@ -151,9 +153,8 @@ class TableModel04_rs(BaseModel, nn.Module):
             mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
             prof.end("model_tag_transformer_encoder", self._prof)
 
-        # Pass encoder output in original NCHW format for bbox decoder compatibility
-        enc_out_batch_nhwc = enc_out_batch.permute(0, 2, 3, 1)  # Convert to NHWC for bbox decoder
-        return self._batched_decoder.predict_batched(enc_out_batch_nhwc, mem_enc, max_steps)
+        # Pass encoder output as NCHW directly (bbox decoder expects NCHW)
+        return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
     def _log(self):
         # Setup a custom logger
