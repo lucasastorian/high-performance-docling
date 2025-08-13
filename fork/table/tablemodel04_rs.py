@@ -88,6 +88,20 @@ class TableModel04_rs(BaseModel, nn.Module):
             self._encoder_dim,
             self._dropout,
         ).to(device)
+        
+        # Stage 2: Cache tag IDs as device tensors (avoid dict hits + reallocs in loop)
+        wm_tag = word_map["word_map_tag"]
+        self._ids = {k: torch.tensor(v, device=device, dtype=torch.long)
+                     for k, v in wm_tag.items() if isinstance(v, int)}
+        
+        # Sets for quick membership tests in the loop
+        _emit_names = ["fcel", "ecel", "ched", "rhed", "srow", "nl", "ucel"]
+        self._emit_ids = torch.stack([self._ids[n] for n in _emit_names if n in self._ids]) \
+                         if any(n in self._ids for n in _emit_names) else torch.empty(0, dtype=torch.long, device=device)
+        
+        _skip_names = ["nl", "ucel", "xcel"]
+        self._skip_ids = torch.stack([self._ids[n] for n in _skip_names if n in self._ids]) \
+                         if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
     def _log(self):
         # Setup a custom logger
@@ -142,15 +156,16 @@ class TableModel04_rs(BaseModel, nn.Module):
         encoder_out_batch = self._tag_transformer._encoder(memory_batch, mask=None)
         AggProfiler().end("model_tag_transformer_encoder", self._prof)
         
-        # Decoder still runs per-item (Stage 2 will batch this too)
+        # Stage 2: Per-item AR decode with GPU-only loop
         results = []
         for i in range(B):
             # Extract per-item encoder outputs
             enc_out_i = enc_out_batch[i:i+1]  # [1,H,W,C] for bbox decoder
             encoder_out_i = encoder_out_batch[:, i:i+1, :]  # [S,1,C] for tag decoder
             
-            seq, outputs_class, outputs_coord = self._predict_single_with_precomputed(
-                enc_out_i, encoder_out_i, max_steps, k, return_attention=return_attention
+            # Use Stage 2 GPU-only AR loop
+            seq, outputs_class, outputs_coord = self._predict_single_with_precomputed_stage2(
+                enc_out_i, encoder_out_i, max_steps
             )
             results.append((seq, outputs_class, outputs_coord))
         return results
@@ -159,6 +174,146 @@ class TableModel04_rs(BaseModel, nn.Module):
         """Utility: [B,H,W,C] -> [S,B,C] for transformer"""
         B, H, W, C = hwc.shape
         return hwc.flatten(1, 2).permute(1, 0, 2).contiguous()
+    
+    def _predict_single_with_precomputed_stage2(self, enc_out: torch.Tensor, memory_enc: torch.Tensor, max_steps: int):
+        """
+        Stage 2: Device-only AR loop with preallocated buffers.
+        enc_out   : [1,H,W,C]  (raw encoder output for bbox head)
+        memory_enc: [S,1,C]    (tag-transformer encoder output)
+        """
+        device = self._device
+        tt = self._tag_transformer
+        prof = AggProfiler()
+
+        # --- Preallocate decoded tags: [Tmax+1, 1] ---
+        Tmax = self._max_pred_len
+        decoded_tags = torch.empty((Tmax + 1, 1), dtype=torch.long, device=device)
+        start_id = self._ids["<start>"]; end_id = self._ids["<end>"]
+        decoded_tags[0, 0] = start_id
+        t = 0
+
+        # --- Flags on device ---
+        skip_next   = torch.tensor(True,  device=device)
+        prev_ucel   = torch.tensor(False, device=device)
+        first_lcel  = torch.tensor(True,  device=device)
+        line_num    = torch.zeros((), dtype=torch.long, device=device)
+
+        # --- Optional ids (may be None) ---
+        lcel_id = self._ids.get("lcel")
+        fcel_id = self._ids.get("fcel")
+        xcel_id = self._ids.get("xcel")
+        ucel_id = self._ids.get("ucel")
+        nl_id   = self._ids.get("nl")
+
+        # --- Ragged buffers for bbox head ---
+        tag_H_buf: list[torch.Tensor] = []
+        bboxes_to_merge: dict[int, int] = {}
+        cur_bbox_ind = 0
+        bbox_ind = 0
+        open_span_start = None
+
+        cache = None
+
+        # --- AR loop ---
+        for _ in range(Tmax):
+            # [t+1,1,D]
+            tgt = tt._positional_encoding(tt._embedding(decoded_tags[:t+1]))
+
+            prof.begin("model_tag_transformer_decoder", self._prof)
+            decoded, cache = tt._decoder(tgt, memory=memory_enc, cache=cache, memory_key_padding_mask=None)
+            prof.end("model_tag_transformer_decoder", self._prof)
+
+            last_H = decoded[-1, :, :]          # [1,D]
+            logits = tt._fc(last_H)             # [1,V]
+            new_tag = torch.argmax(logits, dim=1)  # [1] Long (on device)
+
+            # ---- Structure corrections (GPU) ----
+            if xcel_id is not None and lcel_id is not None:
+                new_tag = torch.where((line_num == 0) & (new_tag == xcel_id),
+                                      lcel_id.expand_as(new_tag), new_tag)
+
+            if prev_ucel and lcel_id is not None and fcel_id is not None:
+                new_tag = torch.where(new_tag == lcel_id,
+                                      fcel_id.expand_as(new_tag), new_tag)
+
+            # ---- Append token ----
+            t += 1
+            decoded_tags[t, 0] = new_tag
+
+            # ---- Termination ----
+            if (new_tag == end_id).item():      # minimal unavoidable sync
+                break
+
+            # ---- BBox emission decisions (mostly GPU) ----
+            emit_bbox = (~skip_next) & (self._emit_ids.numel() > 0) \
+                        & torch.isin(new_tag, self._emit_ids)
+            is_lcel = (lcel_id is not None) and (new_tag == lcel_id)
+
+            # Append features for bbox head when emit OR first_lcel happens
+            if emit_bbox.item() or (is_lcel and first_lcel).item():
+                tag_H_buf.append(last_H)  # GPU tensor per cell
+                
+                # Handle span tracking
+                if is_lcel and first_lcel:
+                    open_span_start = cur_bbox_ind
+                    bboxes_to_merge[open_span_start] = -1
+                    cur_bbox_ind += 1
+                elif not first_lcel and open_span_start is not None:
+                    # Close the span
+                    bboxes_to_merge[open_span_start] = cur_bbox_ind
+                    open_span_start = None
+                    cur_bbox_ind += 1
+                elif emit_bbox.item():
+                    cur_bbox_ind += 1
+
+            # Update flags
+            if is_lcel:
+                first_lcel = torch.tensor(False, device=device)
+            else:
+                first_lcel = torch.tensor(True, device=device)
+
+            # Update line number if nl
+            if nl_id is not None:
+                line_num = line_num + (new_tag == nl_id).to(line_num.dtype)
+
+            # Next-step skip mask
+            if self._skip_ids.numel() > 0:
+                skip_next = torch.isin(new_tag, self._skip_ids)
+            else:
+                skip_next = torch.tensor(False, device=device)
+
+            # prev_ucel
+            prev_ucel = (ucel_id is not None) and (new_tag == ucel_id)
+
+        # --- Materialize sequence ---
+        seq = decoded_tags[:t+1, 0].tolist()
+
+        # --- BBox head (unchanged arch) ---
+        prof.begin("model_bbox_decoder", self._prof)
+        if self._bbox and len(tag_H_buf) > 0:
+            cls_logits, coords = self._bbox_decoder.inference(enc_out, tag_H_buf)
+        else:
+            cls_logits = torch.empty(0, device=device)
+            coords     = torch.empty(0, device=device)
+        prof.end("model_bbox_decoder", self._prof)
+
+        # --- Merge spans safely (treat -1 as "no merge") ---
+        out_cls, out_coord, skip = [], [], set()
+        N = len(coords) if coords is not None else 0
+        for i in range(N):
+            if i in skip: continue
+            j = bboxes_to_merge.get(i, None)
+            if j is None or j < 0 or j >= N:
+                out_cls.append(cls_logits[i]); out_coord.append(coords[i])
+            else:
+                skip.add(j)
+                out_cls.append(cls_logits[i])
+                out_coord.append(self.mergebboxes(coords[i], coords[j]))
+
+        out_cls   = torch.stack(out_cls)   if out_cls   else torch.empty(0, device=device)
+        out_coord = torch.stack(out_coord) if out_coord else torch.empty(0, device=device)
+
+        return seq, out_cls, out_coord
 
     def _predict_single_with_precomputed(self, enc_out, encoder_out, max_steps, k, return_attention=False):
         """
