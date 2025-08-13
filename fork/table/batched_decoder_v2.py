@@ -256,8 +256,10 @@ class BatchedTableDecoderV2:
         for b in range(B):
             tag_H_buf_b = tag_H_per_sample[b]
             if self.model._bbox and len(tag_H_buf_b) > 0:
+                # Convert NHWC to NCHW for bbox decoder (expects NCHW)
+                enc_nchw = enc_out_batch[b:b+1].permute(0, 3, 1, 2).contiguous()
                 cls_logits, coords = self.model._bbox_decoder.inference(
-                    enc_out_batch[b:b+1], tag_H_buf_b
+                    enc_nchw, tag_H_buf_b
                 )
             else:
                 cls_logits = torch.empty(0, device=device)
