@@ -154,27 +154,48 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         prof = AggProfiler()
 
-        prof.begin("model_encoder", self._prof)
-        # Use blocked encoding with CUDA Graphs and preallocated output
+        # ===== ENCODER TIMING =====
+        prof.begin("total_encoder", self._prof)
+        
+        # Image encoding
+        prof.begin("encoder_forward", self._prof)
         enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
-        prof.end("model_encoder", self._prof)
+        prof.end("encoder_forward", self._prof)
+        
+        prof.end("total_encoder", self._prof)
 
-        prof.begin("model_tag_transformer_input_filter", self._prof)
-        # Option B: input_filter expects NCHW, returns NCHW
+        # ===== MEMORY PREPARATION =====
+        prof.begin("memory_preparation", self._prof)
+        
+        # Input filter (conv layer)
+        prof.begin("tag_input_filter", self._prof)
         filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
-        # Convert to NHWC for transformer flatten (semantic requirement)
+        prof.end("tag_input_filter", self._prof)
+        
+        # Memory reshape and permute
+        prof.begin("memory_reshape", self._prof)
         filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
-        prof.end("model_tag_transformer_input_filter", self._prof)
-
         B_, h, w, C = filtered_nhwc.shape
         mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
-
-        prof.begin("model_tag_transformer_encoder", self._prof)
+        prof.end("memory_reshape", self._prof)
+        
+        prof.end("memory_preparation", self._prof)
+        
+        # ===== TAG TRANSFORMER ENCODER =====
+        prof.begin("tag_encoder", self._prof)
         mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
-        prof.end("model_tag_transformer_encoder", self._prof)
+        prof.end("tag_encoder", self._prof)
 
-        # Pass enc_out_batch as NCHW (bbox decoder has been optimized for NCHW input)
-        return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+        # ===== BATCHED DECODER =====
+        prof.begin("total_decoder", self._prof)
+        results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+        prof.end("total_decoder", self._prof)
+        
+        # Print timing summary if profiling enabled
+        if self._prof:
+            prof.print_summary()
+        
+        return results
 
     def _log(self):
         # Setup a custom logger
