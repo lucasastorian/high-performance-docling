@@ -139,12 +139,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         prof.end("model_encoder", self._prof)
 
         prof.begin("model_tag_transformer_input_filter", self._prof)
-        # Direct call to input_filter (NCHW) then single permute to NHWC
-        x = self._tag_transformer._input_filter(enc_out_batch).permute(0, 2, 3, 1)  # [B,h,w,C]
+        # Apply input_filter in NCHW, then convert directly to transformer format [S,B,C]
+        filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
         prof.end("model_tag_transformer_input_filter", self._prof)
 
-        B_, h, w, C = x.shape
-        mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
+        B_, C, h, w = filtered_nchw.shape
+        mem = filtered_nchw.flatten(2).permute(2, 0, 1).contiguous()  # [B,C,h*w] -> [h*w,B,C] = [S,B,C]
 
         prof.begin("model_tag_transformer_encoder", self._prof)
         mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
