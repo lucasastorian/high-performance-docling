@@ -366,6 +366,14 @@ class BatchedTableDecoderV3:
 
         if timer:
             timer.end_section('bbox_decode')
+            
+            # Print timing breakdown
+            timer.finalize()
+            print("\n  === Detailed Decoder Timing ===")
+            print(f"    ar_loop:             {timer.get_time('ar_loop'):7.1f} ms")
+            print(f"      ar_transformer:    {timer.get_time('ar_transformer'):7.1f} ms")
+            print(f"      ar_other:          {timer.get_time('ar_other'):7.1f} ms")
+            print(f"    bbox_decode:         {timer.get_time('bbox_decode'):7.1f} ms")
 
         return outputs
 
