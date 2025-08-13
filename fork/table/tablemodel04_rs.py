@@ -40,8 +40,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._enc_image_size = config["model"]["enc_image_size"]
         self._encoder_dim = config["model"]["hidden_dim"]
         self._encoder = Encoder04(self._enc_image_size, self._encoder_dim).to(device)
-        # Use channels_last memory format for better performance
-        self._encoder = self._encoder.to(memory_format=torch.channels_last)
+        # Note: channels_last is applied only to input tensors in predict(), not to module weights
 
         tag_vocab_size = len(word_map["word_map_tag"])
 

@@ -93,6 +93,8 @@ class LayoutPredictor:
             self._model = AutoModelForObjectDetection.from_pretrained(
                 artifact_path, config=self._model_config, device_map=self._device
             )
+            # Ensure model parameters are in default contiguous format before any potential safetensors operations
+            self._model = self._model.to(memory_format=torch.contiguous_format)
             self._model.eval()
 
             if self._device.type == "cuda":

@@ -178,6 +178,9 @@ class TFPredictor:
         # Use lock to prevent threading issues during model initialization
         with _model_init_lock:
             model = TableModel04_rs(self._config, self._init_data, self._device)
+            
+            # Ensure model parameters are in default contiguous format before safetensors load
+            model = model.to(memory_format=torch.contiguous_format)
 
             if model is None:
                 err_msg = "Not able to initiate a model for {}".format(self._model_type)
