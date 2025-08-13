@@ -62,10 +62,6 @@ class Encoder04(nn.Module):
         self._use_bf16 = bool(int(os.getenv("TABLE_ENCODER_BF16", "0")))
         if self._use_bf16:
             self._log().info("BF16 enabled for encoder via TABLE_ENCODER_BF16=1")
-        
-        # Compile during initialization if enabled
-        if self._use_compile:
-            self._maybe_compile()
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
@@ -76,6 +72,27 @@ class Encoder04(nn.Module):
 
     def get_encoder_dim(self) -> int:
         return self._encoder_dim
+    
+    def prepare_for_inference(self, device="cuda"):
+        """Call this AFTER loading weights to prepare model for inference.
+        This handles fusion, compilation, and graph capture in the correct order.
+        """
+        dev = self._as_device(device)
+        
+        # Step 1: Fuse Conv+BN layers if not already done
+        if not self._fused:
+            self._fuse_conv_bn()
+        
+        # Step 2: Compile if requested (mutually exclusive with manual graphs)
+        if self._use_compile and not self._compiled:
+            self._maybe_compile(device=dev)
+        
+        # Step 3: Capture CUDA graphs if requested (only if not compiled)
+        elif self._use_graphs and self._gr is None and dev.type == "cuda":
+            # Will internally call _fuse_conv_bn if needed
+            self._maybe_capture(device=dev)
+        
+        self._log().info(f"Model prepared for inference - Fused: {self._fused}, Compiled: {self._compiled}, Graphs: {self._gr is not None}")
     
     def _fuse_conv_bn(self):
         """Fuse Conv+BN layers for inference (Optimization 3)"""
@@ -138,9 +155,6 @@ class Encoder04(nn.Module):
         if dev.type != "cuda":
             self._log().warning("torch.compile only supported on CUDA, skipping compilation")
             return
-        
-        # Fuse Conv+BN before compiling
-        self._fuse_conv_bn()
         
         # Move to device
         self.eval()

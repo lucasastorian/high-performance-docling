@@ -210,6 +210,12 @@ class TFPredictor:
                 )
                 self._log().error(err_msg)
                 raise ValueError(err_msg)
+            
+            # Prepare the encoder for inference AFTER loading weights
+            # This handles fusion, compilation, and graph capture in correct order
+            if hasattr(model, '_encoder') and hasattr(model._encoder, 'prepare_for_inference'):
+                model._encoder.prepare_for_inference(device=self._device)
+                self._log().info("Encoder prepared for inference after weight loading")
 
         return model
 
