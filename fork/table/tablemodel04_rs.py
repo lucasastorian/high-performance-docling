@@ -9,12 +9,11 @@ import torch.nn as nn
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
-from docling_ibm_models.tableformer.models.table04_rs.bbox_decoder_rs import BBoxDecoder
-from docling_ibm_models.tableformer.models.table04_rs.encoder04_rs import Encoder04
-from docling_ibm_models.tableformer.models.table04_rs.transformer_rs import (
-    Tag_Transformer,
-)
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
+
+from fork.table.encoder04_rs import Encoder04
+from fork.table.bbox_decoder_rs import BBoxDecoder
+from fork.table.transformer_rs import Tag_Transformer
 
 LOG_LEVEL = logging.WARN
 # LOG_LEVEL = logging.INFO
