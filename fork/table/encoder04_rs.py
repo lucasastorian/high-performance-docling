@@ -278,8 +278,10 @@ class Encoder04(nn.Module):
         return self._gr_out
     
     def graph_forward(self, x):
-        """Execute captured CUDA Graph (x must be [32,3,H,W] channels_last)"""
+        """Execute captured CUDA Graph (x must be [gr_bs,3,H,W] channels_last)"""
+        assert getattr(self, "_gr", None) is not None, "CUDA graph not captured yet"
         assert x.is_contiguous(memory_format=torch.channels_last), "Input must be channels_last for graph replay"
+        assert x.shape[0] == self._gr_bs, f"Graph expects batch size {self._gr_bs}, got {x.shape[0]}"
         self._gr_in.copy_(x, non_blocking=True)
         self._gr.replay()
         return self._gr_out  # NCHW view onto static buffer
@@ -292,10 +294,8 @@ class Encoder04(nn.Module):
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        # Assert batch size is always 32 when graphs are CAPTURED and being used
-        # Allow shape probes (B=1) and other sizes when graphs aren't captured yet
-        if self._use_graphs and self._gr is not None and images.device.type == "cuda":
-            assert images.shape[0] == self._gr_bs, f"Batch size must be {self._gr_bs} for CUDA graphs, got {images.shape[0]}"
+        # NO batch size assertion here - forward() should work with any batch size
+        # The assertion belongs in graph_forward() only
         
         # CRITICAL: Don't convert format here - that would be compiled into the graph!
         # Caller MUST provide channels_last tensor for optimal performance
