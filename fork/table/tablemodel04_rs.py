@@ -132,9 +132,15 @@ class TableModel04_rs(BaseModel, nn.Module):
         B0, C, H, W = imgs.shape
         device = imgs.device
         
+        # Ensure Conv+BN fusion and pool check on first call
+        if not self._encoder._fused and not self._encoder.training:
+            self._encoder._fuse_conv_bn()
+        if not self._encoder._pool_checked and device.type == 'cuda':
+            self._encoder._check_adaptive_pool(H, W, device)
+        
         # Capture CUDA Graph on first call (includes warmup)
         if device.type == 'cuda':
-            self._encoder._maybe_capture(C=C, H=H, W=W, device=str(device))
+            self._encoder._maybe_capture(C=C, H=H, W=W, device=device)
         
         # If batch is small, just run directly without blocking
         if B0 <= block_bs // 2 or not getattr(self._encoder, "_gr", None):

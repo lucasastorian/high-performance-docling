@@ -56,6 +56,10 @@ class Encoder04(nn.Module):
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
+    
+    def _as_device(self, d):
+        """Convert string or device to torch.device"""
+        return d if isinstance(d, torch.device) else torch.device(d)
 
     def get_encoder_dim(self) -> int:
         return self._encoder_dim
@@ -111,22 +115,17 @@ class Encoder04(nn.Module):
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
         
-        # Optimization 5: Pin channels-last permanently after BN fusion
+        # Set module to use channels-last for activations (not weights!)
         self._resnet.to(memory_format=torch.channels_last)
-        for m in self._resnet.modules():
-            if isinstance(m, nn.Conv2d):
-                m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last)
-                if m.bias is not None:
-                    m.bias.data = m.bias.data.contiguous()
-        self._log().info("Weights pinned to channels-last format")
 
     def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
         """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
         if self._pool_checked:
             return
-            
+        
+        dev = self._as_device(device)
         with torch.inference_mode():
-            dummy = torch.zeros(1, 3, H, W, device=device).to(memory_format=torch.channels_last)
+            dummy = torch.zeros(1, 3, H, W, device=dev).to(memory_format=torch.channels_last)
             out = self._resnet(dummy)
         
         if out.shape[-2:] == (self.enc_image_size, self.enc_image_size):
@@ -137,46 +136,46 @@ class Encoder04(nn.Module):
 
     def _maybe_capture(self, C=3, H=448, W=448, device="cuda"):
         """Capture CUDA Graph for fixed batch size encoding (Optimization 1)"""
-        if not self._use_graphs or self._gr is not None or device != "cuda":
+        dev = self._as_device(device)
+        if not self._use_graphs or self._gr is not None or dev.type != "cuda":
             return
         
         # Check for no-op pool (Optimization 2)
-        self._check_adaptive_pool(H, W, device)
+        self._check_adaptive_pool(H, W, dev)
         
         # Fuse Conv+BN before capturing graph (Optimization 3)
         self._fuse_conv_bn()
         
         self.eval()
-        self.to(device=device, memory_format=torch.channels_last)
+        self.to(device=dev, memory_format=torch.channels_last)
         torch.cuda.synchronize()
         
         # Create static input buffer
-        static_in = torch.zeros(self._gr_bs, C, H, W, device=device).to(memory_format=torch.channels_last)
+        static_in = torch.zeros(self._gr_bs, C, H, W, device=dev).to(memory_format=torch.channels_last)
         
         # Enable benchmark for warmup to find best algorithm (Optimization 6)
         old_benchmark = cudnn.benchmark
         cudnn.benchmark = True
         
-        # Warmup runs (2x) to ensure cuDNN algo selection and cache warming
+        # Warmup runs (3x) to ensure cuDNN algo selection and cache warming
         with torch.inference_mode():
-            for _ in range(2):
-                _ = self._resnet(static_in)
-                _ = self._adaptive_pool(_)
+            for _ in range(3):
+                y = self._adaptive_pool(self._resnet(static_in))
                 torch.cuda.synchronize()
+            # Get output shape for buffer allocation
+            y = self._adaptive_pool(self._resnet(static_in))
         
         # Restore benchmark setting after warmup
         cudnn.benchmark = old_benchmark
         
-        # Allocate static output buffer by running full forward
-        with torch.inference_mode():
-            y = self.forward(static_in)  # NCHW output
-        self._gr_out = torch.empty_like(y)  # same NCHW shape
+        # Allocate static output buffer
+        self._gr_out = torch.empty_like(y)  # same shape as output
         
-        # Capture graph
+        # Capture graph - inline operations without calling forward()
         g = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(g):
-            y2 = self.forward(static_in)
+            y2 = self._adaptive_pool(self._resnet(static_in))  # inline, no .to() calls
             self._gr_out.copy_(y2)  # write into static buffer
         
         self._gr_in = static_in
@@ -193,21 +192,13 @@ class Encoder04(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            images: NCHW float tensor [B,3,H,W]. H,W fixed (e.g., 448x448).
+            images: NCHW float tensor [B,3,H,W]. 
+            Should already be in channels_last format from caller.
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        # Optimization 7: Remove assertions from hot path 
-        # (shape checks should be done during init/warmup)
-        
-        # Ensure optimizations are applied for non-graph path
-        if not self._pool_checked and images.device.type == 'cuda':
-            self._check_adaptive_pool(images.shape[2], images.shape[3], str(images.device))
-        
-        if not self._fused and not self.training:
-            self._fuse_conv_bn()
-        
-        x = images.to(memory_format=torch.channels_last)  # perf-safe, doesn't affect state_dict
-        y = self._resnet(x)
+        # Assume caller already provides channels_last input
+        # (no conversion in hot path for graph compatibility)
+        y = self._resnet(images)
         y = self._adaptive_pool(y)
         return y
