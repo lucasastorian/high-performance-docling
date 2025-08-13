@@ -129,6 +129,12 @@ class BatchedTableDecoderV2:
         tt = self.tt
         B = enc_out_batch.size(0)
         
+        # OPTIMIZATION 3: Cache module references to avoid attribute lookups
+        E = tt._embedding              # Embedding module
+        FC = tt._fc                    # Final classification layer
+        decoder = tt._decoder          # Decoder module
+        pos_enc = tt._positional_encoding  # Positional encoding
+        
         # Clamp to model's max
         Tmax = min(max_steps, self.model._max_pred_len)
         
@@ -146,9 +152,9 @@ class BatchedTableDecoderV2:
         bbox_ind = torch.zeros(B, dtype=torch.long, device=device)
         
         # OPTIMIZATION 2: Preallocate tag hidden states buffer [B, Kmax, D]
-        D = tt._embedding.embedding_dim
+        D_embed = E.embedding_dim
         Kmax = max(1, Tmax // 2)  # Safe upper bound for tag hidden states
-        tag_H_buf = torch.empty(B, Kmax, D, device=device)
+        tag_H_buf = torch.empty(B, Kmax, D_embed, device=device)
         k_counters = torch.zeros(B, dtype=torch.int32, device=device)  # Track count per sample
         
         # OPTIMIZATION: Tensorized span tracking - no more Python dicts/lists
@@ -161,11 +167,11 @@ class BatchedTableDecoderV2:
         prof.begin("batched_ar_loop_v2", self._prof)
         
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
-        D = tt._embedding.embedding_dim
+        D = E.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
         
         # FIX 1: Clean PE shape handling - extract [Tmax+1, D] directly
-        pe = tt._positional_encoding.pe  # [max_len, 1, D] positional encoding buffer
+        pe = pos_enc.pe  # [max_len, 1, D] positional encoding buffer
         pos_rows = pe[:Tmax + 1, 0]  # [Tmax+1, D] - clean 2D tensor, no awkward broadcasting
         
         # FIX 4: Prebuild end vector once
@@ -177,7 +183,7 @@ class BatchedTableDecoderV2:
         
         # Initialize first step with start tokens
         start_row = decoded_tags[0, :]  # [B] start tokens
-        tgt_emb_buf[0] = tt._embedding(start_row) + pos_rows[0]  # [B,D] + [D] broadcasts cleanly
+        tgt_emb_buf[0] = E(start_row) + pos_rows[0]  # [B,D] + [D] broadcasts cleanly
         
         # Track current step
         t = 0
@@ -189,14 +195,14 @@ class BatchedTableDecoderV2:
             
             # Transformer decoder with cache
             prof.begin("decoder_step", self._prof)
-            decoded, cache = tt._decoder(
+            decoded, cache = decoder(
                 tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
             )
             prof.end("decoder_step", self._prof)
             
             # FIX: Ensure contiguous for better memory layout
             last_H = decoded[-1].contiguous()  # [B,D]
-            logits = tt._fc(last_H)            # [B,V]
+            logits = FC(last_H)                 # [B,V] - use cached reference
             new_tags = logits.argmax(dim=1)    # [B] Long
             
             # OPTIMIZATION 2: Compute masks once and reuse
@@ -224,7 +230,7 @@ class BatchedTableDecoderV2:
             # Update incremental embedding buffer for next step
             if t < Tmax:  # Only if we'll do another step
                 # FIX 1: Use clean pos_rows without unsqueeze
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_rows[t]  # [B,D] + [D]
+                tgt_emb_buf[t] = E(new_tags) + pos_rows[t]  # [B,D] + [D] - use cached reference
             
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
@@ -250,7 +256,7 @@ class BatchedTableDecoderV2:
                     rows = last_H.index_select(0, append_idx)  # [K,D]
                     slots = k_counters[append_idx].long()      # [K] - current slot for each sample
                     flat_idx = append_idx * tag_H_buf.size(1) + slots  # [K] - use current buffer size
-                    tag_H_buf.view(-1, D).index_copy_(0, flat_idx, rows)  # Vectorized write
+                    tag_H_buf.view(-1, D_embed).index_copy_(0, flat_idx, rows)  # Vectorized write
                     k_counters[append_idx] += 1  # Increment counters
                     
                     # OPTIMIZATION: Tensorized span tracking - no CPU syncs
