@@ -119,21 +119,21 @@ class BatchedTableDecoderV2:
         prof = AggProfiler()
         prof.begin("batched_ar_loop_v2", self._prof)
         
+        # ---- Incremental embedding buffer optimization ----
+        D = tt._embedding.embedding_dim
+        tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
+        pe = tt._positional_encoding.pe  # [max_len, D] positional encoding buffer
+        
+        # Initialize first step with start tokens
+        start_row = decoded_tags[0, :]  # [B] start tokens
+        tgt_emb_buf[0] = tt._embedding(start_row) + pe[0].unsqueeze(0)  # [B,D]
+        
         # Track current step
         t = 0
         
         for step in range(Tmax):
-            # Incremental decoding: only embed the last token (after step 0)
-            if step == 0:
-                # First step: embed start token
-                tgt = tt._positional_encoding(tt._embedding(decoded_tags[0:1, :]))  # [1,B,D]
-            else:
-                # Incremental: only embed new token with correct position
-                last_tokens = decoded_tags[t:t+1, :]  # [1,B]
-                # Need to handle positional encoding correctly for incremental
-                # This requires modifying the transformer to support incremental PE
-                # For now, fall back to full re-embedding (but we'll optimize this)
-                tgt = tt._positional_encoding(tt._embedding(decoded_tags[:t+1, :]))  # [t+1,B,D]
+            # Use incremental embedding buffer - only pass what we've computed so far
+            tgt = tgt_emb_buf[:t+1, :, :]  # [t+1,B,D] - grows each step
             
             # Transformer decoder with cache
             prof.begin("decoder_step", self._prof)
@@ -162,6 +162,10 @@ class BatchedTableDecoderV2:
             # Write to preallocated buffer
             t += 1
             decoded_tags[t, :] = new_tags
+            
+            # Update incremental embedding buffer for next step
+            if t < Tmax:  # Only if we'll do another step
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pe[t].unsqueeze(0)  # [B,D]
             
             # Update lengths for non-finished sequences
             state.lengths = torch.where(~state.finished, state.lengths + 1, state.lengths)

@@ -57,16 +57,13 @@ class Encoder04(nn.Module):
 
         Returns
         -------
-        tensor : (batch_size, enc_image_size, enc_image_size, 256)
-                encoded images
+        tensor : (batch_size, 256, enc_image_size, enc_image_size)
+                encoded images in NCHW format
         """
         out = self._resnet(images)  # (batch_size, 256, 28, 28)
         self._log().debug("forward: resnet out: {}".format(out.size()))
-        out = self._adaptive_pool(out)
-        out = out.permute(
-            0, 2, 3, 1
-        )  # (batch_size, enc_image_size, enc_image_size, 256)
+        out = self._adaptive_pool(out)  # (batch_size, 256, enc_image_size, enc_image_size)
 
         self._log().debug("enc forward: final out: {}".format(out.size()))
 
-        return out
+        return out  # Return NCHW to avoid double permute

@@ -40,6 +40,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._enc_image_size = config["model"]["enc_image_size"]
         self._encoder_dim = config["model"]["hidden_dim"]
         self._encoder = Encoder04(self._enc_image_size, self._encoder_dim).to(device)
+        # Use channels_last memory format for better performance
+        self._encoder = self._encoder.to(memory_format=torch.channels_last)
 
         tag_vocab_size = len(word_map["word_map_tag"])
 
@@ -107,6 +109,13 @@ class TableModel04_rs(BaseModel, nn.Module):
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
         self._batched_decoder = BatchedTableDecoderV2(self, self._device)
+        
+        # Enable fast kernels where safe
+        if device == 'cuda':
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")  # Ampere+ only
 
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
@@ -119,24 +128,33 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._encoder.eval();
         self._tag_transformer.eval();
         self._bbox_decoder.eval()
+        
+        # Convert to channels_last for better performance
+        imgs = imgs.to(memory_format=torch.channels_last, non_blocking=True)
 
         prof = AggProfiler()
-        prof.begin("model_encoder", self._prof)
-        enc_out_batch = self._encoder(imgs)  # [B,H,W,C]
-        prof.end("model_encoder", self._prof)
+        
+        # Use autocast for encoder and tag-encoder (safe for bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(self._device.type == 'cuda')):
+            prof.begin("model_encoder", self._prof)
+            enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - now NCHW format
+            prof.end("model_encoder", self._prof)
 
-        prof.begin("model_tag_transformer_input_filter", self._prof)
-        x = self._tag_transformer._input_filter(enc_out_batch.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)  # [B,h,w,C]
-        prof.end("model_tag_transformer_input_filter", self._prof)
+            prof.begin("model_tag_transformer_input_filter", self._prof)
+            # Direct call to input_filter (NCHW) then single permute to NHWC
+            x = self._tag_transformer._input_filter(enc_out_batch).permute(0, 2, 3, 1)  # [B,h,w,C]
+            prof.end("model_tag_transformer_input_filter", self._prof)
 
-        B_, h, w, C = x.shape
-        mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
+            B_, h, w, C = x.shape
+            mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
 
-        prof.begin("model_tag_transformer_encoder", self._prof)
-        mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
-        prof.end("model_tag_transformer_encoder", self._prof)
+            prof.begin("model_tag_transformer_encoder", self._prof)
+            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
+            prof.end("model_tag_transformer_encoder", self._prof)
 
-        return self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+        # Pass encoder output in original NCHW format for bbox decoder compatibility
+        enc_out_batch_nhwc = enc_out_batch.permute(0, 2, 3, 1)  # Convert to NHWC for bbox decoder
+        return self._batched_decoder.predict_batched(enc_out_batch_nhwc, mem_enc, max_steps)
 
     def _log(self):
         # Setup a custom logger
