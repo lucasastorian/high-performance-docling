@@ -15,8 +15,8 @@ import numpy as np
 
 # from fork.layout.layout_model import LayoutModel
 # from fork.table.table_structure_model import TableStructureModel
-from standard.layout.layout_model import LayoutModel
-from standard.table.table_structure_model import TableStructureModel
+from fork.layout.layout_model import LayoutModel
+from fork.table.table_structure_model import TableStructureModel
 from optimized.table.table_timing_debug import print_timing_summary
 
 from table_regression_runner import TableRegressionRunner, Tolerances
