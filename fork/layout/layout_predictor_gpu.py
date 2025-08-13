@@ -275,7 +275,7 @@ class LayoutPredictor:
                 assert device_input.is_contiguous(memory_format=torch.channels_last)
 
             with timer.time_section('predict'):
-                outputs = self._model(pixel_values=device_input)
+                outputs = self._model(device_input)
 
             # target_sizes is (H, W) per *real* image
             with timer.time_section('postprocess'):
