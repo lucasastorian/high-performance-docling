@@ -109,18 +109,227 @@ class TableModel04_rs(BaseModel, nn.Module):
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
         """
-        Batched wrapper around the original single-image inference.
+        Stage 1 batched inference: batch the image encoder + tag-encoder.
         imgs: FloatTensor [B, 3, 448, 448]
         Returns: list of (seq, outputs_class, outputs_coord) for each item.
         """
-        results = []
         B = imgs.size(0)
+        
+        # Stage 1: Batch the image encoder for all images at once
+        # enc_out_batch: [B, H, W, C] where H=W=28, C=256
+        enc_out_batch = self._encoder(imgs)
+        
+        # Stage 1: Apply input_filter to entire batch and prepare transformer memory
+        # Apply CNN filter: [B,C,H,W] -> [B,h,w,C] where h=w=28, C=512  
+        filtered_batch = self._tag_transformer._input_filter(
+            enc_out_batch.permute(0, 3, 1, 2)
+        ).permute(0, 2, 3, 1)
+        
+        # Flatten spatial dims and transpose for transformer: [B,h,w,C] -> [S,B,C]
+        memory_batch = self._flatten_hw_to_sbc(filtered_batch)
+        
+        # Stage 1: Run transformer encoder once for the entire batch with no mask
+        encoder_out_batch = self._tag_transformer._encoder(memory_batch, mask=None)
+        
+        # Decoder still runs per-item (Stage 2 will batch this too)
+        results = []
         for i in range(B):
-            seq, outputs_class, outputs_coord = self._predict_single(
-                imgs[i:i + 1], max_steps, k, return_attention=return_attention
+            # Extract per-item encoder outputs
+            enc_out_i = enc_out_batch[i:i+1]  # [1,H,W,C] for bbox decoder
+            encoder_out_i = encoder_out_batch[:, i:i+1, :]  # [S,1,C] for tag decoder
+            
+            seq, outputs_class, outputs_coord = self._predict_single_with_precomputed(
+                enc_out_i, encoder_out_i, max_steps, k, return_attention=return_attention
             )
             results.append((seq, outputs_class, outputs_coord))
         return results
+    
+    def _flatten_hw_to_sbc(self, hwc):
+        """Utility: [B,H,W,C] -> [S,B,C] for transformer"""
+        B, H, W, C = hwc.shape
+        return hwc.flatten(1, 2).permute(1, 0, 2).contiguous()
+
+    def _predict_single_with_precomputed(self, enc_out, encoder_out, max_steps, k, return_attention=False):
+        """
+        Single-item inference with precomputed encoder outputs (Stage 1 optimization).
+        enc_out: [1,H,W,C] from image encoder (for bbox decoder)
+        encoder_out: [S,1,C] from tag transformer encoder
+        """
+        AggProfiler().begin("predict_total", self._prof)
+
+        word_map = self._init_data["word_map"]["word_map_tag"]
+        
+        # Skip encoder steps - use precomputed outputs
+        decoded_tags = (
+            torch.LongTensor([word_map["<start>"]]).to(self._device).unsqueeze(1)
+        )
+        output_tags = []
+        cache = None
+        tag_H_buf = []
+
+        skip_next_tag = True
+        prev_tag_ucel = False
+        line_num = 0
+
+        # Populate bboxes_to_merge, indexes of first lcel, and last cell in a span
+        first_lcel = True
+        bboxes_to_merge = {}
+        cur_bbox_ind = -1
+        bbox_ind = 0
+
+        # Create dummy encoder_mask for compatibility (not used with precomputed encoder_out)
+        encoder_mask = None
+
+        # Autoregressive decoder loop (unchanged from original)
+        while len(output_tags) < self._max_pred_len:
+            decoded_embedding = self._tag_transformer._embedding(decoded_tags)
+            decoded_embedding = self._tag_transformer._positional_encoding(
+                decoded_embedding
+            )
+            AggProfiler().begin("model_tag_transformer_decoder", self._prof)
+            decoded, cache = self._tag_transformer._decoder(
+                decoded_embedding,
+                encoder_out,  # Use precomputed encoder output
+                cache,
+                memory_key_padding_mask=encoder_mask,
+            )
+            AggProfiler().end("model_tag_transformer_decoder", self._prof)
+            # Grab last feature to produce token
+            AggProfiler().begin("model_tag_transformer_fc", self._prof)
+            logits = self._tag_transformer._fc(decoded[-1, :, :])  # 1, vocab_size
+            AggProfiler().end("model_tag_transformer_fc", self._prof)
+            new_tag = logits.argmax(1).item()
+
+            # STRUCTURE ERROR CORRECTION
+            # Correction for first line xcel...
+            if line_num == 0:
+                if new_tag == word_map["xcel"]:
+                    new_tag = word_map["lcel"]
+
+            # Correction for ucel, lcel sequence...
+            if prev_tag_ucel:
+                if new_tag == word_map["lcel"]:
+                    new_tag = word_map["fcel"]
+
+            # End of generation
+            if new_tag == word_map["<end>"]:
+                output_tags.append(new_tag)
+                decoded_tags = torch.cat(
+                    [
+                        decoded_tags,
+                        torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
+                    ],
+                    dim=0,
+                )  # current_output_len, 1
+                break
+            output_tags.append(new_tag)
+
+            # BBOX PREDICTION
+            # MAKE SURE TO SYNC NUMBER OF CELLS WITH NUMBER OF BBOXes
+            if not skip_next_tag:
+                if new_tag in [
+                    word_map["fcel"],
+                    word_map["ecel"],
+                    word_map["ched"],
+                    word_map["rhed"],
+                    word_map["srow"],
+                    word_map["nl"],
+                    word_map["ucel"],
+                ]:
+                    # GENERATE BBOX HERE TOO (All other cases)...
+                    tag_H_buf.append(decoded[-1, :, :])
+                    if first_lcel is not True:
+                        # Mark end index for horizontal cell bbox merge
+                        bboxes_to_merge[cur_bbox_ind] = bbox_ind
+                    bbox_ind += 1
+
+            # Treat horisontal span bboxes...
+            if new_tag != word_map["lcel"]:
+                first_lcel = True
+            else:
+                if first_lcel:
+                    # GENERATE BBOX HERE (Beginning of horisontal span)...
+                    tag_H_buf.append(decoded[-1, :, :])
+                    first_lcel = False
+                    # Mark start index for cell bbox merge
+                    cur_bbox_ind = bbox_ind
+                    bboxes_to_merge[cur_bbox_ind] = -1
+                    bbox_ind += 1
+
+            if new_tag in [word_map["nl"], word_map["ucel"], word_map["xcel"]]:
+                skip_next_tag = True
+            else:
+                skip_next_tag = False
+
+            # Register ucel in sequence...
+            if new_tag == word_map["ucel"]:
+                prev_tag_ucel = True
+            else:
+                prev_tag_ucel = False
+
+            decoded_tags = torch.cat(
+                [
+                    decoded_tags,
+                    torch.LongTensor([new_tag]).unsqueeze(1).to(self._device),
+                ],
+                dim=0,
+            )  # current_output_len, 1
+        seq = decoded_tags.squeeze().tolist()
+
+        if self._bbox:
+            AggProfiler().begin("model_bbox_decoder", self._prof)
+            outputs_class, outputs_coord = self._bbox_decoder.inference(
+                enc_out, tag_H_buf  # Use precomputed enc_out
+            )
+            AggProfiler().end("model_bbox_decoder", self._prof)
+        else:
+            outputs_class, outputs_coord = None, None
+
+        outputs_class.to(self._device)
+        outputs_coord.to(self._device)
+
+        ########################################################################################
+        # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
+        ########################################################################################
+
+        outputs_class1 = []
+        outputs_coord1 = []
+        boxes_to_skip = []
+
+        for box_ind in range(len(outputs_coord)):
+            box1 = outputs_coord[box_ind].to(self._device)
+            cls1 = outputs_class[box_ind].to(self._device)
+            if box_ind in bboxes_to_merge:
+                box2 = outputs_coord[bboxes_to_merge[box_ind]].to(self._device)
+                boxes_to_skip.append(bboxes_to_merge[box_ind])
+                boxm = self.mergebboxes(box1, box2).to(self._device)
+                outputs_coord1.append(boxm)
+                outputs_class1.append(cls1)
+            else:
+                if box_ind not in boxes_to_skip:
+                    outputs_coord1.append(box1)
+                    outputs_class1.append(cls1)
+
+        if len(outputs_coord1) > 0:
+            outputs_coord1 = torch.stack(outputs_coord1)
+        else:
+            outputs_coord1 = torch.empty(0)
+        if len(outputs_class1) > 0:
+            outputs_class1 = torch.stack(outputs_class1)
+        else:
+            outputs_class1 = torch.empty(0)
+
+        outputs_class = outputs_class1
+        outputs_coord = outputs_coord1
+
+        # Do the rest of the steps...
+        AggProfiler().end("predict_total", self._prof)
+        num_tab_cells = seq.count(4) + seq.count(5)
+        num_rows = seq.count(9)
+        self._log().info(
+            "OTSL predicted table cells#: {}; rows#: {}".format(num_tab_cells, num_rows)
+        )
+        return seq, outputs_class, outputs_coord
 
     def _predict_single(self, imgs, max_steps, k, return_attention=False):
         r"""
