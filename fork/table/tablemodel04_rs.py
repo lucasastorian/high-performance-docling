@@ -135,7 +135,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         prof = AggProfiler()
         
         # Use autocast for encoder and tag-encoder (safe for bfloat16)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(self._device.type == 'cuda')):
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(self._device == 'cuda')):
             prof.begin("model_encoder", self._prof)
             enc_out_batch = self._encoder(imgs)  # [B,C,H,W] - now NCHW format
             prof.end("model_encoder", self._prof)
