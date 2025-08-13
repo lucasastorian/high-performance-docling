@@ -117,6 +117,10 @@ class TableModel04_rs(BaseModel, nn.Module):
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
         
+        # Optimization 8: Optionally disable gradients globally for inference
+        if os.getenv("DISABLE_GRAD", "1") == "1":
+            torch.set_grad_enabled(False)
+        
         # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
@@ -149,26 +153,28 @@ class TableModel04_rs(BaseModel, nn.Module):
         enc_out = torch.empty((B_padded, out_C, out_H, out_W), 
                              device=device, dtype=y0.dtype)  # NCHW
         
-        # Process in blocks
+        # Process in blocks - Optimization 3: avoid cat() by preallocating chunk buffer
+        chunk_buffer = torch.empty((block_bs, C, H, W), device=device, dtype=imgs.dtype)
+        
         for i in range(0, B_padded, block_bs):
             end_idx = min(i + block_bs, B0)
             
             if end_idx > i:  # We have real images
-                if end_idx - i == block_bs:
-                    # Full block of real images
-                    chunk = imgs[i:end_idx]
-                else:
-                    # Partial block - need padding
-                    real_chunk = imgs[i:end_idx]
-                    pad_size = block_bs - (end_idx - i)
-                    # Repeat last image for padding
-                    padding = real_chunk[-1:].repeat(pad_size, 1, 1, 1)
-                    chunk = torch.cat([real_chunk, padding], dim=0)
+                real_count = end_idx - i
+                # Copy real images to chunk buffer
+                chunk_buffer[:real_count] = imgs[i:end_idx]
+                # Pad with last image if needed (no cat!)
+                if real_count < block_bs:
+                    last_img = imgs[end_idx - 1]
+                    for j in range(real_count, block_bs):
+                        chunk_buffer[j] = last_img
             else:
                 # All padding (shouldn't happen with correct logic)
-                chunk = imgs[-1:].repeat(block_bs, 1, 1, 1)
+                last_img = imgs[-1]
+                for j in range(block_bs):
+                    chunk_buffer[j] = last_img
             
-            chunk = chunk.to(memory_format=torch.channels_last, non_blocking=True)
+            chunk = chunk_buffer.to(memory_format=torch.channels_last, non_blocking=True)
             
             # Use CUDA Graph if available
             if getattr(self._encoder, "_gr", None) and chunk.shape[0] == block_bs:

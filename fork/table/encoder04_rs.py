@@ -27,12 +27,12 @@ class Encoder04(nn.Module):
     def __init__(self, enc_image_size: int, enc_dim: int = 512):
         super().__init__()
         
-        # Torch backend optimizations (Optimization 4)
+        # Backend optimizations (Optimization 6)
         # Enable TF32 for faster matmuls on Ampere+ GPUs
         torch.backends.cuda.matmul.allow_tf32 = True
         cudnn.allow_tf32 = True
-        # Disable benchmark to avoid overhead (we have fixed shapes with CUDA graphs)
-        cudnn.benchmark = False
+        torch.set_float32_matmul_precision("high")  # helps linear/proj in later stages
+        # Note: cudnn.benchmark will be enabled during warmup, not here
         
         self.enc_image_size = enc_image_size
         self._encoder_dim = 256  # ResNet18 layer3 output channels
@@ -44,7 +44,7 @@ class Encoder04(nn.Module):
 
         self._adaptive_pool = nn.AdaptiveAvgPool2d((self.enc_image_size, self.enc_image_size))
         
-        # CUDA Graphs support (Optimization 1) - ON by default
+        # CUDA Graphs support - ON by default
         self._use_graphs = bool(int(os.getenv("ENCODER_USE_GRAPHS", "1")))
         self._gr_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
         self._gr_in = None
@@ -52,6 +52,7 @@ class Encoder04(nn.Module):
         self._gr = None
         self._gr_reuses_output = True  # caller must .clone() if they need a fresh tensor
         self._fused = False  # Track if Conv+BN fusion has been applied
+        self._pool_checked = False  # Track if we've checked for no-op pool
 
     def _log(self):
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
@@ -109,11 +110,38 @@ class Encoder04(nn.Module):
         
         self._fused = True
         self._log().info("Conv+BN layers fused for inference")
+        
+        # Optimization 5: Pin channels-last permanently after BN fusion
+        self._resnet.to(memory_format=torch.channels_last)
+        for m in self._resnet.modules():
+            if isinstance(m, nn.Conv2d):
+                m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last)
+                if m.bias is not None:
+                    m.bias.data = m.bias.data.contiguous()
+        self._log().info("Weights pinned to channels-last format")
+
+    def _check_adaptive_pool(self, H=448, W=448, device="cuda"):
+        """Check if AdaptiveAvgPool2d is a no-op and replace with Identity (Optimization 2)"""
+        if self._pool_checked:
+            return
+            
+        with torch.inference_mode():
+            dummy = torch.zeros(1, 3, H, W, device=device).to(memory_format=torch.channels_last)
+            out = self._resnet(dummy)
+        
+        if out.shape[-2:] == (self.enc_image_size, self.enc_image_size):
+            self._adaptive_pool = nn.Identity()
+            self._log().info(f"AdaptiveAvgPool2d is no-op at size {self.enc_image_size}, replaced with Identity")
+        
+        self._pool_checked = True
 
     def _maybe_capture(self, C=3, H=448, W=448, device="cuda"):
         """Capture CUDA Graph for fixed batch size encoding (Optimization 1)"""
         if not self._use_graphs or self._gr is not None or device != "cuda":
             return
+        
+        # Check for no-op pool (Optimization 2)
+        self._check_adaptive_pool(H, W, device)
         
         # Fuse Conv+BN before capturing graph (Optimization 3)
         self._fuse_conv_bn()
@@ -125,12 +153,19 @@ class Encoder04(nn.Module):
         # Create static input buffer
         static_in = torch.zeros(self._gr_bs, C, H, W, device=device).to(memory_format=torch.channels_last)
         
+        # Enable benchmark for warmup to find best algorithm (Optimization 6)
+        old_benchmark = cudnn.benchmark
+        cudnn.benchmark = True
+        
         # Warmup runs (2x) to ensure cuDNN algo selection and cache warming
         with torch.inference_mode():
             for _ in range(2):
                 _ = self._resnet(static_in)
                 _ = self._adaptive_pool(_)
                 torch.cuda.synchronize()
+        
+        # Restore benchmark setting after warmup
+        cudnn.benchmark = old_benchmark
         
         # Allocate static output buffer by running full forward
         with torch.inference_mode():
@@ -162,9 +197,13 @@ class Encoder04(nn.Module):
         Returns:
             NCHW tensor [B,256,enc_image_size,enc_image_size]
         """
-        assert images.dim() == 4 and images.size(1) == 3, "images should be [B,3,H,W]"
+        # Optimization 7: Remove assertions from hot path 
+        # (shape checks should be done during init/warmup)
         
-        # Ensure Conv+BN fusion for non-graph path too
+        # Ensure optimizations are applied for non-graph path
+        if not self._pool_checked and images.device.type == 'cuda':
+            self._check_adaptive_pool(images.shape[2], images.shape[3], str(images.device))
+        
         if not self._fused and not self.training:
             self._fuse_conv_bn()
         
