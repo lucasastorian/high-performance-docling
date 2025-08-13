@@ -15,9 +15,8 @@ from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
-# from fork.table.transformer_rs import Tag_Transformer
-# from fork.table.batched_decoder_v2 import BatchedTableDecoderV2
-from fork.table.batched_decoder_v3 import BatchedTableDecoderKV, Tag_Transformer_Fast
+from fork.table.transformer_rs import Tag_Transformer
+from fork.table.batched_decoder_v3 import BatchedTableDecoderV2
 
 LOG_LEVEL = logging.WARN
 
@@ -74,15 +73,16 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         self._max_pred_len = config["predict"]["max_steps"]
 
-        self._tag_transformer = Tag_Transformer_Fast(
-            device=self._device,
-            vocab_size=tag_vocab_size,
-            embed_dim=self._decoder_dim,
-            decoder_layers=self._dec_layers,
+        self._tag_transformer = Tag_Transformer(
+            device,
+            tag_vocab_size,
+            td_encode,
+            self._decoder_dim,
+            self._enc_layers,
+            self._dec_layers,
+            self._enc_image_size,
             n_heads=self._n_heads,
-            dim_ff=1024,
-            dropout=0.0,
-        ).to(self._device)
+        ).to(device)
 
         self._bbox_decoder = BBoxDecoder(
             device,
@@ -109,7 +109,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._skip_ids = torch.stack([self._ids[n] for n in _skip_names if n in self._ids]) \
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
-        self._batched_decoder = BatchedTableDecoderKV(self, self._device)
+        self._batched_decoder = BatchedTableDecoderV2(self, self._device)
 
         # Enable fast kernels where safe
         if device == 'cuda':
@@ -157,74 +157,41 @@ class TableModel04_rs(BaseModel, nn.Module):
         is_cuda = str(self._device).startswith('cuda')
         timer = _CudaTimer() if is_cuda else _CPUTimer()
 
-        # ===== ENCODER =====
+        # ===== ENCODER TIMING =====
         with timer.time_section('encoder_forward'):
-            # [B,C,H,W] - NCHW
-            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)
+            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
 
-        # ===== MEMORY PREP (filter/proj + reshape to [S,B,D]) =====
-        with timer.time_section('memory_prep'):
-            C_in = enc_out_batch.shape[1]
-            # Decoder (token) hidden size D = classifier in_features
-            D = int(self._tag_transformer._fc.in_features)
+        # ===== MEMORY PREPARATION =====
+        with timer.time_section('tag_input_filter'):
+            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
 
-            # 1) Optional learned filter if present (old Tag_Transformer)
-            if hasattr(self._tag_transformer, '_input_filter'):
-                filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C?,h,w]
-                C_mid = filtered_nchw.shape[1]
-                # If still not D, fall back to 1x1 proj
-                if C_mid != D:
-                    if not hasattr(self, '_mem_proj') or getattr(self, '_mem_proj', None) is None:
-                        self._mem_proj = nn.Conv2d(C_mid, D, kernel_size=1, bias=False).to(self._device)
-                        self._mem_proj.requires_grad_(False)
-                        self._mem_proj.eval()
-                    filtered_nchw = self._mem_proj(filtered_nchw)
-            else:
-                # New fast decoder path: no filter provided; ensure channels == D
-                if C_in != D:
-                    if not hasattr(self, '_mem_proj') or getattr(self, '_mem_proj', None) is None \
-                            or self._mem_proj.in_channels != C_in or self._mem_proj.out_channels != D:
-                        self._mem_proj = nn.Conv2d(C_in, D, kernel_size=1, bias=False).to(self._device)
-                        self._mem_proj.requires_grad_(False)
-                        self._mem_proj.eval()
-                    filtered_nchw = self._mem_proj(enc_out_batch)
-                else:
-                    filtered_nchw = enc_out_batch
+        with timer.time_section('memory_reshape'):
+            filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
+            B_, h, w, C = filtered_nhwc.shape
+            mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
 
-            # [B,C,h,w] -> [S,B,D]
-            B_, C_, h, w = filtered_nchw.shape
-            filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C]
-            mem = filtered_nhwc.reshape(B_, h * w, C_).permute(1, 0, 2)  # [S,B,D]
-            # NOTE: D == C_ by construction here
-
-        # ===== TAG ENCODER (optional) =====
+        # ===== TAG TRANSFORMER ENCODER =====
         with timer.time_section('tag_encoder'):
-            if hasattr(self._tag_transformer, '_encoder') and self._tag_transformer._encoder is not None:
-                # Old path: run transformer encoder over memory tokens [S,B,D]
-                mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,D]
-            else:
-                # New fast path: use raw memory tokens directly
-                mem_enc = mem
+            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
 
         # ===== BATCHED DECODER =====
         with timer.time_section('batched_ar_decoder'):
             results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps, timer)
 
-        # ===== TIMINGS =====
+        # Finalize and print timing if profiling enabled
         if self._prof:
             timer.finalize()
-            total_time = (
-                    timer.get_time('encoder_forward') +
-                    timer.get_time('memory_prep') +
-                    timer.get_time('tag_encoder') +
-                    timer.get_time('batched_ar_decoder')
-            )
+            total_time = (timer.get_time('encoder_forward') + timer.get_time('tag_input_filter') +
+                         timer.get_time('memory_reshape') + timer.get_time('tag_encoder') +
+                         timer.get_time('batched_ar_decoder'))
             print(f"\n=== TableModel Timing (B={B}) ===")
             print(f"  encoder_forward:    {timer.get_time('encoder_forward'):7.1f} ms")
-            print(f"  memory_prep:        {timer.get_time('memory_prep'):7.1f} ms")
+            print(f"  tag_input_filter:   {timer.get_time('tag_input_filter'):7.1f} ms")
+            print(f"  memory_reshape:     {timer.get_time('memory_reshape'):7.1f} ms")
             print(f"  tag_encoder:        {timer.get_time('tag_encoder'):7.1f} ms")
             print(f"  batched_ar_decoder: {timer.get_time('batched_ar_decoder'):7.1f} ms")
 
+            # Print decoder breakdown if available
             if timer.get_time('ar_loop') > 0:
                 print(f"\n  === Decoder Breakdown ===")
                 print(f"    ar_loop:          {timer.get_time('ar_loop'):7.1f} ms")

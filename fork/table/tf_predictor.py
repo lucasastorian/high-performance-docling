@@ -24,7 +24,6 @@ from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
 from docling_ibm_models.tableformer.data_management.matching_post_processor import MatchingPostProcessor
 
-from fork.table.kv_remap_loader import remap_mha_to_explicit_qkv
 from fork.table.tablemodel04_rs import TableModel04_rs
 # from optimized.table.matching_post_processor import MatchingPostProcessor
 from fork.timers import _CPUTimer, _CudaTimer
@@ -171,148 +170,53 @@ class TFPredictor:
 
     def _load_model(self):
         r"""
-        Load the proper model with backward-compatible decoder weight mapping.
+        Load the proper model
         """
-        import glob
-        import os
-        from safetensors.torch import load_file  # safe & fast
 
         self._model_type = self._config["model"]["type"]
-
-        # --- small helper: choose newest checkpoint ---
-        def _pick_latest_ckpt(save_dir: str) -> str:
-            fns = sorted(glob.glob(os.path.join(save_dir, "tableformer_*.safetensors")),
-                         key=lambda p: os.path.getmtime(p), reverse=True)
-            if not fns:
-                err = f"Not able to find a model file for {self._model_type} in {save_dir}"
-                self._log().error(err)
-                raise ValueError(err)
-            return fns[0]
-
-        # --- small helper: remap old MHA keys -> explicit q/k/v/o ---
-        def _remap_mha_to_explicit_qkv(sd: dict, dec_prefix: str, num_layers: int) -> dict:
-            import torch
-            sd = dict(sd)  # shallow copy
-
-            def _chunk3(x):
-                return torch.chunk(x, 3, dim=0)
-
-            for i in range(num_layers):
-                base = f"{dec_prefix}{i}."
-
-                # Self-attn (decoder self)
-                w = base + "self_attn.in_proj_weight"
-                b = base + "self_attn.in_proj_bias"
-                if w in sd:
-                    W = sd.pop(w)
-                    B = sd.pop(b) if b in sd else None
-                    qW, kW, vW = _chunk3(W)
-                    if B is not None:
-                        qB, kB, vB = _chunk3(B)
-                    sd[base + "self_proj.q.weight"] = qW
-                    sd[base + "self_proj.k.weight"] = kW
-                    sd[base + "self_proj.v.weight"] = vW
-                    if B is not None:
-                        sd[base + "self_proj.q.bias"] = qB
-                        sd[base + "self_proj.k.bias"] = kB
-                        sd[base + "self_proj.v.bias"] = vB
-
-                w = base + "self_attn.out_proj.weight"
-                if w in sd:
-                    sd[base + "self_proj.o.weight"] = sd.pop(w)
-                b = base + "self_attn.out_proj.bias"
-                if b in sd:
-                    sd[base + "self_proj.o.bias"] = sd.pop(b)
-
-                # Cross-attn (encoder-decoder)
-                w = base + "multihead_attn.in_proj_weight"
-                b = base + "multihead_attn.in_proj_bias"
-                if w in sd:
-                    W = sd.pop(w)
-                    B = sd.pop(b) if b in sd else None
-                    qW, kW, vW = _chunk3(W)
-                    if B is not None:
-                        qB, kB, vB = _chunk3(B)
-                    sd[base + "cross_q.weight"] = qW
-                    sd[base + "cross_k.weight"] = kW
-                    sd[base + "cross_v.weight"] = vW
-                    if B is not None:
-                        sd[base + "cross_q.bias"] = qB
-                        sd[base + "cross_k.bias"] = kB
-                        sd[base + "cross_v.bias"] = vB
-
-                w = base + "multihead_attn.out_proj.weight"
-                if w in sd:
-                    sd[base + "out.weight"] = sd.pop(w)
-                b = base + "multihead_attn.out_proj.bias"
-                if b in sd:
-                    sd[base + "out.bias"] = sd.pop(b)
-
-            return sd
 
         # Use lock to prevent threading issues during model initialization
         with _model_init_lock:
             model = TableModel04_rs(self._config, self._init_data, self._device)
+
+            # Ensure model parameters are in default contiguous format before safetensors load
             model = model.to(memory_format=torch.contiguous_format)
+
             if model is None:
-                err_msg = f"Not able to initiate a model for {self._model_type}"
+                err_msg = "Not able to initiate a model for {}".format(self._model_type)
                 self._log().error(err_msg)
                 raise ValueError(err_msg)
 
-            self._remove_padding = (self._model_type == "TableModel02")
+            self._remove_padding = False
+            if self._model_type == "TableModel02":
+                self._remove_padding = True
 
-            # --- locate checkpoint ---
+            # Load model from safetensors
             save_dir = self._config["model"]["save_dir"]
-            ckpt_path = _pick_latest_ckpt(save_dir)
-            self._log().info(f"Loading checkpoint: {ckpt_path}")
-
-            # --- fast path: try strict load as-is ---
-            sd = load_file(ckpt_path, device=str(self._device))
-            try:
-                missing, unexpected = model.load_state_dict(sd, strict=True)
-                # load_state_dict returns lists only in newer PyTorch; to be safe, guard:
-                if (missing or unexpected):
-                    raise RuntimeError("Strict load reported missing/unexpected keys")
-                self._log().info("Loaded weights with strict=True (no remap needed).")
-            except Exception as e:
-                # --- compat path: remap decoder weights then load with strict=False ---
-                L = self._config["model"]["dec_layers"]
-                dec_prefix = "_tag_transformer._decoder.layers."
-                needs_remap = any(
-                    (f"{dec_prefix}0.self_attn.in_proj_weight" in k) or
-                    (f"{dec_prefix}0.multihead_attn.in_proj_weight" in k)
-                    for k in sd.keys()
+            models_fn = glob.glob(f"{save_dir}/tableformer_*.safetensors")
+            if not models_fn:
+                err_msg = "Not able to find a model file for {}".format(
+                    self._model_type
                 )
-                if not needs_remap:
-                    # different error; surface with context
-                    self._log().error(f"Strict load failed and checkpoint looks already-new: {e}")
-                    raise
+                self._log().error(err_msg)
+                raise ValueError(err_msg)
+            model_fn = models_fn[
+                0
+            ]  # Take the first tableformer safetensors file inside the save_dir
+            missing, unexpected = load_model(model, model_fn, device=self._device)
+            if missing or unexpected:
+                err_msg = "Not able to load the model weights for {}".format(
+                    self._model_type
+                )
+                self._log().error(err_msg)
+                raise ValueError(err_msg)
 
-                self._log().warning("Strict load failed; remapping MHA weights -> explicit q/k/v/o…")
-                sd2 = _remap_mha_to_explicit_qkv(sd, dec_prefix=dec_prefix, num_layers=L)
-                missing, unexpected = model.load_state_dict(sd2, strict=False)
-
-                # Log a concise summary so we know what's left
-                m_cnt = len(missing) if isinstance(missing, (list, tuple)) else 0
-                u_cnt = len(unexpected) if isinstance(unexpected, (list, tuple)) else 0
-                if m_cnt or u_cnt:
-                    self._log().warning(f"Loaded with strict=False. Missing: {m_cnt}, Unexpected: {u_cnt}")
-                    if m_cnt:
-                        self._log().debug(f"Missing keys (first 8): {missing[:8]}")
-                    if u_cnt:
-                        self._log().debug(f"Unexpected keys (first 8): {unexpected[:8]}")
-                else:
-                    self._log().info("Loaded after remap with no residual key mismatches.")
-
-            # --- prepare encoder AFTER weights load ---
+            # Prepare the encoder for inference AFTER loading weights
+            # This handles fusion, compilation, and graph capture in correct order
             if hasattr(model, '_encoder') and hasattr(model._encoder, 'prepare_for_inference'):
+                # prepare_for_inference returns the encoder (may be compiled wrapper)
                 model._encoder = model._encoder.prepare_for_inference(device=self._device)
                 self._log().info("Encoder prepared for inference after weight loading")
-
-            # Evaluation mode + no grad (optional)
-            model.eval()
-            if os.getenv("DISABLE_GRAD", "1") == "1":
-                torch.set_grad_enabled(False)
 
         return model
 
