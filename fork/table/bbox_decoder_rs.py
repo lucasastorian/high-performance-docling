@@ -126,43 +126,176 @@ class BBoxDecoder(nn.Module):
         # Setup a custom logger
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
-    def inference(self, encoder_out, tag_H):
+    @torch.inference_mode()
+    def inference(self, enc_out_nchw, tag_H, tile_pixels: int = 128, use_amp: bool = False):
         """
-        Inference on test images with beam search
+        Vectorized, memory-efficient inference for ONE table.
+        - No new parameters.
+        - Accepts NCHW to avoid extra permutes.
+        - Uses streaming softmax over pixels to avoid [N,P,A] blow-up.
+
+        Args
+        ----
+        enc_out_nchw : Tensor [1, C, H, W]
+        tag_H        : List[Tensor] each [1, D] or [D]
+        tile_pixels  : int, pixel tile size along P=H*W
+        use_amp      : whether to autocast to bf16/fp16 (try after parity check)
+
+        Returns
+        -------
+        logits_cls : [N, num_classes+1]
+        boxes      : [N, 4] in cxcywh
         """
-        if hasattr(self, "_input_filter"):
-            encoder_out = self._input_filter(encoder_out.permute(0, 3, 1, 2)).permute(
-                0, 2, 3, 1
-            )
+        assert enc_out_nchw.dim() == 4 and enc_out_nchw.size(0) == 1, \
+            "bbox inference expects a single table (B=1)."
 
-        encoder_dim = encoder_out.size(3)
+        device = enc_out_nchw.device
+        dtype = enc_out_nchw.dtype
 
-        # Flatten encoding (1, num_pixels, encoder_dim)
-        encoder_out = encoder_out.view(1, -1, encoder_dim)
+        # Optional autocast (turn on after verifying parity)
+        autocast_cm = torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_amp else \
+            torch.cpu.amp.autocast(enabled=False)
 
-        num_cells = len(tag_H)
-        predictions_bboxes = []
-        predictions_classes = []
+        with autocast_cm:
+            # 1) Optional conv filter (kept to preserve weights/behavior)
+            if hasattr(self, "_input_filter"):
+                # enc_out_nchw: [1,C,H,W] -> same layout
+                enc_out_nchw = self._input_filter(enc_out_nchw)
 
-        for c_id in range(num_cells):
-            # Start decoding
-            h = self._init_hidden_state(encoder_out, 1)
-            cell_tag_H = tag_H[c_id]
-            awe, _ = self._attention(encoder_out, cell_tag_H, h)
-            gate = self._sigmoid(self._f_beta(h))
-            awe = gate * awe
-            h = awe * h
+            # 2) Flatten pixels once: [1,C,H,W] -> [P,C]
+            B, C, H, W = enc_out_nchw.shape
+            P = H * W
+            enc_flat = enc_out_nchw.reshape(1, C, P).permute(0, 2, 1).reshape(P, C).contiguous()  # [P,C]
 
-            predictions_bboxes.append(self._bbox_embed(h).sigmoid())
-            predictions_classes.append(self._class_embed(h))
-        if len(predictions_bboxes) > 0:
-            predictions_bboxes = torch.stack([x[0] for x in predictions_bboxes])
-        else:
-            predictions_bboxes = torch.empty(0)
+            # 3) Stack tag hidden states -> [N, D]
+            if len(tag_H) == 0:
+                empty = torch.empty(0, device=device, dtype=dtype)
+                return empty, empty
 
-        if len(predictions_classes) > 0:
-            predictions_classes = torch.stack([x[0] for x in predictions_classes])
-        else:
-            predictions_classes = torch.empty(0)
+            tag_H_stacked = []
+            for t in tag_H:
+                t = t.squeeze(0) if (t.dim() == 2 and t.size(0) == 1) else t.reshape(-1)
+                tag_H_stacked.append(t)
+            tag_H_stacked = torch.stack(tag_H_stacked, dim=0).to(device=device, dtype=dtype)  # [N, D]
+            N = tag_H_stacked.size(0)
 
-        return predictions_classes, predictions_bboxes
+            # 4) Precompute linear pieces (no broadcasts yet)
+            # att layers (shared with original CellAttention to keep weights identical)
+            att_enc = self._attention._encoder_att  # Linear(C -> A)
+            att_tag = self._attention._tag_decoder_att  # Linear(D -> A)
+            att_lang = self._attention._language_att  # Linear(dec_dim -> A)
+            att_out = self._attention._full_att  # Linear(A -> 1)
+            relu = self._attention._relu
+
+            # (a) Per-pixel embedding (P,A) – compute once
+            S_p = att_enc(enc_flat)  # [P, A]
+
+            # (b) Per-cell embeddings (N,A)
+            R_n = att_tag(tag_H_stacked)  # [N, A]
+
+            # (c) Init language hidden h0 from pixel mean, expand to N
+            mean_enc = enc_flat.mean(dim=0, keepdim=True)  # [1, C]
+            h0 = self._init_hidden_state(mean_enc.unsqueeze(0), N)  # [N, dec_dim]
+            L_n = att_lang(h0)  # [N, A]
+
+            Rn_plus_Ln = R_n + L_n  # [N, A]
+            w = att_out.weight.view(-1)  # [A]
+            b = att_out.bias  # [1] or []
+
+            # 5) Streaming softmax over pixels (two-pass; numerically stable)
+            # First pass: max over P per row(n)
+            row_max = torch.full((N,), -float("inf"), device=device, dtype=S_p.dtype)
+            for start in range(0, P, tile_pixels):
+                stop = min(start + tile_pixels, P)
+                # compute Z_tile: [N, T] via (N,T,A) but only for small T
+                Sp_tile = S_p[start:stop]  # [T, A]
+                # broadcast add -> [N, T, A]
+                sum_NTA = (Rn_plus_Ln.unsqueeze(1) + Sp_tile.unsqueeze(0))  # [N, T, A]
+                relu_NTA = relu(sum_NTA)  # [N, T, A]
+                # project to 1: (N,T)
+                Z_tile = relu_NTA.matmul(w)  # [N, T]
+                if b is not None:
+                    Z_tile = Z_tile + b
+                # rowwise max update
+                tile_max, _ = Z_tile.max(dim=1)
+                row_max = torch.maximum(row_max, tile_max)
+
+            # Second pass: accumulate exp and weighted sum of encodings
+            row_sum = torch.zeros(N, device=device, dtype=S_p.dtype)  # denominator
+            awe = torch.zeros(N, C, device=device, dtype=S_p.dtype)  # numerator for weighted sum
+
+            for start in range(0, P, tile_pixels):
+                stop = min(start + tile_pixels, P)
+                Sp_tile = S_p[start:stop]  # [T, A]
+                enc_tile = enc_flat[start:stop]  # [T, C]
+
+                sum_NTA = (Rn_plus_Ln.unsqueeze(1) + Sp_tile.unsqueeze(0))  # [N, T, A]
+                relu_NTA = relu(sum_NTA)  # [N, T, A]
+                Z_tile = relu_NTA.matmul(w)  # [N, T]
+                if b is not None:
+                    Z_tile = Z_tile + b
+
+                # exp with max subtraction
+                Z_tile = Z_tile - row_max.unsqueeze(1)  # [N, T]
+                E_tile = torch.exp(Z_tile)  # [N, T]
+
+                # denom
+                row_sum += E_tile.sum(dim=1)  # [N]
+
+                # numerator for awe: (N,T) @ (T,C) -> (N,C)
+                awe += E_tile.matmul(enc_tile)  # [N, C]
+
+            # finalize attention-weighted encoding
+            awe = awe / row_sum.unsqueeze(1)  # [N, C]
+
+            # 6) Gate + combine EXACTLY like original
+            gate = self._sigmoid(self._f_beta(h0))  # [N, C]
+            awe = gate * awe  # [N, C]
+            h = awe * h0  # [N, C]
+            h = self._dropout(h)
+
+            # 7) Heads (unchanged)
+            logits_cls = self._class_embed(h)  # [N, num_classes+1]
+            boxes = self._bbox_embed(h).sigmoid()  # [N, 4]
+            return logits_cls, boxes
+
+    # def inference(self, encoder_out, tag_H):
+    #     """
+    #     Inference on test images with beam search
+    #     """
+    #     if hasattr(self, "_input_filter"):
+    #         encoder_out = self._input_filter(encoder_out.permute(0, 3, 1, 2)).permute(
+    #             0, 2, 3, 1
+    #         )
+    #
+    #     encoder_dim = encoder_out.size(3)
+    #
+    #     # Flatten encoding (1, num_pixels, encoder_dim)
+    #     encoder_out = encoder_out.view(1, -1, encoder_dim)
+    #
+    #     num_cells = len(tag_H)
+    #     predictions_bboxes = []
+    #     predictions_classes = []
+    #
+    #     for c_id in range(num_cells):
+    #         # Start decoding
+    #         h = self._init_hidden_state(encoder_out, 1)
+    #         cell_tag_H = tag_H[c_id]
+    #         awe, _ = self._attention(encoder_out, cell_tag_H, h)
+    #         gate = self._sigmoid(self._f_beta(h))
+    #         awe = gate * awe
+    #         h = awe * h
+    #
+    #         predictions_bboxes.append(self._bbox_embed(h).sigmoid())
+    #         predictions_classes.append(self._class_embed(h))
+    #     if len(predictions_bboxes) > 0:
+    #         predictions_bboxes = torch.stack([x[0] for x in predictions_bboxes])
+    #     else:
+    #         predictions_bboxes = torch.empty(0)
+    #
+    #     if len(predictions_classes) > 0:
+    #         predictions_classes = torch.stack([x[0] for x in predictions_classes])
+    #     else:
+    #         predictions_classes = torch.empty(0)
+    #
+    #     return predictions_classes, predictions_bboxes
