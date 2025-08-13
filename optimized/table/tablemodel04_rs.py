@@ -136,45 +136,90 @@ class TableModel04_rs(BaseModel, nn.Module):
     @torch.inference_mode()
     def predict(self, imgs: torch.Tensor, max_steps: int, k: int, return_attention: bool = False):
         """
-        imgs: [B, 3, 448, 448]
-        Returns: list of tuples (seq, outputs_class, outputs_coord) per table.
+        Encoder micro-batched (padded) at fixed block size for CUDA-graph friendliness.
+        Decoder runs on the true batch size (no padding).
+        imgs: [B, 3, 448, 448] (NCHW)
+        Returns: list[(seq, outputs_class, outputs_coord)] of length B.
         """
-        print(f"Running optimized predict inference.")
+        import os
+
+        # ---- Setup ----
         prof = AggProfiler()
         prof.begin("predict_total", self._prof)
-
         self._encoder.eval()
         self._tag_transformer.eval()
+        self._bbox_decoder.eval()
 
-        # Optional: AMP (bfloat16) – measure before keeping enabled permanently.
-        use_amp = os.environ.get("USE_AMP", "1") == "1"
-        cm = torch.autocast(device_type=self._device, dtype=torch.bfloat16) if use_amp else torch.cpu.amp.autocast(enabled=False)
+        # Ensure optimal tensor layout for convs
+        imgs = imgs.to(memory_format=torch.channels_last, non_blocking=True)
+        B = imgs.size(0)
+        device = imgs.device
 
-        with cm:
-            enc_out_batch = self._encoder(imgs)  # [B, H, W, C]
+        # Fixed encoder block size (default 32). Only the encoder sees padded data.
+        BLOCK_BS = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
-        # Always use batched decoder when enabled (even for B=1) to avoid scalar syncs
-        if self._use_batched_decoder:
-            results = self._batched_decoder.predict_batched(enc_out_batch, max_steps)
-        else:
-            # Fallback: sequential
-            results = []
-            B = imgs.size(0)
-            for i in range(B):
-                seq, cls_t, coord_t = self._predict_compat(
-                    imgs[i:i+1], max_steps, k, precomputed_enc=enc_out_batch[i:i+1].contiguous()
-                )
-                results.append((seq, cls_t, coord_t))
+        def _encode_in_blocks(x: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
+            """
+            Run CNN encoder in fixed-size blocks with zero-pad of final block.
+            Returns concatenated encoder outputs with the padding trimmed.
+            Input/Output are NCHW (channels_last memory format for speed).
+            """
+            B0, C, H, W = x.shape
+            pad = (block_bs - (B0 % block_bs)) % block_bs
 
+            if pad:
+                pad_tensor = torch.zeros(pad, C, H, W, device=x.device, dtype=x.dtype)
+                work = torch.cat([x, pad_tensor], dim=0)
+            else:
+                work = x
+
+            outs = []
+            for i in range(0, work.size(0), block_bs):
+                chunk = work[i:i + block_bs].to(memory_format=torch.channels_last, non_blocking=True)
+                prof.begin("model_encoder", self._prof)
+                y = self._encoder(chunk)  # -> [block_bs, 256, h, w] (NCHW)
+                prof.end("model_encoder", self._prof)
+
+                # If the encoder uses a CUDA Graph with a static output buffer, avoid aliasing
+                if getattr(self._encoder, "_gr_reuses_output", False):
+                    y = y.clone()
+
+                outs.append(y)
+
+            enc = torch.cat(outs, dim=0)
+            if pad:
+                enc = enc[:B0]
+            return enc  # [B0, 256, h, w] NCHW
+
+        # ---- 1) CNN encoder (micro-batched, padded to BLOCK_BS) ----
+        enc_out_batch = _encode_in_blocks(imgs, block_bs=BLOCK_BS)  # NCHW
+
+        # ---- 2) Tag-transformer input filter + encoder (true B, no padding) ----
+        prof.begin("model_tag_transformer_input_filter", self._prof)
+        # _input_filter expects NCHW and returns NCHW; single permute to NHWC afterwards
+        x = self._tag_transformer._input_filter(enc_out_batch).permute(0, 2, 3, 1)  # [B, h, w, C]
+        prof.end("model_tag_transformer_input_filter", self._prof)
+
+        B_, h, w, C = x.shape
+        mem = x.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [S, B, C]
+
+        prof.begin("model_tag_transformer_encoder", self._prof)
+        mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S, B, C]
+        prof.end("model_tag_transformer_encoder", self._prof)
+
+        # ---- 3) Batched AR decode + bbox head ----
+        # BBox decoder expects NHWC per-table features
+        enc_out_batch_nhwc = enc_out_batch.permute(0, 2, 3, 1)  # [B, h, w, C]
+        results = self._batched_decoder.predict_batched(enc_out_batch_nhwc, mem_enc, max_steps)
+
+        # ---- Done ----
         prof.end("predict_total", self._prof)
-
-        # Optional profiler dump
-        if self._prof:
-            print("\n📊 Model Profiling Results:")
-            for key in ["predict_total"]:
-                if hasattr(prof, "_timings") and key in prof._timings and prof._timings[key]:
-                    avg_ms = (sum(prof._timings[key]) / len(prof._timings[key])) * 1000
-                    print(f"  {key:30s}: {avg_ms:.2f} ms")
+        if self._prof and hasattr(prof, "_timings"):
+            try:
+                avg_ms = (sum(prof._timings["predict_total"]) / len(prof._timings["predict_total"])) * 1000
+                print(f"predict_total: {avg_ms:.2f} ms")
+            except Exception:
+                pass
 
         return results
 
@@ -337,3 +382,39 @@ class TableModel04_rs(BaseModel, nn.Module):
         out_coord = torch.stack(out_coord) if len(out_coord) else torch.empty(0, device=device)
         out_cls = torch.stack(out_cls) if len(out_cls) else torch.empty(0, device=device)
         return out_cls, out_coord
+
+    def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
+        """
+        Run the CNN encoder in fixed-size blocks (default 32).
+        Pads the final block with zeros, encodes, then trims the padding.
+        Expects imgs in NCHW; casts to channels_last inside.
+        """
+        B, C, H, W = imgs.shape
+        dev, dtype = imgs.device, imgs.dtype
+
+        # one-time format cast for faster convs
+        imgs = imgs.to(memory_format=torch.channels_last, non_blocking=True)
+
+        # compute padding
+        pad = (block_bs - (B % block_bs)) % block_bs
+        if pad:
+            pad_tensor = torch.zeros(pad, C, H, W, device=dev, dtype=dtype)
+            work = torch.cat([imgs, pad_tensor], dim=0)
+        else:
+            work = imgs
+
+        outs = []
+        # if you wrapped the encoder with a CUDA Graph for BS=32, this loop will replay the graph
+        for i in range(0, work.size(0), block_bs):
+            chunk = work[i:i + block_bs]
+            # keep channels_last for the CNN
+            chunk = chunk.to(memory_format=torch.channels_last, non_blocking=True)
+            y = self._encoder(chunk)  # -> [block_bs, 256, H', W']
+            # IMPORTANT: if your encoder's CUDA-graph runner returns a *static* output buffer,
+            # clone here OR set ENCODER_CLONE_GRAPH_OUTPUT=1 inside the encoder.
+            outs.append(y.clone() if getattr(self._encoder, "_gr", None) else y)
+
+        enc_out = torch.cat(outs, dim=0)
+        if pad:
+            enc_out = enc_out[:B]
+        return enc_out  # NCHW [B,256,h,w]
