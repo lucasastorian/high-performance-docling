@@ -160,6 +160,8 @@ class BBoxDecoder(nn.Module):
             # 1) Optional conv filter (kept to preserve weights/behavior)
             if hasattr(self, "_input_filter"):
                 # enc_out_nchw: [1,C,H,W] -> same layout
+                B, C, H, W = enc_out_nchw.shape
+                assert B == 1 and C == 256, f"Expected [1,256,H,W] NCHW input, got [{B},{C},{H},{W}]"
                 enc_out_nchw = self._input_filter(enc_out_nchw)
 
             # 2) Flatten pixels once: [1,C,H,W] -> [P,C]
