@@ -138,16 +138,17 @@ class BatchedTableDecoderV2:
 
         # Track current step
         t = 0
-        cache = None
+        cache_states = None    # existing per-layer output cache
+        kv_cache_l1 = None     # NEW: [(K,V), None, None, ...] or None
 
         # Step 4: Precompute cross-attention memory K/V once
         USE_MEM_KV = True  # set False to disable the custom path
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
-            # Use step_fullprefix wrapper with precomputed memory K/V
-            last_H, cache = tt.step_fullprefix(
-                t, tgt_emb_buf, memory=mem_enc, cache=cache, memory_kv=mem_kv
+            # Use step_fullprefix wrapper with precomputed memory K/V and layer-0 KV cache
+            last_H, cache_states, kv_cache_l1 = tt.step_fullprefix(
+                t, tgt_emb_buf, memory=mem_enc, cache=cache_states, memory_kv=mem_kv, sa_kv_cache=kv_cache_l1
             )
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long
