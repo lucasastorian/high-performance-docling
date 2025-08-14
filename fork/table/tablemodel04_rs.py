@@ -206,18 +206,69 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Setup a custom logger
         return s.get_custom_logger(self.__class__.__name__, LOG_LEVEL)
 
+    def _cxcywh_to_xyxy(self, b: torch.Tensor) -> torch.Tensor:
+        """Convert from center format to corner format
+        Args:
+            b: [..., 4] tensor with (cx, cy, w, h)
+        Returns:
+            [..., 4] tensor with (x1, y1, x2, y2)
+        """
+        cx, cy, w, h = b.unbind(-1)
+        x1 = cx - 0.5 * w
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        return torch.stack((x1, y1, x2, y2), dim=-1)
+
+    def _xyxy_to_cxcywh(self, b: torch.Tensor) -> torch.Tensor:
+        """Convert from corner format to center format
+        Args:
+            b: [..., 4] tensor with (x1, y1, x2, y2)
+        Returns:
+            [..., 4] tensor with (cx, cy, w, h)
+        """
+        x1, y1, x2, y2 = b.unbind(-1)
+        w = (x2 - x1).clamp_min(1e-6)  # Prevent zero/negative widths
+        h = (y2 - y1).clamp_min(1e-6)  # Prevent zero/negative heights
+        cx = x1 + 0.5 * w
+        cy = y1 + 0.5 * h
+        return torch.stack((cx, cy, w, h), dim=-1)
+
     def mergebboxes(self, bbox1: torch.Tensor, bbox2: torch.Tensor) -> torch.Tensor:
-        """Merge two bboxes using pure tensor ops to avoid CPU sync"""
-        new_w = (bbox2[0] + bbox2[2] / 2) - (bbox1[0] - bbox1[2] / 2)
-        new_h = (bbox2[1] + bbox2[3] / 2) - (bbox1[1] - bbox1[3] / 2)
-
-        new_left = bbox1[0] - bbox1[2] / 2
-        new_top = torch.minimum(bbox2[1] - bbox2[3] / 2, bbox1[1] - bbox1[3] / 2)
-
-        new_cx = new_left + new_w / 2
-        new_cy = new_top + new_h / 2
-
-        return torch.stack([new_cx, new_cy, new_w, new_h])  # stays on same device/dtype
+        """Merge two bboxes (order-agnostic union)"""
+        # Convert to corner format for proper min/max
+        a = self._cxcywh_to_xyxy(bbox1)
+        b = self._cxcywh_to_xyxy(bbox2)
+        
+        # Compute union (elementwise min/max)
+        x1 = torch.minimum(a[0], b[0])
+        y1 = torch.minimum(a[1], b[1])
+        x2 = torch.maximum(a[2], b[2])
+        y2 = torch.maximum(a[3], b[3])
+        
+        # Convert back to center format
+        return self._xyxy_to_cxcywh(torch.stack((x1, y1, x2, y2)))
+    
+    def mergebboxes_batch(self, bboxes1: torch.Tensor, bboxes2: torch.Tensor) -> torch.Tensor:
+        """Batched merge of bbox pairs (order-agnostic union)
+        Args:
+            bboxes1, bboxes2: [N, 4] tensors in cxcywh format
+        Returns:
+            merged: [N, 4] tensor in cxcywh format
+        """
+        # Convert to corner format for proper min/max
+        a = self._cxcywh_to_xyxy(bboxes1)
+        b = self._cxcywh_to_xyxy(bboxes2)
+        
+        # Compute union (elementwise min/max)
+        x1 = torch.minimum(a[..., 0], b[..., 0])
+        y1 = torch.minimum(a[..., 1], b[..., 1])
+        x2 = torch.maximum(a[..., 2], b[..., 2])
+        y2 = torch.maximum(a[..., 3], b[..., 3])
+        
+        # Stack and convert back to center format
+        merged_xyxy = torch.stack((x1, y1, x2, y2), dim=-1)
+        return self._xyxy_to_cxcywh(merged_xyxy)
 
     def _flatten_hw_to_sbc(self, hwc):
         """Utility: [B,H,W,C] -> [S,B,C] for transformer"""
