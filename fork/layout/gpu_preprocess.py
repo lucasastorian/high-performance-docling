@@ -451,11 +451,14 @@ class GPUPreprocessorV2(nn.Module):
             stream_compute.wait_event(h2d_event)
         
         with (torch.cuda.stream(stream_compute) if stream_compute else contextlib.nullcontext()):
-            # Convert to float
-            batch_float = batch_gpu.to(self.dtype)
-            # Rescale if needed (in-place for efficiency)
-            if self.do_rescale:
-                batch_float.mul_(self.rescale_factor)
+            # Convert to float and rescale in one step if possible
+            if self.do_rescale and batch_gpu.dtype == torch.uint8:
+                # Fuse conversion + rescaling: uint8 -> float32 with scaling
+                batch_float = batch_gpu.to(self.dtype) * self.rescale_factor
+            else:
+                batch_float = batch_gpu.to(self.dtype)
+                if self.do_rescale:
+                    batch_float.mul_(self.rescale_factor)
             
             # Resize (internally converts to NCHW and back)
             batch_resized = self.resize_op(batch_float)
