@@ -141,7 +141,7 @@ class BatchedTableDecoderV2:
         cache = None
 
         # Step 4: Precompute cross-attention memory K/V once
-        USE_MEM_KV = True  # set False to disable the custom path
+        USE_MEM_KV = False  # set False to disable the custom path
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
