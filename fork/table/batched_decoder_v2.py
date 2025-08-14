@@ -4,7 +4,6 @@
 import torch
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
-from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 
 @dataclass
@@ -115,9 +114,6 @@ class BatchedTableDecoderV2:
                 return torch.zeros_like(vals, dtype=torch.bool)
             return torch.isin(vals, ids)
 
-        prof = AggProfiler()
-        prof.begin("batched_ar_loop_v2", self._prof)
-
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
@@ -137,11 +133,9 @@ class BatchedTableDecoderV2:
             tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
 
             # Transformer decoder with cache
-            prof.begin("decoder_step", self._prof)
             decoded, cache = tt._decoder(
                 tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
             )
-            prof.end("decoder_step", self._prof)
 
             last_H = decoded[-1, :, :]  # [B,D]
             logits = tt._fc(last_H)  # [B,V]
@@ -237,8 +231,6 @@ class BatchedTableDecoderV2:
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
-        prof.end("batched_ar_loop_v2", self._prof)
-
         # ---- Materialize outputs (minimal sync points) ----
         # Trim sequences to actual length
         end_id_int = self.end_id.item()
@@ -256,7 +248,6 @@ class BatchedTableDecoderV2:
 
         # ---- Per-table bbox head (already vectorized) ----
         outputs = []
-        prof.begin("batched_bbox_decode_v2", self._prof)
         for b in range(B):
             tag_H_buf_b = tag_H_per_sample[b]
             if self.model._bbox and len(tag_H_buf_b) > 0:
@@ -272,7 +263,6 @@ class BatchedTableDecoderV2:
             # Merge spans
             merged_cls, merged_coord = self._merge_spans(cls_logits, coords, span_maps[b])
             outputs.append((seqs[b], merged_cls, merged_coord))
-        prof.end("batched_bbox_decode_v2", self._prof)
 
         return outputs
 
