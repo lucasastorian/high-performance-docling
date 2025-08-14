@@ -80,8 +80,7 @@ class GPUPreprocessor(nn.Module):
         self.resize_op = self._make_resize(size)
         
         # Pre-allocated pinned staging tensor for large batches (avoid allocator churn)
-        self._staging_tensor = None
-        self._staging_size = None
+        self._staging_cache = {}  # key: (B_bucket, H, W, C, dtype) -> pinned tensor
         
     def _make_resize(self, size_dict: Dict[str, int]):
         """Create appropriate resize operation based on size specification."""
@@ -128,6 +127,19 @@ class GPUPreprocessor(nn.Module):
             return ShortLongResize()
         else:
             raise ValueError(f"Unsupported size specification: {size_dict}")
+    
+    def _get_staging_tensor(self, shape, dtype):
+        """Get pinned staging tensor with bucket-based allocation to avoid churn."""
+        B, H, W, C = shape
+        # Round batch size up to next power of 2 or common size
+        B_bucket = max(8, 1 << (B-1).bit_length()) if B > 0 else 8  # 8, 16, 32, 64...
+        bucket_key = (B_bucket, H, W, C, dtype)
+        
+        if bucket_key not in self._staging_cache:
+            self._staging_cache[bucket_key] = torch.empty(
+                (B_bucket, H, W, C), dtype=dtype, pin_memory=True
+            )
+        return self._staging_cache[bucket_key][:B]  # View into larger buffer
     
     @torch.no_grad()
     def preprocess_batch(
@@ -188,16 +200,14 @@ class GPUPreprocessor(nn.Module):
         
         # Use pre-allocated pinned staging tensor for faster transfer
         if is_u8 and torch.cuda.is_available() and self.device.type == "cuda":
-            batch_shape = batch_cpu.shape
-            # Reuse staging tensor if same size, otherwise allocate new one
-            if (self._staging_tensor is None or 
-                self._staging_size != batch_shape):
-                self._staging_tensor = torch.empty(batch_shape, dtype=batch_cpu.dtype, pin_memory=True)
-                self._staging_size = batch_shape
+            # Get staging tensor from bucket cache (BCHW -> BHWC for staging)
+            batch_shape_hwc = (batch_cpu.shape[0], batch_cpu.shape[2], batch_cpu.shape[3], batch_cpu.shape[1])
+            staging_tensor = self._get_staging_tensor(batch_shape_hwc, batch_cpu.dtype)
             
-            # Copy to staging tensor and transfer
-            self._staging_tensor.copy_(batch_cpu)
-            batch_gpu = self._staging_tensor.to(self.device, non_blocking=True)
+            # Copy to staging tensor (CHW -> HWC conversion)
+            batch_hwc = batch_cpu.permute(0, 2, 3, 1)
+            staging_tensor.copy_(batch_hwc)
+            batch_gpu = staging_tensor.permute(0, 3, 1, 2).to(self.device, non_blocking=True)
         else:
             batch_gpu = batch_cpu.to(self.device, non_blocking=True)
         
@@ -312,8 +322,7 @@ class GPUPreprocessorV2(nn.Module):
         self.resize_op = self._make_resize(size)
         
         # Pre-allocated pinned staging tensor for large batches (avoid allocator churn)
-        self._staging_tensor = None
-        self._staging_size = None
+        self._staging_cache = {}  # key: (B_bucket, H, W, C, dtype) -> pinned tensor
     
     def _make_resize(self, size_dict: Dict[str, int]):
         """Create appropriate resize operation based on size specification."""
@@ -335,6 +344,19 @@ class GPUPreprocessorV2(nn.Module):
             return resized.permute(0, 2, 3, 1)  # Back to NHWC
         
         return resize_exact
+    
+    def _get_staging_tensor(self, shape, dtype):
+        """Get pinned staging tensor with bucket-based allocation to avoid churn."""
+        B, H, W, C = shape
+        # Round batch size up to next power of 2 or common size
+        B_bucket = max(8, 1 << (B-1).bit_length()) if B > 0 else 8  # 8, 16, 32, 64...
+        bucket_key = (B_bucket, H, W, C, dtype)
+        
+        if bucket_key not in self._staging_cache:
+            self._staging_cache[bucket_key] = torch.empty(
+                (B_bucket, H, W, C), dtype=dtype, pin_memory=True
+            )
+        return self._staging_cache[bucket_key][:B]  # View into larger buffer
     
     @torch.no_grad()
     def preprocess_batch(
@@ -370,16 +392,12 @@ class GPUPreprocessorV2(nn.Module):
         # Create pinned tensor using staging buffer to avoid allocator churn
         batch_tensor = torch.from_numpy(batch_np)
         if self.device.type == "cuda":
-            batch_shape = batch_tensor.shape
-            # Reuse staging tensor if same size, otherwise allocate new one
-            if (self._staging_tensor is None or 
-                self._staging_size != batch_shape):
-                self._staging_tensor = torch.empty(batch_shape, dtype=batch_tensor.dtype, pin_memory=True)
-                self._staging_size = batch_shape
+            # Get staging tensor from bucket cache (already NHWC)
+            staging_tensor = self._get_staging_tensor(batch_tensor.shape, batch_tensor.dtype)
             
             # Copy to staging tensor
-            self._staging_tensor.copy_(batch_tensor)
-            batch_pinned = self._staging_tensor
+            staging_tensor.copy_(batch_tensor)
+            batch_pinned = staging_tensor
         else:
             batch_pinned = batch_tensor
         
