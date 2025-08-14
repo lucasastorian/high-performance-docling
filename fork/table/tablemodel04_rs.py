@@ -7,10 +7,10 @@ import os
 
 import torch
 import torch.nn as nn
-from torch.backends.cuda import sdp_kernel
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
+from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04
@@ -111,14 +111,19 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         self._batched_decoder = BatchedTableDecoder(self, self._device)
 
+        # Enable fast kernels where safe
         if device == 'cuda':
+            # Don't enable benchmark globally - it interferes with CUDA Graphs!
+            # torch.backends.cudnn.benchmark = True  # REMOVED - causes slowdown with graphs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
 
+        # Optimization 8: Optionally disable gradients globally for inference
         if os.getenv("DISABLE_GRAD", "1") == "1":
             torch.set_grad_enabled(False)
 
+        # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
     def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
@@ -132,7 +137,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Ensure channels_last format for optimal performance
         imgs_cl = imgs if imgs.is_contiguous(memory_format=torch.channels_last) \
             else imgs.contiguous(memory_format=torch.channels_last)
-        
+
         # Simply run through encoder - no graphs, no compilation
         return self._encoder(imgs_cl)
 
@@ -171,15 +176,14 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== BATCHED DECODER =====
         with timer.time_section('batched_ar_decoder'):
-            # with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:
             timer.finalize()
             total_time = (timer.get_time('encoder_forward') + timer.get_time('tag_input_filter') +
-                         timer.get_time('memory_reshape') + timer.get_time('tag_encoder') +
-                         timer.get_time('batched_ar_decoder'))
+                          timer.get_time('memory_reshape') + timer.get_time('tag_encoder') +
+                          timer.get_time('batched_ar_decoder'))
             print(f"\n=== TableModel Timing (B={B}) ===")
             print(f"  encoder_forward:    {timer.get_time('encoder_forward'):7.1f} ms")
             print(f"  tag_input_filter:   {timer.get_time('tag_input_filter'):7.1f} ms")
@@ -235,16 +239,16 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Convert to corner format for proper min/max
         a = self._cxcywh_to_xyxy(bbox1)
         b = self._cxcywh_to_xyxy(bbox2)
-        
+
         # Compute union (elementwise min/max)
         x1 = torch.minimum(a[0], b[0])
         y1 = torch.minimum(a[1], b[1])
         x2 = torch.maximum(a[2], b[2])
         y2 = torch.maximum(a[3], b[3])
-        
+
         # Convert back to center format
         return self._xyxy_to_cxcywh(torch.stack((x1, y1, x2, y2)))
-    
+
     def mergebboxes_batch(self, bboxes1: torch.Tensor, bboxes2: torch.Tensor) -> torch.Tensor:
         """Batched merge of bbox pairs (order-agnostic union)
         Args:
@@ -255,13 +259,13 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Convert to corner format for proper min/max
         a = self._cxcywh_to_xyxy(bboxes1)
         b = self._cxcywh_to_xyxy(bboxes2)
-        
+
         # Compute union (elementwise min/max)
         x1 = torch.minimum(a[..., 0], b[..., 0])
         y1 = torch.minimum(a[..., 1], b[..., 1])
         x2 = torch.maximum(a[..., 2], b[..., 2])
         y2 = torch.maximum(a[..., 3], b[..., 3])
-        
+
         # Stack and convert back to center format
         merged_xyxy = torch.stack((x1, y1, x2, y2), dim=-1)
         return self._xyxy_to_cxcywh(merged_xyxy)
