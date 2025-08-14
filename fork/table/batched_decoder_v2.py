@@ -141,15 +141,8 @@ class BatchedTableDecoderV2:
         cache = None
 
         for step in range(Tmax):
-            # Use incremental embedding buffer - only pass what we've computed so far
-            tgt = tgt_emb_buf[:t + 1, :, :]  # [t+1,B,D] - grows each step
-
-            # Transformer decoder with cache
-            decoded, cache = tt._decoder(
-                tgt, memory=mem_enc, cache=cache, memory_key_padding_mask=None
-            )
-
-            last_H = decoded[-1, :, :]  # [B,D]
+            # Use step_fullprefix wrapper (Step 3 - no behavior change)
+            last_H, cache = tt.step_fullprefix(t, tgt_emb_buf, memory=mem_enc, cache=cache)
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long
 

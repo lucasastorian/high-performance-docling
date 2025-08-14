@@ -174,6 +174,21 @@ class Tag_Transformer(nn.Module):
         self._input_filter = u.resnet_block(stride=1)
         self._fc = nn.Linear(embed_dim, vocab_size)
 
+    def step_fullprefix(
+        self,
+        t: int,
+        tgt_emb_buf: torch.Tensor,   # [Tmax+1, B, D]
+        memory: torch.Tensor,        # [S, B, D]
+        cache=None,
+        memory_kv=None,              # ignored in step 3
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # feed the full prefix up to t (exactly your current behavior)
+        tgt = tgt_emb_buf[: t + 1, :, :]             # [t+1, B, D]
+        decoded, cache = self._decoder(
+            tgt, memory=memory, cache=cache, memory_key_padding_mask=None
+        )
+        return decoded[-1, :, :], cache               # [B, D], cache
+
     def inference(self, enc_inputs, tags, tag_lens, num_cells):
         # CNN backbone image encoding
         enc_inputs = self._input_filter(enc_inputs.permute(0, 3, 1, 2)).permute(
