@@ -87,11 +87,21 @@ class GPUPreprocessor(nn.Module):
         if "height" in size_dict and "width" in size_dict:
             # Exact size resize (no aspect ratio preservation)
             # Always use antialias=False to match PIL bilinear behavior
-            return T.Resize(
-                (size_dict["height"], size_dict["width"]), 
-                interpolation=T.InterpolationMode.BILINEAR,
-                antialias=False
-            )
+            # Wrap in contiguity-ensuring function for robustness
+            target_h, target_w = size_dict["height"], size_dict["width"]
+            
+            def resize_with_contiguity(x):
+                # Ensure input is contiguous before resize
+                x_cont = x.contiguous()
+                resized = F.resize(
+                    x_cont,
+                    [target_h, target_w],
+                    interpolation=T.InterpolationMode.BILINEAR,
+                    antialias=False
+                )
+                return resized.contiguous()  # Ensure output is contiguous too
+            
+            return resize_with_contiguity
         elif "shortest_edge" in size_dict and "longest_edge" in size_dict:
             # Custom resize respecting shortest/longest edge constraints
             se = size_dict["shortest_edge"]
@@ -117,12 +127,15 @@ class GPUPreprocessor(nn.Module):
                         new_h = int(round(new_h * scale2))
                         new_w = int(round(new_w * scale2))
                     
-                    return F.resize(
-                        x, 
+                    # Ensure contiguity for consistent performance
+                    x_cont = x.contiguous()
+                    resized = F.resize(
+                        x_cont, 
                         [new_h, new_w], 
                         interpolation=T.InterpolationMode.BILINEAR, 
                         antialias=False
                     )
+                    return resized.contiguous()
             
             return ShortLongResize()
         else:
@@ -333,15 +346,15 @@ class GPUPreprocessorV2(nn.Module):
         target_w = size_dict["width"]
         
         def resize_exact(x):
-            # x is NHWC
-            x_nchw = x.permute(0, 3, 1, 2)  # NHWC -> NCHW for resize
+            # x is NHWC - force contiguity to avoid F.resize slow path
+            x_nchw = x.permute(0, 3, 1, 2).contiguous()  # NHWC -> NCHW, ensure contiguous
             resized = F.resize(
                 x_nchw,
                 [target_h, target_w],
                 interpolation=T.InterpolationMode.BILINEAR,
                 antialias=False
             )
-            return resized.permute(0, 2, 3, 1)  # Back to NHWC
+            return resized.contiguous().permute(0, 2, 3, 1).contiguous()  # Back to NHWC, force contiguous
         
         return resize_exact
     
