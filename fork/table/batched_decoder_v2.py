@@ -38,7 +38,7 @@ class BatchedTableDecoderV2:
             [wm[t] for t in skip_names if t in wm],
             device=device, dtype=torch.long
         )
-        
+
         # Pre-build lookup tables for fast membership checks (no torch.isin!)
         vocab_size = len(wm)
         emit_lut = torch.zeros(vocab_size, dtype=torch.bool, device=device)
@@ -49,7 +49,7 @@ class BatchedTableDecoderV2:
             skip_lut[self.skip_ids] = True
         self.emit_lut = emit_lut  # Store as attribute
         self.skip_lut = skip_lut
-        
+
         # CUDA Graph support
         self._graph = None
         self._graph_stream = torch.cuda.Stream() if "cuda" in str(device) else None
@@ -64,44 +64,44 @@ class BatchedTableDecoderV2:
         D = tt._embedding.embedding_dim
         H = tt._decoder_dim
         S = mem_enc.size(0)
-        
+
         st = self._static
         st.clear()
-        
+
         # ---- Inputs/state that the loop will mutate in-place ----
         st["decoded_tags"] = torch.full((Tmax + 1, B), self.end_id.item(),
                                         dtype=torch.long, device=dev)
         st["decoded_tags"][0].fill_(self.start_id.item())  # seed
-        
+
         st["lengths"] = torch.zeros(B, dtype=torch.int32, device=dev)
         st["finished"] = torch.zeros(B, dtype=torch.bool, device=dev)
         st["first_lcel"] = torch.ones(B, dtype=torch.bool, device=dev)
         st["skip_next"] = torch.ones(B, dtype=torch.bool, device=dev)
         st["prev_ucel"] = torch.zeros(B, dtype=torch.bool, device=dev)
         st["line_num"] = torch.zeros(B, dtype=torch.long, device=dev)
-        
+
         st["tag_H_counts"] = torch.zeros(B, dtype=torch.long, device=dev)
         st["open_span_start"] = torch.full((B,), -1, dtype=torch.long, device=dev)
         st["span_starts"] = torch.full((B, Tmax), -1, dtype=torch.long, device=dev)
         st["span_ends"] = torch.full((B, Tmax), -1, dtype=torch.long, device=dev)
         st["span_counts"] = torch.zeros(B, dtype=torch.long, device=dev)
-        
+
         st["tgt_emb_buf"] = torch.empty(Tmax + 1, B, D, device=dev)
         # Use model's actual dtype instead of hardcoded fp32
-        act_dtype = getattr(tt._fc.weight, "dtype", torch.float32)
+        act_dtype = getattr(tt._embedding.weight, "dtype", torch.float32)
         st["tag_H_buffer"] = torch.empty(B, Tmax, H, device=dev, dtype=act_dtype)
         # Don't need tag_H_flat anymore - we use 3D indexing directly
-        
+
         # Precompute indices
         st["arangeB"] = torch.arange(B, device=dev, dtype=torch.long)
-        
+
         # Static copies of model-constant tensors
         st["pe"] = tt._positional_encoding.pe  # don't clone; it's static
-        
+
         # Memory buffers (pre-allocated, copy into them per call)
         st["mem_enc_buf"] = torch.empty(S, B, D, device=dev)
         st["mem_enc_buf"].copy_(mem_enc)
-        
+
         # Pre-allocate mem_kv buffers per decoder layer
         st["memK"] = []
         st["memV"] = []
@@ -111,31 +111,31 @@ class BatchedTableDecoderV2:
             Dh = mha.embed_dim // H_mha
             st["memK"].append(torch.empty(B, H_mha, S, Dh, device=dev))
             st["memV"].append(torch.empty(B, H_mha, S, Dh, device=dev))
-        
+
         # Compute mem_kv in-place
         self._rebuild_mem_kv_inplace()
-        
+
         # Pre-build mem_kv list for cleaner capture (avoid Python object creation in loop)
         st["mem_kv"] = list(zip(st["memK"], st["memV"]))
-        
+
         # Encode start row embedding once
         start_row = st["decoded_tags"][0]  # [B]
         pe0 = st["pe"][0] if st["pe"].dim() == 2 else st["pe"][0].squeeze(0)
         st["tgt_emb_buf"][0].copy_(tt._embedding(start_row) + pe0)
-        
+
         # KV cache list (per layer) initialized to None
         st["sa_kv_cache"] = [None] * len(tt._decoder.layers)
-        
+
         # Keep reference to enc_out_batch
         st["enc_out_batch"] = enc_out_batch
-    
+
     def _rebuild_mem_kv_inplace(self):
         """Rebuild memory K/V in-place without allocating new tensors"""
         st = self._static
         tt = self.tt
         mem = st["mem_enc_buf"].transpose(0, 1).contiguous()  # [B,S,D]
         B, S, D = mem.shape
-        
+
         for (Kbuf, Vbuf), layer in zip(zip(st["memK"], st["memV"]), tt._decoder.layers):
             mha = layer.multihead_attn
             E = mha.embed_dim
@@ -143,22 +143,23 @@ class BatchedTableDecoderV2:
             Dh = E // H
             W = mha.in_proj_weight
             b = mha.in_proj_bias
-            Wk = W[E:2*E, :]
-            Wv = W[2*E:, :]
-            bk = b[E:2*E] if b is not None else None
-            bv = b[2*E:] if b is not None else None
+            Wk = W[E:2 * E, :]
+            Wv = W[2 * E:, :]
+            bk = b[E:2 * E] if b is not None else None
+            bv = b[2 * E:] if b is not None else None
             K = torch.nn.functional.linear(mem, Wk, bk)  # [B,S,E]
             V = torch.nn.functional.linear(mem, Wv, bv)  # [B,S,E]
             Kbuf.copy_(K.view(B, S, H, Dh).transpose(1, 2).contiguous())
             Vbuf.copy_(V.view(B, S, H, Dh).transpose(1, 2).contiguous())
-    
+
     def _ar_loop_graph_body(self, Tmax, B):
         """Graph-friendly AR loop with fixed shapes and no breaks"""
+
         st = self._static
         tt = self.tt
         dev = self.device
-        
-        # Unpack static tensors
+
+        # Unpack static/state tensors
         decoded_tags = st["decoded_tags"]
         lengths = st["lengths"]
         finished = st["finished"]
@@ -175,188 +176,177 @@ class BatchedTableDecoderV2:
         tag_H_buffer = st["tag_H_buffer"]
         pe = st["pe"]
         mem_enc_buf = st["mem_enc_buf"]
-        memK = st["memK"]
-        memV = st["memV"]
-        sa_kv_cache = st["sa_kv_cache"]
         arangeB = st["arangeB"]
-        
-        # Use pre-built LUTs
+        sa_kv_cache = st["sa_kv_cache"]
+
+        # LUTs and pre-built memory KV (no Python object creation inside loop)
         emit_lut = self.emit_lut
         skip_lut = self.skip_lut
-        
-        # Use pre-built mem_kv list (avoid Python object creation in captured region)
         mem_kv = st["mem_kv"]
-        
-        # Run exactly Tmax steps (no early break)
+
+        # -------- Hoisted constants / prepared tensors (graph-friendly) --------
+        h_dtype = tag_H_buffer.dtype
+        D_hidden = tag_H_buffer.size(-1)
+
+        peL = pe.size(0)
+        pe_max = torch.tensor(peL - 1, device=dev, dtype=torch.long)
+        tmax_minus1 = torch.tensor(Tmax - 1, device=dev, dtype=torch.long)
+
+        has_lcel = self.lcel_id is not None
+        has_nl = self.nl_id is not None
+        has_ucel = self.ucel_id is not None
+        zero_bool_B = torch.zeros(B, dtype=torch.bool, device=dev)
+
+        # -----------------------------------------------------------------------
         for t in range(Tmax):
-            # Use Python int for indexing
+            # Transformer step (incremental, fixed shapes)
             last_H, _, sa_kv_cache = tt.step_fullprefix(
                 t, tgt_emb_buf,
                 memory=mem_enc_buf, cache=None, memory_kv=mem_kv,
                 sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
             )
-            
+
+            # Ensure dtype matches buffer to avoid implicit promotion kernels
+            if last_H.dtype != h_dtype:
+                last_H = last_H.to(h_dtype)
+
             # FC + argmax
-            logits = tt._fc(last_H)  # [B,V]
+            logits = tt._fc(last_H)  # [B, V]
             new_tags = logits.argmax(dim=1)  # [B]
-            
-            # Structure corrections (all on GPU)
-            if self.xcel_id is not None and self.lcel_id is not None:
+
+            # Structure corrections (GPU)
+            if (self.xcel_id is not None) and (self.lcel_id is not None):
                 mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
                 new_tags = torch.where(mask_first_line, self.lcel_id, new_tags)
-            
-            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
+
+            if has_ucel and (self.lcel_id is not None) and (self.fcel_id is not None):
                 mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
                 new_tags = torch.where(mask_ucel_lcel, self.fcel_id, new_tags)
-            
-            # Force <end> for finished sequences
+
+            # Force <end> for already finished sequences
             new_tags = torch.where(finished, self.end_id, new_tags)
-            
-            # Write to preallocated buffer
-            decoded_tags[t + 1, :] = new_tags
-            
-            # Advance lengths for active sequences (IN-PLACE)
+
+            # Commit token
+            decoded_tags[t + 1] = new_tags
+
+            # Advance lengths for sequences active *before* this step
             active_prev = ~finished
             lengths.add_(active_prev.to(lengths.dtype))
-            
-            # PE using per-sample positions (same logic as eager path)
-            peL = pe.size(0)
-            pos_idx = torch.minimum(lengths, torch.tensor(peL - 1, device=dev, dtype=lengths.dtype)).to(torch.long)
-            
-            if pe.dim() == 2:         # [L, D]
-                pos_vec = pe.index_select(0, pos_idx)                 # [B, D]
-            else:                     # [L, 1, D]
-                pos_vec = pe.index_select(0, pos_idx).squeeze(1)      # [B, D]
-            
+
+            # Positional encoding for next-step embedding (same semantics as eager path)
+            pos_idx = torch.minimum(lengths.to(torch.long), pe_max)  # [B]
+            pos_vec = pe.index_select(0, pos_idx)  # [B, D] or [B,1,D]
+            if pos_vec.dim() == 3:  # handle [L,1,D]
+                pos_vec = pos_vec.squeeze(1)
+
             if t + 1 < Tmax:
-                tgt_emb_buf[t + 1] = tt._embedding(new_tags) + pos_vec
-            
-            # Mark newly finished (IN-PLACE)
-            finished.logical_or_((new_tags == self.end_id))
-            
-            # ---- BBox emission (fixed-shape, no nonzero) ----
+                tgt_emb_buf[t + 1] = tt._embedding(new_tags) + pos_vec  # [B, D]
+
+            # Mark newly finished (for the *next* step)
+            finished.logical_or_(new_tags == self.end_id)
+
+            # ---------- BBox emission & span bookkeeping (whole-batch, masked) ----------
             m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
-            
-            if self.lcel_id is not None:
-                m_is_lcel = (new_tags == self.lcel_id)
-            else:
-                m_is_lcel = torch.zeros(B, dtype=torch.bool, device=dev)
-            
+            m_is_lcel = (new_tags == self.lcel_id) if has_lcel else zero_bool_B
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
-            
-            # Compute append mask
-            append_mask = m_emit_bbox | m_first_lcel
-            
-            # Fixed-shape bbox storage using masked operations (SAFE - no OOB)
-            positions = tag_H_counts
-            valid_store = append_mask & (positions < Tmax)
-            
-            # Clamp positions to avoid out-of-bounds indexing
-            safe_pos = torch.minimum(positions, torch.tensor(Tmax-1, device=dev))
-            mask2d = valid_store.unsqueeze(1).expand(-1, last_H.size(1))
-            
-            # Use 3D view for cleaner indexing (no flat index math)
-            old_slice = tag_H_buffer[arangeB, safe_pos]  # [B, D]
-            tag_H_buffer[arangeB, safe_pos] = torch.where(mask2d, last_H, old_slice)
-            tag_H_counts.add_(valid_store.to(tag_H_counts.dtype))  # IN-PLACE
-            
-            # Span tracking with fixed shapes - NO BRANCHING, ALL IN-PLACE
-            # Start spans where m_first_lcel & append_mask
+
+            append_mask = m_emit_bbox | m_first_lcel  # [B]
+            positions = tag_H_counts  # [B]
+            valid_store = append_mask & (positions < Tmax)  # [B]
+
+            # Safe position indices
+            safe_pos = torch.minimum(positions, tmax_minus1)  # [B]
+
+            # Masked write of decoder features into [B, Tmax, H]
+            #   tag_H_buffer[b, safe_pos[b], :] = last_H[b]  if valid_store[b]
+            mask2d = valid_store.unsqueeze(1).expand(-1, D_hidden)  # [B, H]
+            cur = tag_H_buffer[arangeB, safe_pos]  # [B, H]
+            tag_H_buffer[arangeB, safe_pos] = torch.where(mask2d, last_H, cur)
+
+            # Increment per-row emission counters
+            tag_H_counts.add_(valid_store.to(tag_H_counts.dtype))
+
+            # ---- Span starts
             span_start_mask = m_first_lcel & append_mask
+            # masked_scatter with empty source is a no-op (graph-friendly)
             open_span_start.masked_scatter_(span_start_mask, positions.masked_select(span_start_mask))
-            
-            # End spans - FIXED SHAPE, NO IF STATEMENTS
+
+            # ---- Span ends
             span_end_mask = m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)
-            
-            # Fixed-shape span updates (no variable-length indices)
-            can_write = span_counts < Tmax  # [B]
-            write_mask = span_end_mask & can_write  # [B]
-            
-            # Compute safe indices for writing
-            span_idx = span_counts  # [B] current write slot per row
-            safe_idx = torch.minimum(span_idx, torch.tensor(Tmax-1, device=dev))
-            
-            # Write starts/ends with mask - every sample gets touched but only masked ones change
+
+            can_write = span_counts < Tmax
+            write_mask = span_end_mask & can_write
+
+            # Write current start/end indices into fixed slots
+            safe_span_slot = torch.minimum(span_counts, tmax_minus1)  # [B]
             row = arangeB
-            col = safe_idx
-            
-            # Start coords (IN-PLACE)
-            cur_starts = span_starts[row, col]
-            span_starts[row, col] = torch.where(write_mask, open_span_start, cur_starts)
-            
-            # End coords (IN-PLACE)
-            cur_ends = span_ends[row, col]
-            span_ends[row, col] = torch.where(write_mask, positions, cur_ends)
-            
-            # Increment counts (IN-PLACE)
+            col = safe_span_slot
+
+            cur_st = span_starts[row, col]
+            span_starts[row, col] = torch.where(write_mask, open_span_start, cur_st)
+
+            cur_en = span_ends[row, col]
+            span_ends[row, col] = torch.where(write_mask, positions, cur_en)
+
+            # Bump span counters where we wrote
             span_counts.add_(write_mask.to(span_counts.dtype))
-            
-            # Always close spans that attempted to end (IN-PLACE)
+
+            # Close any span that attempted to end (even if we didn't write due to capacity)
             open_span_start.masked_fill_(span_end_mask, -1)
-            
-            # Update flags (ALL IN-PLACE)
-            # first_lcel should be False where m_is_lcel, True elsewhere
-            # This is equivalent to: first_lcel = ~m_is_lcel (but in-place)
+
+            # ---------- Flags for next iteration ----------
             first_lcel.copy_(~m_is_lcel)
-            
-            # skip_next from LUT
             skip_next.copy_(skip_lut[new_tags])
-            
-            # prev_ucel tracking
-            if self.ucel_id is not None:
+            if has_ucel:
                 prev_ucel.copy_(new_tags == self.ucel_id)
             else:
                 prev_ucel.zero_()
-            
-            # line_num increment
-            if self.nl_id is not None:
+            if has_nl:
                 line_num.add_((new_tags == self.nl_id).to(line_num.dtype))
-        
-        # No need to store back - we mutated in-place!
-        # The tensors in st[] are the same objects we modified
-        # Just update sa_kv_cache which is a list
+
+        # Persist kv-cache list back to static storage
         st["sa_kv_cache"] = sa_kv_cache
-    
+
     def _capture_if_needed(self, enc_out_batch, mem_enc, Tmax, B):
         """Capture CUDA Graph if not already captured or if shapes changed"""
         # Check if recapture is needed
         need_capture = (
-            self._graph is None
-            or self._static.get("B", None) != B
-            or self._static.get("Tmax", None) != Tmax
+                self._graph is None
+                or self._static.get("B", None) != B
+                or self._static.get("Tmax", None) != Tmax
         )
-        
+
         if not need_capture:
             return  # Already captured with correct shapes
-        
+
         if not torch.cuda.is_available():
             return  # Not on CUDA
-        
+
         # Clear old graph if recapturing
         if self._graph is not None:
             del self._graph
             self._graph = None
-        
+
         torch.cuda.synchronize()
-        
+
         # Prepare static buffers
         self._prepare_graph_static(enc_out_batch, mem_enc, Tmax, B)
-        
+
         # Warmup on default stream
         self._ar_loop_graph_body(Tmax, B)
         torch.cuda.synchronize()
-        
+
         # Capture on default stream for simplicity
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):  # No stream arg = use default
             self._ar_loop_graph_body(Tmax, B)
-        
+
         self._graph = g
-        
+
         # Store shape metadata for future shape guards
         self._static["B"] = B
         self._static["Tmax"] = Tmax
-    
+
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
         seq_list = seq_tensor.tolist()
@@ -377,11 +367,11 @@ class BatchedTableDecoderV2:
         device = self.device
         B_orig = enc_out_batch.size(0)
         S = mem_enc.size(0)
-        
+
         # Use actual request dimensions (clamped)
         Tmax_req = min(max_steps, self.model._max_pred_len, self._graph_tmax)
         B_req = min(self._graph_bs, max(B_orig, 1))  # At least original batch size
-        
+
         # Pad inputs to graph size if needed
         if B_orig < B_req:
             # Pad enc_out_batch
@@ -390,27 +380,27 @@ class BatchedTableDecoderV2:
                 enc_out_batch,
                 torch.zeros(pad_b, *enc_out_batch.shape[1:], device=device, dtype=enc_out_batch.dtype)
             ], dim=0)
-            
+
             # Pad mem_enc [S,B,D]
             mem_enc = torch.cat([
                 mem_enc,
                 torch.zeros(S, pad_b, mem_enc.size(2), device=device, dtype=mem_enc.dtype)
             ], dim=1)
-        
+
         # Capture graph if needed (with shape guards)
         self._capture_if_needed(enc_out_batch, mem_enc, Tmax_req, B_req)
-        
+
         # Reset state for this batch
         st = self._static
         st["decoded_tags"].fill_(self.end_id.item())
         st["decoded_tags"][0].fill_(self.start_id.item())
         st["lengths"].zero_()
         st["finished"].zero_()
-        
+
         # Mark padded samples as finished from the start
         if B_orig < B_req:
             st["finished"][B_orig:] = True
-        
+
         st["first_lcel"].fill_(True)
         st["skip_next"].fill_(True)
         st["prev_ucel"].zero_()
@@ -420,25 +410,25 @@ class BatchedTableDecoderV2:
         st["span_starts"].fill_(-1)
         st["span_ends"].fill_(-1)
         st["span_counts"].zero_()
-        
+
         # Reset KV cache
         st["sa_kv_cache"] = [None] * len(self.tt._decoder.layers)
-        
+
         # Copy memory to static buffers
         st["mem_enc_buf"].copy_(mem_enc)
         self._rebuild_mem_kv_inplace()
         # Update the mem_kv list with new data
         st["mem_kv"] = list(zip(st["memK"], st["memV"]))
-        
+
         # Re-encode start embeddings
         start_row = st["decoded_tags"][0]
         pe0 = st["pe"][0] if st["pe"].dim() == 2 else st["pe"][0].squeeze(0)
         st["tgt_emb_buf"][0].copy_(self.tt._embedding(start_row) + pe0)
-        
+
         # Replay the graph
         self._graph.replay()
         # Note: No sync needed - subsequent .item()/.cpu() calls will sync as required
-        
+
         # Read results from static buffers (only first B_orig samples)
         decoded_tags = st["decoded_tags"][:, :B_orig]
         lengths = st["lengths"][:B_orig]
@@ -448,7 +438,7 @@ class BatchedTableDecoderV2:
         span_ends = st["span_ends"][:B_orig]
         span_counts = st["span_counts"][:B_orig]
         enc_out_batch = enc_out_batch[:B_orig]
-        
+
         # Process outputs (same as non-graph path)
         end_id_int = self.end_id.item()
         seqs = []
@@ -458,34 +448,34 @@ class BatchedTableDecoderV2:
             seq_len = min(Tmax_req + 1, actual_len)
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
-        
+
         # Process bboxes
         tag_H_counts_cpu = tag_H_counts.cpu()
         outputs = []
-        
+
         for b in range(B_orig):
             count = tag_H_counts_cpu[b].item()
-            
+
             if self.model._bbox and count > 0:
                 tag_H_tensor = tag_H_buffer[b, :count].contiguous()
                 enc_nchw = enc_out_batch[b:b + 1]
-                
+
                 cls_logits, coords = self.model._bbox_decoder.inference(
                     enc_nchw, tag_H_tensor
                 )
             else:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
-            
+
             # GPU-based span merging
             merged_cls, merged_coord = self._merge_spans_gpu(
                 cls_logits, coords,
                 span_starts[b], span_ends[b], span_counts[b]
             )
             outputs.append((seqs[b], merged_cls, merged_coord))
-        
+
         return outputs
-    
+
     @torch.inference_mode()
     def predict_batched(
             self,
@@ -499,19 +489,19 @@ class BatchedTableDecoderV2:
 
         # Clamp to model's max
         Tmax = min(max_steps, self.model._max_pred_len)
-        
+
         # Check if we should use CUDA Graphs
         use_graph = (
-            device == 'cuda' and 
+            ("cuda" in str(self.device)) and
             torch.cuda.is_available() and
             B <= self._graph_bs and
             Tmax <= self._graph_tmax and
-            os.getenv("USE_CUDA_GRAPHS", "1") == "1"
+            os.getenv("USE_CUDA_GRAPHS", "0") == "1"  # default OFF until parity confirmed
         )
-        
+
         if use_graph:
             return self.predict_batched_graph(enc_out_batch, mem_enc, max_steps)
-        
+
         # Otherwise use original non-graph path
 
         # ---- Preallocate all buffers (Fix B: avoid reallocation) ----
@@ -534,14 +524,14 @@ class BatchedTableDecoderV2:
         tag_H_buffer = None
         tag_H_flat = None
         tag_H_counts = torch.zeros(B, dtype=torch.long, device=device)  # [B] count per sample
-        
+
         # Span tracking on GPU - allocate more capacity (Tmax instead of Tmax//2)
         open_span_start = torch.full((B,), -1, dtype=torch.long, device=device)  # [B]
         # Allocate Tmax spans per sample (safe, won't overflow)
         span_starts = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
         span_ends = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
         span_counts = torch.zeros(B, dtype=torch.long, device=device)
-        
+
         # Drop bbox_ind - just use tag_H_counts (they're identical)
 
         # Use pre-built LUTs from __init__
@@ -573,7 +563,7 @@ class BatchedTableDecoderV2:
         # Track current step
         t = 0
         # Checkpoint B: Switch to incremental mode (no tag cache)
-        sa_kv_cache = None     # KV cache for all layers
+        sa_kv_cache = None  # KV cache for all layers
 
         # Step 4: Precompute cross-attention memory K/V once
         USE_MEM_KV = True  # set False to disable the custom path
@@ -638,60 +628,45 @@ class BatchedTableDecoderV2:
             if finished.all():
                 break
 
-            # ---- BBox emission decisions (TRULY NO SYNCS!) ----
-            # Use LUT for fast membership (no isin!)
+            # ---- BBox emission decisions ----
             m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
-
-            # Fix: Proper boolean handling for m_is_lcel
-            if self.lcel_id is not None:
-                m_is_lcel = (new_tags == self.lcel_id)
-            else:
-                m_is_lcel = torch.zeros(B, dtype=torch.bool, device=device)
-
+            m_is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else torch.zeros(B, dtype=torch.bool,
+                                                                                                device=device)
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
 
-            # Collect bbox features (SAFE - using same logic as graph path)
             append_mask = m_emit_bbox | m_first_lcel
-            positions = tag_H_counts  # [B]
-            valid_store = append_mask & (positions < Tmax)  # Bounds check
+            positions = tag_H_counts
+            valid_store = append_mask & (positions < Tmax)
 
-            # Get samples that need emission
+            # Collect per-sample features (works even if empty)
             emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
-            if emit_samples.numel() > 0:
-                store_pos = positions.index_select(0, emit_samples)  # [K]
-                flat_idx = emit_samples * Tmax + store_pos  # [K]
-                src = last_H.index_select(0, emit_samples)  # [K,D]
-                tag_H_flat.index_copy_(0, flat_idx, src)
+            store_pos = positions.index_select(0, emit_samples)  # [K]
+            flat_idx = emit_samples * Tmax + store_pos  # [K]
+            src = last_H.index_select(0, emit_samples)  # [K, D]
+            tag_H_flat.index_copy_(0, flat_idx, src)
 
-                # Span starts
-                start_samples = (m_first_lcel[emit_samples] & append_mask[emit_samples]).nonzero(as_tuple=False).squeeze(-1)
-                if start_samples.numel() > 0:
-                    actual_samples = emit_samples[start_samples]
-                    open_span_start.index_copy_(0, actual_samples, tag_H_counts.index_select(0, actual_samples))
+            # ---- span starts (WHOLE BATCH) ----
+            start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
+            open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
 
-                # Span ends
-                end_mask = m_emit_bbox[emit_samples] & (~m_first_lcel[emit_samples]) & append_mask[emit_samples] & (open_span_start[emit_samples] >= 0)
-                end_samples = end_mask.nonzero(as_tuple=False).squeeze(-1)
-                if end_samples.numel() > 0:
-                    actual_end_samples = emit_samples[end_samples]
-                    
-                    # Filter for capacity and store
-                    span_idx = span_counts.index_select(0, actual_end_samples)
-                    valid = span_idx < span_starts.size(1)
-                    valid_end_samples = actual_end_samples[valid]
-                    valid_span_idx = span_idx[valid]
+            # ---- span ends (WHOLE BATCH) ----
+            end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)) \
+                .nonzero(as_tuple=False).squeeze(-1)
 
-                    # Store valid spans (read values BEFORE closing!)
-                    if valid_end_samples.numel() > 0:
-                        span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
-                        span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
-                        span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
+            span_idx = span_counts.index_select(0, end_samples)
+            valid = span_idx < span_starts.size(1)
+            valid_end_samples = end_samples[valid]
+            valid_span_idx = span_idx[valid]
 
-                    # ALWAYS close spans (even if capacity exceeded) to prevent stuck open spans
-                    open_span_start.index_fill_(0, actual_end_samples, -1)
+            span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
+            span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
+            span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
 
-            # Counters: increment ONLY rows that actually stored (IN-PLACE)
-            tag_H_counts.add_(valid_store.to(tag_H_counts.dtype))
+            # Always close spans that attempted to end
+            open_span_start.index_fill_(0, end_samples, -1)
+
+            # Counter: increment only rows that actually stored
+            tag_H_counts.index_add_(0, emit_samples, torch.ones_like(store_pos))
 
             # ---- Update flags (all IN-PLACE to match graph path) ----
             # Reset first_lcel=True on every non-lcel step (matches serial semantics)
@@ -734,12 +709,12 @@ class BatchedTableDecoderV2:
         outputs = []
         for b in range(B):
             count = tag_H_counts_cpu[b].item()
-            
+
             if self.model._bbox and count > 0:
                 # Pass tensor directly (no list construction!)
                 tag_H_tensor = tag_H_buffer[b, :count].contiguous()  # [N, D] on device
                 enc_nchw = enc_out_batch[b:b + 1]  # [1, 256, 28, 28] NCHW
-                
+
                 # Check type explicitly (no try/except overhead)
                 if isinstance(tag_H_tensor, torch.Tensor):
                     cls_logits, coords = self.model._bbox_decoder.inference(
@@ -747,7 +722,7 @@ class BatchedTableDecoderV2:
                     )
                 else:
                     # Should never hit this path with our GPU-only collection
-                    tag_H_list = [tag_H_tensor[i:i+1] for i in range(count)]
+                    tag_H_list = [tag_H_tensor[i:i + 1] for i in range(count)]
                     cls_logits, coords = self.model._bbox_decoder.inference(
                         enc_nchw, tag_H_list
                     )
@@ -757,7 +732,7 @@ class BatchedTableDecoderV2:
 
             # GPU-based span merging
             merged_cls, merged_coord = self._merge_spans_gpu(
-                cls_logits, coords, 
+                cls_logits, coords,
                 span_starts[b], span_ends[b], span_counts[b]
             )
             outputs.append((seqs[b], merged_cls, merged_coord))
@@ -765,42 +740,42 @@ class BatchedTableDecoderV2:
         return outputs
 
     def _merge_spans_gpu(
-        self, 
-        cls_logits: torch.Tensor, 
-        coords: torch.Tensor,
-        starts: torch.Tensor,  # [Tmax] with -1 for invalid
-        ends: torch.Tensor,    # [Tmax] with -1 for invalid  
-        count: torch.Tensor    # scalar, number of valid spans
+            self,
+            cls_logits: torch.Tensor,
+            coords: torch.Tensor,
+            starts: torch.Tensor,  # [Tmax] with -1 for invalid
+            ends: torch.Tensor,  # [Tmax] with -1 for invalid
+            count: torch.Tensor  # scalar, number of valid spans
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """GPU-based span merging without CPU sync"""
         device = coords.device if coords is not None and coords.numel() > 0 else self.device
         N = len(coords) if coords is not None else 0
-        
+
         if N == 0 or count == 0:
             return cls_logits, coords
-        
+
         # Extract valid spans
         num_spans = count.item()  # Single sync point
         if num_spans == 0:
             return cls_logits, coords
-            
+
         valid_starts = starts[:num_spans].clamp_min(0)  # [M]
-        valid_ends = ends[:num_spans].clamp_min(0)      # [M]
-        
+        valid_ends = ends[:num_spans].clamp_min(0)  # [M]
+
         # Create drop mask (mark ends for removal)
         drop = torch.zeros(N, dtype=torch.bool, device=device)
         valid_mask = (valid_ends < N) & (valid_starts < N)
         drop[valid_ends[valid_mask]] = True
         keep = ~drop
-        
+
         # Merge coordinates for start positions (BATCHED - no Python loop!)
         if valid_mask.any():
             merge_starts = valid_starts[valid_mask]
             merge_ends = valid_ends[valid_mask]
-            
+
             # Clone coords to avoid in-place issues
             coords = coords.clone()
-            
+
             # Use batched merge - single kernel, no loop!
             if hasattr(self.model, 'mergebboxes_batch'):
                 coords[merge_starts] = self.model.mergebboxes_batch(
@@ -812,10 +787,10 @@ class BatchedTableDecoderV2:
                     coords[merge_starts[i]] = self.model.mergebboxes(
                         coords[merge_starts[i]], coords[merge_ends[i]]
                     )
-        
+
         # Select only kept rows
         return cls_logits[keep], coords[keep]
-    
+
     def _merge_spans(self, cls_logits: torch.Tensor, coords: torch.Tensor, merge_map: Dict[int, int]) -> Tuple[
         torch.Tensor, torch.Tensor]:
         """Merge bbox spans according to merge_map"""
