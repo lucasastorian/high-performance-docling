@@ -152,29 +152,16 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         V_buf[..., t:t+1, :] = v
         t += 1
 
-        # Use manual attention for very short sequences (SDPA has overhead)
-        if t < 8:
-            # Manual attention for short sequences
-            # q: [B*H,1,Dh], K_buf/V_buf: [B,H,t,Dh]
-            q_manual = q.reshape(B, H, 1, Dh)  # [B,H,1,Dh]
-            K_active = K_buf[..., :t, :]  # [B,H,t,Dh]
-            V_active = V_buf[..., :t, :]  # [B,H,t,Dh]
-            
-            scores = torch.matmul(q_manual, K_active.transpose(-2, -1)) * (1.0 / (Dh ** 0.5))
-            attn = torch.softmax(scores, dim=-1)  # [B,H,1,t]
-            ctx = torch.matmul(attn, V_active)  # [B,H,1,Dh]
-            ctx = ctx.reshape(B*H, 1, Dh)
-        else:
-            # SDPA for longer sequences (where it shines)
-            k_sdp = K_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
-            v_sdp = V_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
-            
-            ctx = F.scaled_dot_product_attention(
-                q, k_sdp, v_sdp, 
-                attn_mask=None, 
-                dropout_p=0.0, 
-                is_causal=False
-            )  # [B*H,1,Dh]
+        # Always use SDPA (no branching, better kernel selection)
+        k_sdp = K_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
+        v_sdp = V_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
+        
+        ctx = F.scaled_dot_product_attention(
+            q, k_sdp, v_sdp, 
+            attn_mask=None, 
+            dropout_p=0.0, 
+            is_causal=False
+        )  # [B*H,1,Dh]
 
         # Merge heads -> [1,B,E]
         ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
