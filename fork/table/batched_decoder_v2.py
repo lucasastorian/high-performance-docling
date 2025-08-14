@@ -126,8 +126,8 @@ class BatchedTableDecoderV2:
             """
             idx = idx.to(torch.long)
             out = pe.index_select(0, idx)  # [B, D] or [B,1,D]
-            if out.dim() == 3:             # common case: [B,1,D]
-                out = out.squeeze(1)       # -> [B, D]
+            if out.dim() == 3:  # common case: [B,1,D]
+                out = out.squeeze(1)  # -> [B, D]
             return out.contiguous()
 
         # Initialize first step with start tokens (per-sample position indexing)
@@ -138,13 +138,10 @@ class BatchedTableDecoderV2:
 
         # Track current step
         t = 0
-        
-        # Step 3: Enable KV cache for layer 0 only (for testing)
-        USE_SA_KV_L0 = True  # Enable self-attention KV cache for layer 0
-        cache = [None] * len(tt._decoder.layers) if USE_SA_KV_L0 else None
+        cache = None
 
         # Step 4: Precompute cross-attention memory K/V once
-        USE_MEM_KV = False  # set False to disable the custom path
+        USE_MEM_KV = True  # set False to disable the custom path
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
@@ -179,13 +176,13 @@ class BatchedTableDecoderV2:
             # 2) Assign the position for the token we just emitted:
             #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
             #    - Previously-finished sequences DO NOT advance (they keep their last pos)
-            pos_idx = torch.where(active_prev, lengths + 1, lengths)          # int32
-            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)        # bounds + dtype
-            pos_vec = pe_gather_bD(pe, pos_idx)                               # [B, D]
-            
+            pos_idx = torch.where(active_prev, lengths + 1, lengths)  # int32
+            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)  # bounds + dtype
+            pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
+
             # Update incremental embedding buffer for next step
             if t < Tmax:  # Only if we'll do another step
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec                # [B, D]
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
 
             # 3) Now actually advance lengths for sequences that were active
             lengths = torch.where(active_prev, lengths + 1, lengths)

@@ -60,39 +60,37 @@ class TMTransformerDecoder(nn.TransformerDecoder):
 
         output = tgt
 
-        # Initialize cache structure for KV (Step 3: only layer 0 for now)
-        if cache is None:
-            kv_cache = [None] * len(self.layers)
-        else:
-            # Interpret cache as KV cache list
-            kv_cache = cache if isinstance(cache, list) else [None] * len(self.layers)
-        
-        out_kv_cache = []
-        
+        # cache
+        tag_cache = []
         for i, mod in enumerate(self.layers):
-            # Only use KV cache for layer 0 (Step 3)
-            layer_self_kv = kv_cache[i] if i == 0 else None
-            
-            # Call layer with optional self-KV cache
+            # Call layer - it now returns (output, self_kv) but we ignore self_kv for now
             result = mod(
                 output, memory,
                 memory_mask=memory_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
                 memory_kv=None if memory_kv is None else memory_kv[i],
-                self_kv=layer_self_kv,  # Pass KV cache for layer 0
+                self_kv=None,  # Always None for now (Step 3)
             )
             
-            # Handle return value based on whether layer returns KV
+            # Handle the new tuple return format
             if isinstance(result, tuple):
-                output, layer_kv_new = result
-                out_kv_cache.append(layer_kv_new if layer_kv_new is not None else kv_cache[i])
+                output, layer_kv = result
+                # Ignore layer_kv for now
             else:
-                # Backward compatibility for layers without KV support
+                # Fallback for compatibility
                 output = result
-                out_kv_cache.append(None)
+            
+            tag_cache.append(output)
+            if cache is not None:
+                output = torch.cat([cache[i], output], dim=0)
 
-        return output, out_kv_cache  # Return list of KV caches
+        if cache is not None:
+            out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
+        else:
+            out_cache = torch.stack(tag_cache, dim=0)
+
+        return output, out_cache  # type: ignore
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
@@ -138,8 +136,8 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         if kv_prev is not None:
             K_prev, V_prev = kv_prev                      # [B,H,Tprev,Dh]
-            K_cat = torch.cat([K_prev, k], dim=2)         # [B,H,Tprev+1,Dh]
-            V_cat = torch.cat([V_prev, v], dim=2)
+            K_cat = torch.cat([K_prev, k], dim=2).contiguous()         # [B,H,Tprev+1,Dh]
+            V_cat = torch.cat([V_prev, v], dim=2).contiguous()
         else:
             K_cat, V_cat = k, v
 
@@ -165,38 +163,35 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv=None,   # NEW: (K_mem, V_mem) or None
-        self_kv: Optional[Tuple[Tensor,Tensor]] = None,  # NEW: self-attn KV cache
+        self_kv: Optional[Tuple[Tensor,Tensor]] = None,  # NEW: self-attn KV cache (UNUSED for now)
     ) -> Tuple[Tensor, Optional[Tuple[Tensor,Tensor]]]:
         """
         Args:
             same as TMTransformerDecoder
         Returns:
             Tuple[Tensor, Optional[Tuple[Tensor,Tensor]]]:
-                - embedding of last tag: (1,bsz,hidden_dim)
-                - updated self-attn KV cache
+                - embedding of last tag: (1,bsz,hidden_dim) 
+                - self-attention KV cache (always None for now in Step 3)
         """
 
         # From PyTorch but modified to only use the last tag
         tgt_last_tok = tgt[-1:, :, :]
-        
-        # Use KV cache if provided, otherwise fall back to stock MHA
-        if self_kv is not None:
-            sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv)
-            tmp_tgt = sa_out
-        else:
-            # Fallback: stock MHA with full sequence
-            tmp_tgt = self.self_attn(
-                tgt_last_tok,
-                tgt,
-                tgt,
-                attn_mask=None,  # None, because we only care about the last tag
-                key_padding_mask=tgt_key_padding_mask,
-                need_weights=False,  # Optimization: Don't compute attention weights
-            )[0]
-            self_kv_new = None  # No cache update
-        
+
+        # FOR NOW: Always use stock MHA (self_kv is ignored)
+        # In Step 4, we'll enable KV cache conditionally
+        tmp_tgt = self.self_attn(
+            tgt_last_tok,
+            tgt,
+            tgt,
+            attn_mask=None,  # None, because we only care about the last tag
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,  # Optimization: Don't compute attention weights
+        )[0]
         tgt_last_tok = tgt_last_tok + self.dropout1(tmp_tgt)
         tgt_last_tok = self.norm1(tgt_last_tok)
+        
+        # KV cache is always None for now
+        self_kv_new = None
 
         # cross-attn
         if memory is not None:
@@ -258,7 +253,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         )
         tgt_last_tok = tgt_last_tok + self.dropout3(tmp_tgt)
         tgt_last_tok = self.norm3(tgt_last_tok)
-        return tgt_last_tok, self_kv_new
+        return tgt_last_tok, self_kv_new  # Return tuple now
 
 
 class Tag_Transformer(nn.Module):
