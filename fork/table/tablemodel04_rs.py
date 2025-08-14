@@ -10,7 +10,6 @@ import torch.nn as nn
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
-from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04

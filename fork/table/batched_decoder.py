@@ -109,7 +109,9 @@ class BatchedTableDecoder:
         zeros_B = torch.zeros(B, dtype=torch.bool, device=device)  # [B] reusable zeros
         ones_B_bool = torch.ones(B, dtype=torch.bool, device=device)  # [B] reusable bool ones
         neg_ones_B = torch.full((B,), -1, dtype=torch.long, device=device)  # [B] reusable -1s
-        col_mask = torch.zeros(B, Tmax, dtype=torch.bool, device=device)  # [B, Tmax] reusable mask
+        
+        # Efficient indexing: precompute row base offsets for flat indexing
+        row_base = B_idx * Tmax  # [B] base offset for each row in flattened view
 
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
@@ -211,36 +213,48 @@ class BatchedTableDecoder:
 
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
 
-            # Collect bbox features with fixed-shape masked writes
+            # Collect bbox features with efficient per-row index_copy_
             append_mask = m_emit_bbox | m_first_lcel
             positions = tag_H_counts  # [B]
             valid_store = append_mask & (positions < Tmax) & (~finished)  # Bounds check
 
-            # Fixed-shape masked write - no variable K tensors
-            row_pos = tag_H_counts.clamp_max(Tmax - 1)  # [B], current per-row cursor
-            col_mask.zero_()  # Reset reusable mask
-            col_mask[B_idx, row_pos] = valid_store  # Mark positions to update
+            # Efficient per-row indexed write - O(B*D) not O(B*Tmax*D)
+            dest_col = tag_H_counts.clamp_max(Tmax - 1)  # [B] current column position
+            flat_idx = row_base + dest_col  # [B] flat indices for each row's write position
+            
+            # Build source that preserves old values for rows we don't want to write
+            old_vals = tag_H_flat.index_select(0, flat_idx)  # [B, D] current values
+            src = torch.where(valid_store.unsqueeze(1), last_H, old_vals)  # [B, D]
+            
+            # Fixed-size copy for all B rows (touches only B*D elements, not B*Tmax*D)
+            tag_H_flat.index_copy_(0, flat_idx, src)
 
-            # Masked scatter into tag_H_buffer using broadcasting
-            expanded_H = last_H.unsqueeze(1)  # [B, 1, D]
-            tag_H_buffer = torch.where(col_mask.unsqueeze(-1), expanded_H, tag_H_buffer)
-
-            # Span starts with fixed-shape masked operations
+            # Span tracking with efficient per-row index_copy_
             start_mask = m_first_lcel & valid_store  # [B]
             open_span_start = torch.where(start_mask, tag_H_counts, open_span_start)
 
-            # Span ends with fixed-shape masked operations
+            # Span ends with efficient indexing
             end_mask = m_emit_bbox & (~m_first_lcel) & valid_store & (open_span_start >= 0)  # [B]
             span_capacity_mask = span_counts < Tmax  # [B]
             valid_end_mask = end_mask & span_capacity_mask  # [B]
 
-            # Store spans using masked scatter - write at current span_counts position
-            span_positions = span_counts.clamp_max(Tmax - 1)  # [B]
-            # Only update where valid_end_mask is True
-            span_starts[B_idx, span_positions] = torch.where(valid_end_mask, open_span_start, span_starts[B_idx, span_positions])
-            span_ends[B_idx, span_positions] = torch.where(valid_end_mask, tag_H_counts, span_ends[B_idx, span_positions])
+            # Efficient span storage using flat indexing - O(B) not O(B*Tmax)
+            span_pos = span_counts.clamp_max(Tmax - 1)  # [B]
+            span_flat_idx = row_base + span_pos  # [B] reuse row_base concept for spans
             
-            # Increment span counts with masked addition
+            # Update span starts
+            span_starts_flat = span_starts.view(-1)  # [B*Tmax]
+            old_starts = span_starts_flat.index_select(0, span_flat_idx)  # [B]
+            new_starts = torch.where(valid_end_mask, open_span_start, old_starts)  # [B]
+            span_starts_flat.index_copy_(0, span_flat_idx, new_starts)
+            
+            # Update span ends
+            span_ends_flat = span_ends.view(-1)  # [B*Tmax]
+            old_ends = span_ends_flat.index_select(0, span_flat_idx)  # [B]
+            new_ends = torch.where(valid_end_mask, tag_H_counts, old_ends)  # [B]
+            span_ends_flat.index_copy_(0, span_flat_idx, new_ends)
+            
+            # Increment span counts with masked addition (fixed-size)
             span_counts = span_counts + valid_end_mask.to(span_counts.dtype)
 
             # Close spans (reset to -1) using masked assignment
