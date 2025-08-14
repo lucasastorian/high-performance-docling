@@ -128,26 +128,30 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 # Q projection (query comes from decoder side)
                 W_q = mha.in_proj_weight[:E, :]
                 b_q = mha.in_proj_bias[:E] if mha.in_proj_bias is not None else None
-                q = F.linear(tgt_last_tok, W_q, b_q)        # [1, B, E]
-                # split heads: -> [B, H, 1, Dh]
-                q = q.permute(1, 0, 2).contiguous().view(-1, 1, H, Dh).transpose(1, 2)
+                q = F.linear(tgt_last_tok, W_q, b_q)                  # [1,B,E]
+                q = q.permute(1,0,2).contiguous().view(B, 1, H, Dh).transpose(1,2).reshape(B*H, 1, Dh)
 
                 K_mem, V_mem = memory_kv                      # [B, H, S, Dh]
+                # K_mem,V_mem: [B,H,S,Dh] -> [B*H, S, Dh]
+                k = K_mem.reshape(B*H, S, Dh)
+                v = V_mem.reshape(B*H, S, Dh)
 
-                # scores: [B, H, 1, S]
-                scores = torch.matmul(q, K_mem.transpose(-2, -1)) / math.sqrt(Dh)
+                # Handle padding mask for SDPA
+                attn_mask = None
+                if memory_key_padding_mask is not None:  # [B,S] True=pad
+                    # SDPA needs an additive mask: True -> -inf, False -> 0.0
+                    mask = memory_key_padding_mask.float().masked_fill(
+                        memory_key_padding_mask, float('-inf')
+                    ).masked_fill(~memory_key_padding_mask, 0.0)  # [B,S]
+                    attn_mask = mask.unsqueeze(1).expand(B, H, S).reshape(B*H, 1, S)
 
-                if memory_key_padding_mask is not None:       # [B, S] True=pad
-                    mask = memory_key_padding_mask.unsqueeze(1).unsqueeze(2)  # [B,1,1,S]
-                    scores = scores.masked_fill(mask, float('-inf'))
-                if memory_mask is not None:                    # [1, S] or [T,S]
-                    # broadcast to [B,H,1,S] if needed
-                    scores = scores + memory_mask  # assumes additive mask, adjust if boolean
+                # SDPA (no dropout in eval)
+                ctx = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+                )  # [B*H,1,Dh]
 
-                attn = torch.softmax(scores, dim=-1)           # [B, H, 1, S]
-                ctx  = torch.matmul(attn, V_mem)               # [B, H, 1, Dh]
-                # merge heads -> [1, B, E]
-                ctx = ctx.transpose(1, 2).contiguous().view(-1, 1, E).transpose(0, 1)  # [1,B,E]
+                # back to [1,B,E]
+                ctx = ctx.reshape(B, H, 1, Dh).transpose(1,2).contiguous().view(1, B, E)
 
                 # ✅ IMPORTANT: apply the MHA output projection, same as the stock module
                 ctx = mha.out_proj(ctx)  # preserves shape [1,B,E]
