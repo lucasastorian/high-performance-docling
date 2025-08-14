@@ -146,11 +146,10 @@ class BatchedTableDecoderV2:
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
-            # Use step_fullprefix wrapper with incremental mode
-            # Checkpoint B: incremental=True (big speedup!)
+            # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
             last_H, _, sa_kv_cache = tt.step_fullprefix(
                 t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv, 
-                sa_kv_cache=sa_kv_cache, incremental=True
+                sa_kv_cache=sa_kv_cache
             )
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long

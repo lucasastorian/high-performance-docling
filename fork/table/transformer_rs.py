@@ -43,13 +43,12 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         self,
         tgt: Tensor,
         memory: Optional[Tensor] = None,
-        cache: Optional[Tensor] = None,
+        cache: Optional[Tensor] = None,  # Unused now, kept for compatibility
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv=None,   # NEW
         sa_kv_cache=None,  # NEW: self-attention KV cache list
-        incremental: bool = False,  # NEW: incremental mode flag
     ):
         """
         Args:
@@ -60,89 +59,38 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
 
-        if not incremental:
-            # Current path: uses tag cache (full sequence rebuild)
-            output = tgt
-
-            # cache
-            tag_cache = []
-            new_sa_kv_cache = [] if sa_kv_cache is not None else None
-            
-            for i, mod in enumerate(self.layers):
-                # Use KV cache for all layers
-                layer_self_kv = None
-                if sa_kv_cache is not None and i < len(sa_kv_cache):  # all layers use KV
-                    layer_self_kv = sa_kv_cache[i]
-                
-                result = mod(
-                    output, memory,
-                    memory_mask=memory_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
-                    memory_kv=None if memory_kv is None else memory_kv[i],
-                    self_kv=layer_self_kv,
-                )
-                
-                # Handle the new tuple return format
-                if isinstance(result, tuple):
-                    output_last, layer_kv_new = result
-                else:
-                    # Fallback for compatibility
-                    output_last, layer_kv_new = result, None
-                
-                tag_cache.append(output_last)
-                
-                # Rebuild full prefix to feed next layer (unchanged)
-                if cache is not None:
-                    output = torch.cat([cache[i], output_last], dim=0)
-                else:
-                    # first step: no history; output_last is the only row
-                    output = output_last
-                    
-                # Build new KV cache  
-                if new_sa_kv_cache is not None:
-                    new_sa_kv_cache.append(layer_kv_new)  # All layers now have KV cache
-
-            if cache is not None:
-                out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
-            else:
-                out_cache = torch.stack(tag_cache, dim=0)
-
-            return output, out_cache, new_sa_kv_cache  # Return 3 items now
+        # Always use incremental path now (Checkpoint C)
+        # tgt must be [1, B, D] (single token with PE already added)
+        tgt_last = tgt  # Should be [1, B, D]
+        new_sa_kv_cache = []  # Always create KV list
         
-        else:
-            # Incremental path: last token only, with per-layer KV cache
-            # tgt must be [1, B, D] (single token with PE already added)
-            tgt_last = tgt  # Should be [1, B, D]
-            new_sa_kv_cache = []  # Always create KV list
+        for i, mod in enumerate(self.layers):
+            # Get KV cache for this layer
+            layer_self_kv = None
+            if sa_kv_cache is not None and i < len(sa_kv_cache):
+                layer_self_kv = sa_kv_cache[i]
             
-            for i, mod in enumerate(self.layers):
-                # Get KV cache for this layer
-                layer_self_kv = None
-                if sa_kv_cache is not None and i < len(sa_kv_cache):
-                    layer_self_kv = sa_kv_cache[i]
-                
-                # Call layer with single token
-                result = mod(
-                    tgt_last, memory,  # tgt_last is [1, B, D]
-                    memory_mask=memory_mask,
-                    tgt_key_padding_mask=tgt_key_padding_mask,
-                    memory_key_padding_mask=memory_key_padding_mask,
-                    memory_kv=None if memory_kv is None else memory_kv[i],
-                    self_kv=layer_self_kv,
-                )
-                
-                # Handle return format
-                if isinstance(result, tuple):
-                    tgt_last, layer_kv_new = result  # [1, B, D], (K, V)
-                else:
-                    tgt_last, layer_kv_new = result, None
-                
-                # Collect new KV cache
-                new_sa_kv_cache.append(layer_kv_new)
+            # Call layer with single token
+            result = mod(
+                tgt_last, memory,  # tgt_last is [1, B, D]
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                memory_kv=None if memory_kv is None else memory_kv[i],
+                self_kv=layer_self_kv,
+            )
             
-            # Return: no tag cache, just the final last token output
-            return tgt_last, new_sa_kv_cache  # [1, B, D], list of KV
+            # Handle return format
+            if isinstance(result, tuple):
+                tgt_last, layer_kv_new = result  # [1, B, D], (K, V)
+            else:
+                tgt_last, layer_kv_new = result, None
+            
+            # Collect new KV cache
+            new_sa_kv_cache.append(layer_kv_new)
+        
+        # Return: no tag cache, just the final last token output
+        return tgt_last, new_sa_kv_cache  # [1, B, D], list of KV
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
@@ -366,26 +314,17 @@ class Tag_Transformer(nn.Module):
         cache=None,
         memory_kv=None,
         sa_kv_cache=None,           # NEW: self-attention KV cache
-        incremental: bool = False,   # NEW: incremental mode flag
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List]]:
-        if not incremental:
-            # Current path: feed the full prefix up to t
-            tgt = tgt_emb_buf[: t + 1, :, :]             # [t+1, B, D]
-            decoded, cache_out, sa_kv_out = self._decoder(
-                tgt, memory=memory, cache=cache, memory_key_padding_mask=None,
-                memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, incremental=False
-            )
-            return decoded[-1, :, :], cache_out, sa_kv_out  # [B, D], cache, kv_cache
-        else:
-            # Incremental path: pass only the current token
-            tgt_current = tgt_emb_buf[t:t+1, :, :]  # [1, B, D] - current token with PE
-            last_h_1BD, sa_kv_out = self._decoder(
-                tgt_current, memory=memory, cache=None, memory_key_padding_mask=None,
-                memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, incremental=True
-            )
-            # Convert [1, B, D] -> [B, D] for compatibility
-            last_H = last_h_1BD.squeeze(0)  # [B, D]
-            return last_H, None, sa_kv_out  # [B, D], None (no tag cache), kv_cache
+        # Always use incremental path (Checkpoint C)
+        # Pass only the current token
+        tgt_current = tgt_emb_buf[t:t+1, :, :]  # [1, B, D] - current token with PE
+        last_h_1BD, sa_kv_out = self._decoder(
+            tgt_current, memory=memory, cache=None, memory_key_padding_mask=None,
+            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache
+        )
+        # Convert [1, B, D] -> [B, D] for compatibility
+        last_H = last_h_1BD.squeeze(0)  # [B, D]
+        return last_H, None, sa_kv_out  # [B, D], None (no tag cache), kv_cache
 
     def precompute_mem_kv(self, mem_enc: torch.Tensor):
         """
