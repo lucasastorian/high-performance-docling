@@ -200,6 +200,7 @@ class BatchedTableDecoderV3:
         # Track current step
         t = 0
         cache = None
+        early_break = False
 
         # SIMPLE TIMING
         if timer:
@@ -262,6 +263,7 @@ class BatchedTableDecoderV3:
                 if not (~finished).any().item():
                     if timer:
                         timer.end_section('ar_other')
+                    early_break = True
                     break
 
             # ---- BBox emission decisions (minimize syncs) ----
@@ -321,7 +323,7 @@ class BatchedTableDecoderV3:
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
-            if timer:
+            if timer and not early_break:
                 timer.end_section('ar_other')
 
         if timer:
