@@ -115,6 +115,9 @@ class BatchedTableDecoderV2:
         # Compute mem_kv in-place
         self._rebuild_mem_kv_inplace()
         
+        # Pre-build mem_kv list for cleaner capture (avoid Python object creation in loop)
+        st["mem_kv"] = list(zip(st["memK"], st["memV"]))
+        
         # Encode start row embedding once
         start_row = st["decoded_tags"][0]  # [B]
         pe0 = st["pe"][0] if st["pe"].dim() == 2 else st["pe"][0].squeeze(0)
@@ -401,6 +404,8 @@ class BatchedTableDecoderV2:
         # Copy memory to static buffers
         st["mem_enc_buf"].copy_(mem_enc)
         self._rebuild_mem_kv_inplace()
+        # Update the mem_kv list with new data
+        st["mem_kv"] = list(zip(st["memK"], st["memV"]))
         
         # Re-encode start embeddings
         start_row = st["decoded_tags"][0]
