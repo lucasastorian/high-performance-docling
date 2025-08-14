@@ -140,9 +140,14 @@ class BatchedTableDecoderV2:
         t = 0
         cache = None
 
+        # Step 4: Precompute cross-attention memory K/V once
+        mem_kv = tt.precompute_mem_kv(mem_enc)
+
         for step in range(Tmax):
-            # Use step_fullprefix wrapper (Step 3 - no behavior change)
-            last_H, cache = tt.step_fullprefix(t, tgt_emb_buf, memory=mem_enc, cache=cache)
+            # Use step_fullprefix wrapper with precomputed memory K/V
+            last_H, cache = tt.step_fullprefix(
+                t, tgt_emb_buf, memory=mem_enc, cache=cache, memory_kv=mem_kv
+            )
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long
 

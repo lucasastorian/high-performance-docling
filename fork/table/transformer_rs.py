@@ -9,6 +9,7 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 import docling_ibm_models.tableformer.utils.utils as u
@@ -46,6 +47,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        memory_kv=None,   # NEW
     ) -> Tensor:
         """
         Args:
@@ -61,7 +63,14 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         # cache
         tag_cache = []
         for i, mod in enumerate(self.layers):
-            output = mod(output, memory)
+            # pass per-layer memory_kv[i] down
+            output = mod(
+                output, memory,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                memory_kv=None if memory_kv is None else memory_kv[i],
+            )
             tag_cache.append(output)
             if cache is not None:
                 output = torch.cat([cache[i], output], dim=0)
@@ -82,6 +91,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
+        memory_kv=None,   # NEW: (K_mem, V_mem) or None
     ) -> Tensor:
         """
         Args:
@@ -106,15 +116,49 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_last_tok = tgt_last_tok + self.dropout1(tmp_tgt)
         tgt_last_tok = self.norm1(tgt_last_tok)
 
+        # cross-attn
         if memory is not None:
-            tmp_tgt = self.multihead_attn(
-                tgt_last_tok,
-                memory,
-                memory,
-                attn_mask=memory_mask,
-                key_padding_mask=memory_key_padding_mask,
-                need_weights=False,  # Optimization: Don't compute attention weights
-            )[0]
+            if memory_kv is not None:
+                # -- custom cross-attn using precomputed K_mem/V_mem --
+                mha = self.multihead_attn
+                E = mha.embed_dim
+                H = mha.num_heads
+                Dh = E // H
+
+                # Q projection (query comes from decoder side)
+                W_q = mha.in_proj_weight[:E, :]
+                b_q = mha.in_proj_bias[:E] if mha.in_proj_bias is not None else None
+                q = F.linear(tgt_last_tok, W_q, b_q)        # [1, B, E]
+                # split heads: -> [B, H, 1, Dh]
+                q = q.permute(1, 0, 2).contiguous().view(-1, 1, H, Dh).transpose(1, 2)
+
+                K_mem, V_mem = memory_kv                      # [B, H, S, Dh]
+
+                # scores: [B, H, 1, S]
+                scores = torch.matmul(q, K_mem.transpose(-2, -1)) / math.sqrt(Dh)
+
+                if memory_key_padding_mask is not None:       # [B, S] True=pad
+                    mask = memory_key_padding_mask.unsqueeze(1).unsqueeze(2)  # [B,1,1,S]
+                    scores = scores.masked_fill(mask, float('-inf'))
+                if memory_mask is not None:                    # [1, S] or [T,S]
+                    # broadcast to [B,H,1,S] if needed
+                    scores = scores + memory_mask  # assumes additive mask, adjust if boolean
+
+                attn = torch.softmax(scores, dim=-1)           # [B, H, 1, S]
+                ctx  = torch.matmul(attn, V_mem)               # [B, H, 1, Dh]
+                # merge heads -> [1, B, E]
+                ctx = ctx.transpose(1, 2).contiguous().view(-1, 1, E).transpose(0, 1)
+
+                tmp_tgt = ctx
+            else:
+                # fallback: regular MHA does its own projections
+                tmp_tgt = self.multihead_attn(
+                    tgt_last_tok, memory, memory,
+                    attn_mask=memory_mask,
+                    key_padding_mask=memory_key_padding_mask,
+                    need_weights=False,
+                )[0]
+
             tgt_last_tok = tgt_last_tok + self.dropout2(tmp_tgt)
             tgt_last_tok = self.norm2(tgt_last_tok)
 
@@ -185,9 +229,41 @@ class Tag_Transformer(nn.Module):
         # feed the full prefix up to t (exactly your current behavior)
         tgt = tgt_emb_buf[: t + 1, :, :]             # [t+1, B, D]
         decoded, cache = self._decoder(
-            tgt, memory=memory, cache=cache, memory_key_padding_mask=None
+            tgt, memory=memory, cache=cache, memory_key_padding_mask=None,
+            memory_kv=memory_kv  # <-- new optional arg
         )
         return decoded[-1, :, :], cache               # [B, D], cache
+
+    def precompute_mem_kv(self, mem_enc: torch.Tensor):
+        """
+        mem_enc: [S, B, D] encoder output (your current shape)
+        returns: List[(K_mem, V_mem)] per decoder layer; shapes [B, H, S, Dh]
+        """
+        mem = mem_enc.transpose(0, 1).contiguous()   # [B, S, D]
+        B, S, D = mem.shape
+
+        mem_kv = []
+        for layer in self._decoder.layers:  # TMTransformerDecoderLayer
+            mha = layer.multihead_attn
+            E = mha.embed_dim
+            H = mha.num_heads
+            Dh = E // H
+
+            W = mha.in_proj_weight    # [3E, E]
+            b = mha.in_proj_bias      # [3E] or None
+            # slice K and V projections
+            W_k = W[E:2*E, :]
+            W_v = W[2*E: , :]
+            b_k = b[E:2*E] if b is not None else None
+            b_v = b[2*E: ] if b is not None else None
+
+            K = F.linear(mem, W_k, b_k)  # [B, S, E]
+            V = F.linear(mem, W_v, b_v)  # [B, S, E]
+            # -> [B, H, S, Dh]
+            K = K.view(B, S, H, Dh).transpose(1, 2).contiguous()
+            V = V.view(B, S, H, Dh).transpose(1, 2).contiguous()
+            mem_kv.append((K, V))
+        return mem_kv
 
     def inference(self, enc_inputs, tags, tag_lens, num_cells):
         # CNN backbone image encoding
