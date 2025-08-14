@@ -147,7 +147,10 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 attn = torch.softmax(scores, dim=-1)           # [B, H, 1, S]
                 ctx  = torch.matmul(attn, V_mem)               # [B, H, 1, Dh]
                 # merge heads -> [1, B, E]
-                ctx = ctx.transpose(1, 2).contiguous().view(-1, 1, E).transpose(0, 1)
+                ctx = ctx.transpose(1, 2).contiguous().view(-1, 1, E).transpose(0, 1)  # [1,B,E]
+
+                # ✅ IMPORTANT: apply the MHA output projection, same as the stock module
+                ctx = mha.out_proj(ctx)  # preserves shape [1,B,E]
 
                 tmp_tgt = ctx
             else:
