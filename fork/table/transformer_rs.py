@@ -15,6 +15,8 @@ from torch import Tensor, nn
 import docling_ibm_models.tableformer.utils.utils as u
 
 LOG_LEVEL = logging.INFO
+
+
 # LOG_LEVEL = logging.DEBUG
 
 
@@ -40,16 +42,16 @@ class PositionalEncoding(nn.Module):
 
 class TMTransformerDecoder(nn.TransformerDecoder):
     def forward(  # type: ignore
-        self,
-        tgt: Tensor,
-        memory: Optional[Tensor] = None,
-        cache: Optional[Tensor] = None,  # Unused now, kept for compatibility
-        memory_mask: Optional[Tensor] = None,
-        tgt_key_padding_mask: Optional[Tensor] = None,
-        memory_key_padding_mask: Optional[Tensor] = None,
-        memory_kv=None,   # NEW
-        sa_kv_cache=None,  # NEW: self-attention KV cache list
-        max_pred_len: Optional[int] = None,  # For capacity hint
+            self,
+            tgt: Tensor,
+            memory: Optional[Tensor] = None,
+            cache: Optional[Tensor] = None,  # Unused now, kept for compatibility
+            memory_mask: Optional[Tensor] = None,
+            tgt_key_padding_mask: Optional[Tensor] = None,
+            memory_key_padding_mask: Optional[Tensor] = None,
+            memory_kv=None,  # NEW
+            sa_kv_cache=None,  # NEW: self-attention KV cache list
+            max_pred_len: Optional[int] = None,  # For capacity hint
     ):
         """
         Args:
@@ -64,13 +66,13 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         # tgt must be [1, B, D] (single token with PE already added)
         tgt_last = tgt  # Should be [1, B, D]
         new_sa_kv_cache = []  # Always create KV list
-        
+
         for i, mod in enumerate(self.layers):
             # Get KV cache for this layer
             layer_self_kv = None
             if sa_kv_cache is not None and i < len(sa_kv_cache):
                 layer_self_kv = sa_kv_cache[i]
-            
+
             # Call layer with single token (pass capacity hint for better initial allocation)
             result = mod(
                 tgt_last, memory,  # tgt_last is [1, B, D]
@@ -81,26 +83,26 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                 self_kv=layer_self_kv,
                 max_pred_len=max_pred_len,  # Pass through capacity hint
             )
-            
+
             # Handle return format
             if isinstance(result, tuple):
                 tgt_last, layer_kv_new = result  # [1, B, D], (K, V)
             else:
                 tgt_last, layer_kv_new = result, None
-            
+
             # Collect new KV cache
             new_sa_kv_cache.append(layer_kv_new)
-        
+
         # Return: no tag cache, just the final last token output
         return tgt_last, new_sa_kv_cache  # [1, B, D], list of KV
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
     def _sa_kv_step(
-        self,
-        last_in: torch.Tensor,                  # [1, B, D]  (layer input for the *last* token)
-        kv_prev,  # Either (K_prev, V_prev) or (K_buf, V_buf, t, cap) for O(1) growth
-        cap_hint: Optional[int] = None,         # Capacity hint for initial allocation
+            self,
+            last_in: torch.Tensor,  # [1, B, D]  (layer input for the *last* token)
+            kv_prev,  # Either (K_prev, V_prev) or (K_buf, V_buf, t, cap) for O(1) growth
+            cap_hint: Optional[int] = None,  # Capacity hint for initial allocation
     ):
         """
         Incremental self-attention with O(1) KV cache growth and SDPA.
@@ -109,23 +111,23 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
           kv_new: (K_buf, V_buf, t, cap) with O(1) growth buffer
         """
         mha = self.self_attn
-        E  = mha.embed_dim
-        H  = mha.num_heads
+        E = mha.embed_dim
+        H = mha.num_heads
         Dh = E // H
-        B  = last_in.size(1)
+        B = last_in.size(1)
 
         # Fused QKV projection: ONE matmul instead of three
         x = last_in.squeeze(0)  # [1,B,D] -> [B,D] to avoid permutes
         W = mha.in_proj_weight  # [3E, E]
-        b = mha.in_proj_bias    # [3E] or None
-        
+        b = mha.in_proj_bias  # [3E] or None
+
         qkv = F.linear(x, W, b)  # [B, 3E] - single GEMM!
         q, k, v = qkv.split(E, dim=-1)  # each [B, E]
-        
+
         # Reshape with views only (no permute, no contiguous!)
-        q = q.view(B, H, Dh).reshape(B*H, 1, Dh)  # [B*H,1,Dh]
-        k = k.view(B, H, Dh).unsqueeze(2)         # [B,H,1,Dh]
-        v = v.view(B, H, Dh).unsqueeze(2)         # [B,H,1,Dh]
+        q = q.view(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
+        k = k.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        v = v.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
 
         # Interpret/initialize cache (always 4-tuple now)
         if kv_prev is None:
@@ -142,20 +144,20 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Just assert for safety in debug mode
         assert t < cap, f"KV cache overflow: t={t}, cap={cap}"
 
-        # O(1) in-place append 
-        K_buf[..., t:t+1, :] = k
-        V_buf[..., t:t+1, :] = v
+        # O(1) in-place append
+        K_buf[..., t:t + 1, :] = k
+        V_buf[..., t:t + 1, :] = v
         t += 1
 
         # Always use SDPA (no branching, better kernel selection)
-        k_sdp = K_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
-        v_sdp = V_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
-        
+        k_sdp = K_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
+        v_sdp = V_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
+
         ctx = F.scaled_dot_product_attention(
-            q, k_sdp, v_sdp, 
-            attn_mask=None, 
-            dropout_p=0.0, 
-            is_causal=True  # Set to True for causal attention (CUDA Graphs optimization)
+            q, k_sdp, v_sdp,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False
         )  # [B*H,1,Dh]
 
         # Merge heads -> [1,B,E]
@@ -167,22 +169,22 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         return sa_out, (K_buf, V_buf, t, cap)
 
     def forward(  # type: ignore
-        self,
-        tgt: Tensor,
-        memory: Optional[Tensor] = None,
-        memory_mask: Optional[Tensor] = None,
-        tgt_key_padding_mask: Optional[Tensor] = None,
-        memory_key_padding_mask: Optional[Tensor] = None,
-        memory_kv=None,   # NEW: (K_mem, V_mem) or None
-        self_kv = None,  # NEW: self-attn KV cache (now flexible tuple)
-        max_pred_len: Optional[int] = None,  # For capacity hint
+            self,
+            tgt: Tensor,
+            memory: Optional[Tensor] = None,
+            memory_mask: Optional[Tensor] = None,
+            tgt_key_padding_mask: Optional[Tensor] = None,
+            memory_key_padding_mask: Optional[Tensor] = None,
+            memory_kv=None,  # NEW: (K_mem, V_mem) or None
+            self_kv=None,  # NEW: self-attn KV cache (now flexible tuple)
+            max_pred_len: Optional[int] = None,  # For capacity hint
     ) -> Tuple[Tensor, Optional[Tuple]]:
         """
         Args:
             same as TMTransformerDecoder
         Returns:
             Tuple[Tensor, Optional[Tuple[Tensor,Tensor]]]:
-                - embedding of last tag: (1,bsz,hidden_dim) 
+                - embedding of last tag: (1,bsz,hidden_dim)
                 - self-attention KV cache (always None for now in Step 3)
         """
 
@@ -218,18 +220,18 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 H = mha.num_heads
                 Dh = E // H
 
-                K_mem, V_mem = memory_kv                      # [B, H, S, Dh]
-                B, H, S, Dh = K_mem.shape                     # Extract dimensions
+                K_mem, V_mem = memory_kv  # [B, H, S, Dh]
+                B, H, S, Dh = K_mem.shape  # Extract dimensions
 
                 # Q projection (query comes from decoder side)
                 W_q = mha.in_proj_weight[:E, :]
                 b_q = mha.in_proj_bias[:E] if mha.in_proj_bias is not None else None
-                q = F.linear(tgt_last_tok, W_q, b_q)                  # [1,B,E]
-                q = q.permute(1,0,2).contiguous().view(B, 1, H, Dh).transpose(1,2).reshape(B*H, 1, Dh)
+                q = F.linear(tgt_last_tok, W_q, b_q)  # [1,B,E]
+                q = q.permute(1, 0, 2).contiguous().view(B, 1, H, Dh).transpose(1, 2).reshape(B * H, 1, Dh)
 
                 # K_mem,V_mem: [B,H,S,Dh] -> [B*H, S, Dh]
-                k = K_mem.reshape(B*H, S, Dh)
-                v = V_mem.reshape(B*H, S, Dh)
+                k = K_mem.reshape(B * H, S, Dh)
+                v = V_mem.reshape(B * H, S, Dh)
 
                 # Handle padding mask for SDPA
                 attn_mask = None
@@ -238,7 +240,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                     mask = memory_key_padding_mask.float().masked_fill(
                         memory_key_padding_mask, float('-inf')
                     ).masked_fill(~memory_key_padding_mask, 0.0)  # [B,S]
-                    attn_mask = mask.unsqueeze(1).expand(B, H, S).reshape(B*H, 1, S)
+                    attn_mask = mask.unsqueeze(1).expand(B, H, S).reshape(B * H, 1, S)
 
                 # SDPA (no dropout in eval)
                 ctx = F.scaled_dot_product_attention(
@@ -246,7 +248,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 )  # [B*H,1,Dh]
 
                 # back to [1,B,E]
-                ctx = ctx.reshape(B, H, 1, Dh).transpose(1,2).contiguous().view(1, B, E)
+                ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
 
                 # ✅ IMPORTANT: apply the MHA output projection, same as the stock module
                 ctx = mha.out_proj(ctx)  # preserves shape [1,B,E]
@@ -278,19 +280,18 @@ class Tag_Transformer(nn.Module):
     """
 
     def __init__(
-        self,
-        device,
-        vocab_size,
-        td_encode,
-        embed_dim,
-        encoder_layers,
-        decoder_layers,
-        enc_image_size,
-        dropout=0.1,
-        n_heads=4,
-        dim_ff=1024,
+            self,
+            device,
+            vocab_size,
+            td_encode,
+            embed_dim,
+            encoder_layers,
+            decoder_layers,
+            enc_image_size,
+            dropout=0.1,
+            n_heads=4,
+            dim_ff=1024,
     ):
-
         super(Tag_Transformer, self).__init__()
 
         self._device = device
@@ -321,18 +322,18 @@ class Tag_Transformer(nn.Module):
         self._fc = nn.Linear(embed_dim, vocab_size)
 
     def step_fullprefix(
-        self,
-        t: int,
-        tgt_emb_buf: torch.Tensor,   # [Tmax+1, B, D]
-        memory: torch.Tensor,        # [S, B, D]
-        cache=None,
-        memory_kv=None,
-        sa_kv_cache=None,           # NEW: self-attention KV cache
-        max_pred_len: Optional[int] = None,  # For capacity hint
+            self,
+            t: int,
+            tgt_emb_buf: torch.Tensor,  # [Tmax+1, B, D]
+            memory: torch.Tensor,  # [S, B, D]
+            cache=None,
+            memory_kv=None,
+            sa_kv_cache=None,  # NEW: self-attention KV cache
+            max_pred_len: Optional[int] = None,  # For capacity hint
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List]]:
         # Always use incremental path (Checkpoint C)
         # Pass only the current token
-        tgt_current = tgt_emb_buf[t:t+1, :, :]  # [1, B, D] - current token with PE
+        tgt_current = tgt_emb_buf[t:t + 1, :, :]  # [1, B, D] - current token with PE
         last_h_1BD, sa_kv_out = self._decoder(
             tgt_current, memory=memory, cache=None, memory_key_padding_mask=None,
             memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, max_pred_len=max_pred_len
@@ -346,7 +347,7 @@ class Tag_Transformer(nn.Module):
         mem_enc: [S, B, D] encoder output (your current shape)
         returns: List[(K_mem, V_mem)] per decoder layer; shapes [B, H, S, Dh]
         """
-        mem = mem_enc.transpose(0, 1).contiguous()   # [B, S, D]
+        mem = mem_enc.transpose(0, 1).contiguous()  # [B, S, D]
         B, S, D = mem.shape
 
         mem_kv = []
@@ -356,13 +357,13 @@ class Tag_Transformer(nn.Module):
             H = mha.num_heads
             Dh = E // H
 
-            W = mha.in_proj_weight    # [3E, E]
-            b = mha.in_proj_bias      # [3E] or None
+            W = mha.in_proj_weight  # [3E, E]
+            b = mha.in_proj_bias  # [3E] or None
             # slice K and V projections
-            W_k = W[E:2*E, :]
-            W_v = W[2*E: , :]
-            b_k = b[E:2*E] if b is not None else None
-            b_v = b[2*E: ] if b is not None else None
+            W_k = W[E:2 * E, :]
+            W_v = W[2 * E:, :]
+            b_k = b[E:2 * E] if b is not None else None
+            b_v = b[2 * E:] if b is not None else None
 
             K = F.linear(mem, W_k, b_k)  # [B, S, E]
             V = F.linear(mem, W_v, b_v)  # [B, S, E]
