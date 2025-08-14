@@ -111,9 +111,39 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             return output, out_cache, new_sa_kv_cache  # Return 3 items now
         
         else:
-            # TODO: Incremental path (Checkpoint B)
-            # For now, fall back to old behavior
-            raise NotImplementedError("Incremental path not implemented yet")
+            # Incremental path: last token only, with per-layer KV cache
+            # tgt must be [1, B, D] (single token with PE already added)
+            tgt_last = tgt  # Should be [1, B, D]
+            new_sa_kv_cache = [] if sa_kv_cache is not None else None
+            
+            for i, mod in enumerate(self.layers):
+                # Get KV cache for this layer
+                layer_self_kv = None
+                if sa_kv_cache is not None and i < len(sa_kv_cache):
+                    layer_self_kv = sa_kv_cache[i]
+                
+                # Call layer with single token
+                result = mod(
+                    tgt_last, memory,  # tgt_last is [1, B, D]
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    memory_kv=None if memory_kv is None else memory_kv[i],
+                    self_kv=layer_self_kv,
+                )
+                
+                # Handle return format
+                if isinstance(result, tuple):
+                    tgt_last, layer_kv_new = result  # [1, B, D], (K, V)
+                else:
+                    tgt_last, layer_kv_new = result, None
+                
+                # Collect new KV cache
+                if new_sa_kv_cache is not None:
+                    new_sa_kv_cache.append(layer_kv_new)
+            
+            # Return: no tag cache, just the final last token output
+            return tgt_last, new_sa_kv_cache  # [1, B, D], list of KV
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
@@ -348,9 +378,15 @@ class Tag_Transformer(nn.Module):
             )
             return decoded[-1, :, :], cache_out, sa_kv_out  # [B, D], cache, kv_cache
         else:
-            # TODO: Incremental path (Checkpoint B) 
-            # For now, fall back to old behavior
-            raise NotImplementedError("Incremental step_fullprefix not implemented yet")
+            # Incremental path: pass only the current token
+            tgt_current = tgt_emb_buf[t:t+1, :, :]  # [1, B, D] - current token with PE
+            last_h_1BD, sa_kv_out = self._decoder(
+                tgt_current, memory=memory, cache=None, memory_key_padding_mask=None,
+                memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, incremental=True
+            )
+            # Convert [1, B, D] -> [B, D] for compatibility
+            last_H = last_h_1BD.squeeze(0)  # [B, D]
+            return last_H, None, sa_kv_out  # [B, D], None (no tag cache), kv_cache
 
     def precompute_mem_kv(self, mem_enc: torch.Tensor):
         """

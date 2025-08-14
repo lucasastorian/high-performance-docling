@@ -138,19 +138,19 @@ class BatchedTableDecoderV2:
 
         # Track current step
         t = 0
-        cache_states = None    # existing per-layer output cache
-        kv_cache_l1 = None     # NEW: [(K,V), None, None, ...] or None
+        # Checkpoint B: Switch to incremental mode (no tag cache)
+        sa_kv_cache = None     # KV cache for all layers
 
         # Step 4: Precompute cross-attention memory K/V once
         USE_MEM_KV = True  # set False to disable the custom path
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
-            # Use step_fullprefix wrapper with precomputed memory K/V and KV cache
-            # Checkpoint A: incremental=False (no behavior change yet)
-            last_H, cache_states, kv_cache_l1 = tt.step_fullprefix(
-                t, tgt_emb_buf, memory=mem_enc, cache=cache_states, memory_kv=mem_kv, 
-                sa_kv_cache=kv_cache_l1, incremental=False
+            # Use step_fullprefix wrapper with incremental mode
+            # Checkpoint B: incremental=True (big speedup!)
+            last_H, _, sa_kv_cache = tt.step_fullprefix(
+                t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv, 
+                sa_kv_cache=sa_kv_cache, incremental=True
             )
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long
