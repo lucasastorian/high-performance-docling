@@ -313,6 +313,7 @@ class GPUPreprocessorV2(nn.Module):
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
         device: Union[str, torch.device] = "cuda",
         dtype: torch.dtype = torch.float32,
+        return_channels_last: bool = False,  # Set True if model uses channels_last
     ):
         super().__init__()
         self.size = size
@@ -323,6 +324,7 @@ class GPUPreprocessorV2(nn.Module):
         self.do_normalize = do_normalize
         self.device = torch.device(device)  # Ensure proper device object
         self.dtype = dtype
+        self.return_channels_last = return_channels_last
         
         # Enable compatibility mode if environment variable is set
         self._compat_mode = os.getenv("DOCLING_GPU_COMPAT_MODE", "").lower() in ("1", "true", "yes")
@@ -464,23 +466,13 @@ class GPUPreprocessorV2(nn.Module):
             else:
                 batch_normalized = batch_resized
             
-            # Convert to NCHW for model input - plain contiguous
-            batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
-        
-        # Handle CPU fallback path (when no streams available)
-        if stream_compute is None:
-            batch_float = batch_gpu.to(self.dtype)
-            if self.do_rescale:
-                batch_float.mul_(self.rescale_factor)
-            
-            batch_resized = self.resize_op(batch_float)
-            
-            if self.do_normalize:
-                batch_normalized = (batch_resized - self.mean) / self.std
+            # Convert to final format based on model preference
+            if self.return_channels_last:
+                # Keep NHWC format with channels_last memory layout for optimal model performance
+                batch_final = batch_normalized.contiguous(memory_format=torch.channels_last)
             else:
-                batch_normalized = batch_resized
-            
-            batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
+                # Convert to NCHW for standard model input
+                batch_final = batch_normalized.permute(0, 3, 1, 2).contiguous()
         
         # Handle padding
         if self.do_pad:
