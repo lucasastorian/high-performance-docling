@@ -189,6 +189,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         if tgt.size(0) == 1:
             # Incremental mode: always use preallocated KV cache (no allocation during capture)
             # self_kv should be (K_buf, V_buf, t_dev, cap, pos_cap) from preallocation
+            cap_hint = max_pred_len + 1 if max_pred_len is not None else 128
             sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv, cap_hint=cap_hint)
         else:
             # Full-sequence path (training / non-incremental)
