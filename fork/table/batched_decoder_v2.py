@@ -147,9 +147,10 @@ class BatchedTableDecoderV2:
 
         for step in range(Tmax):
             # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
+            # Pass max_pred_len for optimal KV cache sizing
             last_H, _, sa_kv_cache = tt.step_fullprefix(
                 t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv, 
-                sa_kv_cache=sa_kv_cache
+                sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
             )
             logits = tt._fc(last_H)  # [B,V]
             new_tags = logits.argmax(dim=1)  # [B] Long

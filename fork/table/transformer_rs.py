@@ -49,6 +49,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv=None,   # NEW
         sa_kv_cache=None,  # NEW: self-attention KV cache list
+        max_pred_len: Optional[int] = None,  # For capacity hint
     ):
         """
         Args:
@@ -70,7 +71,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             if sa_kv_cache is not None and i < len(sa_kv_cache):
                 layer_self_kv = sa_kv_cache[i]
             
-            # Call layer with single token
+            # Call layer with single token (pass capacity hint for better initial allocation)
             result = mod(
                 tgt_last, memory,  # tgt_last is [1, B, D]
                 memory_mask=memory_mask,
@@ -78,6 +79,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                 memory_key_padding_mask=memory_key_padding_mask,
                 memory_kv=None if memory_kv is None else memory_kv[i],
                 self_kv=layer_self_kv,
+                max_pred_len=max_pred_len,  # Pass through capacity hint
             )
             
             # Handle return format
@@ -97,63 +99,76 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
     def _sa_kv_step(
         self,
         last_in: torch.Tensor,                  # [1, B, D]  (layer input for the *last* token)
-        kv_prev: Optional[Tuple[torch.Tensor, torch.Tensor]],  # (K_prev, V_prev) each [B,H,Tprev,Dh]
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        kv_prev,  # Either (K_prev, V_prev) or (K_buf, V_buf, t, cap) for O(1) growth
+        cap_hint: Optional[int] = None,         # Capacity hint for initial allocation
+    ):
         """
-        Incremental self-attention with KV cache.
+        Incremental self-attention with O(1) KV cache growth and SDPA.
         Return:
           sa_out: [1, B, D]   (self-attention output, before residual)
-          kv_new: (K_cat, V_cat) with new step appended
+          kv_new: (K_buf, V_buf, t, cap) with O(1) growth buffer
         """
         mha = self.self_attn
         E  = mha.embed_dim
         H  = mha.num_heads
         Dh = E // H
+        B  = last_in.size(1)
 
-        # Slice projections (same math as nn.MultiheadAttention)
+        # Project q,k,v for current token
         W = mha.in_proj_weight    # [3E, E]
         b = mha.in_proj_bias      # [3E] or None
+        
+        q = F.linear(last_in, W[:E,     :], None if b is None else b[:E])       # [1,B,E]
+        k = F.linear(last_in, W[E:2*E,  :], None if b is None else b[E:2*E])    # [1,B,E]  
+        v = F.linear(last_in, W[2*E:,   :], None if b is None else b[2*E:])     # [1,B,E]
 
-        W_q = W[:E,     :]
-        W_k = W[E:2*E,  :]
-        W_v = W[2*E:,   :]
-        b_q = b[:E]     if b is not None else None
-        b_k = b[E:2*E]  if b is not None else None
-        b_v = b[2*E:]   if b is not None else None
+        # Reshape for SDPA: q -> [B*H,1,Dh], k,v -> [B,H,1,Dh]
+        q = q.view(1, B, H, Dh).permute(1, 0, 2, 3).reshape(B*H, 1, Dh)    # [B*H,1,Dh]
+        k = k.view(1, B, H, Dh).permute(1, 2, 0, 3)                        # [B,H,1,Dh]
+        v = v.view(1, B, H, Dh).permute(1, 2, 0, 3)                        # [B,H,1,Dh]
 
-        # Project only the last token
-        # last_in: [1,B,D] -> q,k,v: [1,B,E]
-        q = F.linear(last_in, W_q, b_q)
-        k = F.linear(last_in, W_k, b_k)
-        v = F.linear(last_in, W_v, b_v)
-
-        # Split heads
-        # -> [B,H,1,Dh]
-        B = q.size(1)
-        q = q.view(1, B, H, Dh).permute(1, 2, 0, 3)  # [B,H,1,Dh]
-        k = k.view(1, B, H, Dh).permute(1, 2, 0, 3)  # [B,H,1,Dh]
-        v = v.view(1, B, H, Dh).permute(1, 2, 0, 3)  # [B,H,1,Dh]
-
-        if kv_prev is not None:
-            K_prev, V_prev = kv_prev                      # [B,H,Tprev,Dh]
-            K_cat = torch.cat([K_prev, k], dim=2).contiguous()         # [B,H,Tprev+1,Dh]
-            V_cat = torch.cat([V_prev, v], dim=2).contiguous()
+        # Interpret/initialize cache: legacy 2-tuple or new 4-tuple
+        if kv_prev is None or len(kv_prev) == 2:
+            # New cache: create growable buffer
+            cap = 16 if cap_hint is None else max(1, cap_hint)
+            K_buf = k.new_empty((B, H, cap, Dh))
+            V_buf = v.new_empty((B, H, cap, Dh))
+            t = 0
         else:
-            K_cat, V_cat = k, v
+            K_buf, V_buf, t, cap = kv_prev
 
-        # Attention: single-step query over cached keys/values
-        # q: [B,H,1,Dh], K_cat: [B,H,T,Dh] -> scores: [B,H,1,T]
-        scores = torch.matmul(q, K_cat.transpose(-2, -1)) * (1.0 / (Dh ** 0.5))
-        attn   = torch.softmax(scores, dim=-1)            # [B,H,1,T]
-        ctx    = torch.matmul(attn, V_cat)                # [B,H,1,Dh]
+        # Grow buffer if needed (double capacity)
+        if t >= cap:
+            new_cap = cap * 2
+            K_new = K_buf.new_empty((B, H, new_cap, Dh))
+            K_new[..., :cap, :] = K_buf
+            V_new = V_buf.new_empty((B, H, new_cap, Dh))
+            V_new[..., :cap, :] = V_buf
+            K_buf, V_buf, cap = K_new, V_new, new_cap
+
+        # O(1) in-place append 
+        K_buf[..., t:t+1, :] = k
+        V_buf[..., t:t+1, :] = v
+        t += 1
+
+        # SDPA over active portion (no copies, just views)
+        k_sdp = K_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
+        v_sdp = V_buf[..., :t, :].reshape(B*H, t, Dh)  # [B*H, t, Dh]
+        
+        ctx = F.scaled_dot_product_attention(
+            q, k_sdp, v_sdp, 
+            attn_mask=None, 
+            dropout_p=0.0, 
+            is_causal=False
+        )  # [B*H,1,Dh]
 
         # Merge heads -> [1,B,E]
-        ctx = ctx.permute(2, 0, 1, 3).contiguous().view(1, B, E)
+        ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
 
-        # Out projection (must match stock MHA)
-        sa_out = mha.out_proj(ctx)                        # [1,B,E]
+        # Out projection
+        sa_out = mha.out_proj(ctx)  # [1,B,E]
 
-        return sa_out, (K_cat, V_cat)
+        return sa_out, (K_buf, V_buf, t, cap)
 
     def forward(  # type: ignore
         self,
@@ -163,8 +178,9 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         tgt_key_padding_mask: Optional[Tensor] = None,
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv=None,   # NEW: (K_mem, V_mem) or None
-        self_kv: Optional[Tuple[Tensor,Tensor]] = None,  # NEW: self-attn KV cache (UNUSED for now)
-    ) -> Tuple[Tensor, Optional[Tuple[Tensor,Tensor]]]:
+        self_kv = None,  # NEW: self-attn KV cache (now flexible tuple)
+        max_pred_len: Optional[int] = None,  # For capacity hint
+    ) -> Tuple[Tensor, Optional[Tuple]]:
         """
         Args:
             same as TMTransformerDecoder
@@ -180,7 +196,9 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Detect incremental mode vs full sequence mode
         if tgt.size(0) == 1:
             # Incremental mode: always use KV cache (seed if self_kv is None)
-            sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv)
+            # Use max_pred_len for optimal initial capacity, fallback to reasonable default
+            cap_hint = max_pred_len if max_pred_len is not None else 64
+            sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv, cap_hint=cap_hint)
         else:
             # Full-sequence path (training / non-incremental)
             sa_out = self.self_attn(
@@ -314,13 +332,14 @@ class Tag_Transformer(nn.Module):
         cache=None,
         memory_kv=None,
         sa_kv_cache=None,           # NEW: self-attention KV cache
+        max_pred_len: Optional[int] = None,  # For capacity hint
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List]]:
         # Always use incremental path (Checkpoint C)
         # Pass only the current token
         tgt_current = tgt_emb_buf[t:t+1, :, :]  # [1, B, D] - current token with PE
         last_h_1BD, sa_kv_out = self._decoder(
             tgt_current, memory=memory, cache=None, memory_key_padding_mask=None,
-            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache
+            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, max_pred_len=max_pred_len
         )
         # Convert [1, B, D] -> [B, D] for compatibility
         last_H = last_h_1BD.squeeze(0)  # [B, D]
