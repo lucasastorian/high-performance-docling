@@ -60,8 +60,9 @@ class TMTransformerDecoder(nn.TransformerDecoder):
 
         output = tgt
 
-        # cache
-        tag_cache = []
+        # Step 1: Return placeholder cache (no-op for now, proper KV cache in later steps)
+        out_cache = [None] * len(self.layers)  # Placeholder per-layer cache
+        
         for i, mod in enumerate(self.layers):
             # pass per-layer memory_kv[i] down
             output = mod(
@@ -71,14 +72,6 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                 memory_key_padding_mask=memory_key_padding_mask,
                 memory_kv=None if memory_kv is None else memory_kv[i],
             )
-            tag_cache.append(output)
-            if cache is not None:
-                output = torch.cat([cache[i], output], dim=0)
-
-        if cache is not None:
-            out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
-        else:
-            out_cache = torch.stack(tag_cache, dim=0)
 
         return output, out_cache  # type: ignore
 
