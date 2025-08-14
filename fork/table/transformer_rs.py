@@ -125,13 +125,15 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 H = mha.num_heads
                 Dh = E // H
 
+                K_mem, V_mem = memory_kv                      # [B, H, S, Dh]
+                B, H, S, Dh = K_mem.shape                     # Extract dimensions
+
                 # Q projection (query comes from decoder side)
                 W_q = mha.in_proj_weight[:E, :]
                 b_q = mha.in_proj_bias[:E] if mha.in_proj_bias is not None else None
                 q = F.linear(tgt_last_tok, W_q, b_q)                  # [1,B,E]
                 q = q.permute(1,0,2).contiguous().view(B, 1, H, Dh).transpose(1,2).reshape(B*H, 1, Dh)
 
-                K_mem, V_mem = memory_kv                      # [B, H, S, Dh]
                 # K_mem,V_mem: [B,H,S,Dh] -> [B*H, S, Dh]
                 k = K_mem.reshape(B*H, S, Dh)
                 v = V_mem.reshape(B*H, S, Dh)
