@@ -176,7 +176,7 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== BATCHED DECODER =====
         with timer.time_section('batched_ar_decoder'):
-            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps, timer)
+            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:
