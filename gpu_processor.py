@@ -13,10 +13,10 @@ from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
-from fork.layout.layout_model import LayoutModel
-from fork.table.table_structure_model import TableStructureModel
-# from standard.layout.layout_model import LayoutModel
-# from standard.table.table_structure_model import TableStructureModel
+# from fork.layout.layout_model import LayoutModel
+# from fork.table.table_structure_model import TableStructureModel
+from standard.layout.layout_model import LayoutModel
+from standard.table.table_structure_model import TableStructureModel
 
 from table_regression_runner import TableRegressionRunner, Tolerances
 from layout_regression_runner import LayoutRegressionRunner, LayoutTol
@@ -79,36 +79,38 @@ class GPUProcessor:
         print("  1️⃣ Running layout detection...")
         t_layout_start = time.perf_counter()
         pages_with_layout = list(self.layout_model(conv_res, pages))
-        
+
         # Synchronize GPU work before measuring total time
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         t_layout = time.perf_counter() - t_layout_start
-        
+
         # Collect detailed layout timings
         layout_timings = self._get_layout_timings()
         print(f"     ⏱ layout: {fmt_secs(t_layout)}")
         if layout_timings:
             print(f"       └─ preprocess: {layout_timings['preprocess']:.1f} ms")
-            print(f"       └─ predict: {layout_timings['predict']:.1f} ms") 
+            print(f"       └─ predict: {layout_timings['predict']:.1f} ms")
             print(f"       └─ postprocess: {layout_timings['postprocess']:.1f} ms")
             print(f"       └─ cluster-build: {layout_timings['cluster_build']:.1f} ms")
             print(f"       └─ layout-postprocess: {layout_timings['layout_postprocess']:.1f} ms")
-            
+
             # Show detailed postprocess breakdown if available
-            if any(layout_timings.get(k, 0) > 0 for k in ['postprocess_regular', 'postprocess_special', 'postprocess_filter', 'postprocess_sort_final', 'postprocess_finalize']):
+            if any(layout_timings.get(k, 0) > 0 for k in
+                   ['postprocess_regular', 'postprocess_special', 'postprocess_filter', 'postprocess_sort_final',
+                    'postprocess_finalize']):
                 print(f"           ├─ regular: {layout_timings['postprocess_regular']:.1f} ms")
                 print(f"           ├─ special: {layout_timings['postprocess_special']:.1f} ms")
                 print(f"           ├─ filter: {layout_timings['postprocess_filter']:.1f} ms")
                 print(f"           ├─ sort_final: {layout_timings['postprocess_sort_final']:.1f} ms")
                 print(f"           └─ finalize: {layout_timings['postprocess_finalize']:.1f} ms")
-            
+
             # Calculate any remaining unaccounted time
-            timed_components = (layout_timings['preprocess'] + 
-                             layout_timings['predict'] + 
-                             layout_timings['postprocess'] + 
-                             layout_timings['cluster_build'] + 
-                             layout_timings['layout_postprocess'])
+            timed_components = (layout_timings['preprocess'] +
+                                layout_timings['predict'] +
+                                layout_timings['postprocess'] +
+                                layout_timings['cluster_build'] +
+                                layout_timings['layout_postprocess'])
             remaining_time = max(0.0, t_layout * 1000 - timed_components)
             if remaining_time > 10.0:  # Only show if significant
                 print(f"       └─ other: {remaining_time:.1f} ms")
@@ -158,8 +160,8 @@ class GPUProcessor:
             f"total: {fmt_secs(t_all)}"
         )
 
-        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="compare")
-        self.end_of_run_layout_regression(url=url, pages=pages_with_tables, mode="compare")
+        self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="baseline")
+        self.end_of_run_layout_regression(url=url, pages=pages_with_tables, mode="baseline")
 
         return pages_with_tables
 
@@ -295,18 +297,18 @@ class GPUProcessor:
     def _get_layout_timings(self) -> dict:
         """Collect detailed layout timings from predictor and model."""
         timings = {}
-        
+
         # Get timings from layout predictor (RTDetr preprocessing, predict, postprocessing)
         if hasattr(self.layout_model, 'layout_predictor'):
             predictor = self.layout_model.layout_predictor
             timings['preprocess'] = getattr(predictor, '_t_preprocess_ms', 0.0)
             timings['predict'] = getattr(predictor, '_t_predict_ms', 0.0)
             timings['postprocess'] = getattr(predictor, '_t_postprocess_ms', 0.0)
-        
+
         # Get timings from layout model (totals across all pages)
         timings['layout_postprocess'] = getattr(self.layout_model, '_t_layout_postprocess_total_ms', 0.0)
         timings['cluster_build'] = getattr(self.layout_model, '_t_cluster_build_total_ms', 0.0)
-        
+
         # Get detailed postprocess breakdown timings (auto-aggregated across all pages)
         if hasattr(self.layout_model, '_postprocess_timer'):
             timer = self.layout_model._postprocess_timer
@@ -321,7 +323,7 @@ class GPUProcessor:
             timings['postprocess_filter'] = 0.0
             timings['postprocess_sort_final'] = 0.0
             timings['postprocess_finalize'] = 0.0
-        
+
         return timings
 
     @staticmethod
