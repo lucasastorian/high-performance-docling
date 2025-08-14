@@ -119,10 +119,11 @@ class BatchedTableDecoderV2:
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
         pe = tt._positional_encoding.pe  # [max_len, D] positional encoding buffer
 
-        # Initialize first step with start tokens
+        # Initialize first step with start tokens (per-sample position indexing)
         start_row = decoded_tags[0, :]  # [B] start tokens
-        pos0 = pe[0].unsqueeze(0)  # [1, D] - extract position 0
-        tgt_emb_buf[0] = tt._embedding(start_row) + pos0  # [B,D]
+        pos_idx = torch.zeros(B, dtype=torch.long, device=device)  # [B] all zeros
+        pos_vec = pe.index_select(0, pos_idx)  # [B, D]
+        tgt_emb_buf[0] = tt._embedding(start_row) + pos_vec  # [B, D]
 
         # Track current step
         t = 0
@@ -158,10 +159,12 @@ class BatchedTableDecoderV2:
             t += 1
             decoded_tags[t, :] = new_tags
 
-            # Update incremental embedding buffer for next step
+            # Update incremental embedding buffer for next step (per-sample position indexing)
             if t < Tmax:  # Only if we'll do another step
-                pos_t = pe[t].unsqueeze(0)  # [1, D] - extract position t
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_t  # [B,D]
+                # pos for *next* token = current lengths (how many tokens each sample has emitted so far)
+                pos_idx = lengths.clamp_max(pe.size(0) - 1)  # [B]
+                pos_vec = pe.index_select(0, pos_idx)  # [B, D]
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
 
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
