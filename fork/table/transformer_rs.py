@@ -114,18 +114,18 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         Dh = E // H
         B  = last_in.size(1)
 
-        # Project q,k,v for current token
-        W = mha.in_proj_weight    # [3E, E]
-        b = mha.in_proj_bias      # [3E] or None
+        # Fused QKV projection: ONE matmul instead of three
+        x = last_in.squeeze(0)  # [1,B,D] -> [B,D] to avoid permutes
+        W = mha.in_proj_weight  # [3E, E]
+        b = mha.in_proj_bias    # [3E] or None
         
-        q = F.linear(last_in, W[:E,     :], None if b is None else b[:E])       # [1,B,E]
-        k = F.linear(last_in, W[E:2*E,  :], None if b is None else b[E:2*E])    # [1,B,E]  
-        v = F.linear(last_in, W[2*E:,   :], None if b is None else b[2*E:])     # [1,B,E]
-
-        # Reshape for SDPA: q -> [B*H,1,Dh], k,v -> [B,H,1,Dh]
-        q = q.view(1, B, H, Dh).permute(1, 0, 2, 3).reshape(B*H, 1, Dh)    # [B*H,1,Dh]
-        k = k.view(1, B, H, Dh).permute(1, 2, 0, 3)                        # [B,H,1,Dh]
-        v = v.view(1, B, H, Dh).permute(1, 2, 0, 3)                        # [B,H,1,Dh]
+        qkv = F.linear(x, W, b)  # [B, 3E] - single GEMM!
+        q, k, v = qkv.split(E, dim=-1)  # each [B, E]
+        
+        # Reshape with views only (no permute, no contiguous!)
+        q = q.view(B, H, Dh).reshape(B*H, 1, Dh)  # [B*H,1,Dh]
+        k = k.view(B, H, Dh).unsqueeze(2)         # [B,H,1,Dh]
+        v = v.view(B, H, Dh).unsqueeze(2)         # [B,H,1,Dh]
 
         # Interpret/initialize cache (always 4-tuple now)
         if kv_prev is None:
