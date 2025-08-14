@@ -7,10 +7,10 @@ import os
 
 import torch
 import torch.nn as nn
+from torch.backends.cuda import sdp_kernel
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
-from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04
@@ -176,7 +176,8 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== BATCHED DECODER =====
         with timer.time_section('batched_ar_decoder'):
-            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+            with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+                results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:
