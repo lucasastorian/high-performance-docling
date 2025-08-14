@@ -137,95 +137,97 @@ class BatchedTableDecoderV2:
         USE_MEM_KV = True  # set False to disable the custom path
         mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
-        with torch.autocast('cuda', dtype=torch.bfloat16):
-            for step in range(Tmax):
-                # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
-                # Pass max_pred_len for optimal KV cache sizing
-                last_H, _, sa_kv_cache = tt.step_fullprefix(
-                    t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv,
-                    sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
-                )
+        for step in range(Tmax):
+            # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
+            # Pass max_pred_len for optimal KV cache sizing
+            last_H, _, sa_kv_cache = tt.step_fullprefix(
+                t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv,
+                sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
+            )
 
-                # Create tag_H_buffer with correct dtype on first iteration
-                if tag_H_buffer is None:
-                    tag_H_buffer = torch.empty(B, Tmax, hidden_dim, device=device, dtype=last_H.dtype)
-                    tag_H_flat = tag_H_buffer.view(B * Tmax, hidden_dim)
+            # Create tag_H_buffer with correct dtype on first iteration
+            if tag_H_buffer is None:
+                tag_H_buffer = torch.empty(B, Tmax, hidden_dim, device=device, dtype=last_H.dtype)
+                tag_H_flat = tag_H_buffer.view(B * Tmax, hidden_dim)
 
-                logits = tt._fc(last_H)  # [B,V]
-                new_tags = logits.argmax(dim=1)  # [B] Long
+            logits = tt._fc(last_H)  # [B,V]
+            new_tags = logits.argmax(dim=1)  # [B] Long
 
-                # ---- Structure corrections (all on GPU) ----
-                if self.xcel_id is not None and self.lcel_id is not None:
-                    mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
-                    new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
+            # ---- Structure corrections (all on GPU) ----
+            if self.xcel_id is not None and self.lcel_id is not None:
+                mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
+                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
 
-                # For ucel->lcel correction, check prev_ucel from PREVIOUS step
-                if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                    mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
-                    new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
+            # For ucel->lcel correction, check prev_ucel from PREVIOUS step
+            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
+                mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
+                new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
 
-                # Force <end> for already finished sequences
-                new_tags = torch.where(finished, self.end_id.expand(B), new_tags)
+            # Force <end> for already finished sequences
+            new_tags = torch.where(finished, self.end_id.expand(B), new_tags)
 
-                # Write to preallocated buffer
-                t += 1
-                decoded_tags[t, :] = new_tags
+            # Write to preallocated buffer
+            t += 1
+            decoded_tags[t, :] = new_tags
 
-                # 1) Decide which samples were active BEFORE this step's token
-                #    (i.e., they were not already finished)
-                active_prev = ~finished  # [B]  -- use the old 'finished' from BEFORE this step
+            # 1) Decide which samples were active BEFORE this step's token
+            #    (i.e., they were not already finished)
+            active_prev = ~finished  # [B]  -- use the old 'finished' from BEFORE this step
 
-                # 2) Assign the position for the token we just emitted:
-                #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
-                #    - Previously-finished sequences DO NOT advance (they keep their last pos)
-                pos_idx = torch.where(active_prev, lengths + 1, lengths)  # int32
-                pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)  # bounds + dtype
-                pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
+            # 2) Assign the position for the token we just emitted:
+            #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
+            #    - Previously-finished sequences DO NOT advance (they keep their last pos)
+            pos_idx = torch.where(active_prev, lengths + 1, lengths)  # int32
+            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)  # bounds + dtype
+            pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
 
-                # Update incremental embedding buffer for next step
-                if t < Tmax:  # Only if we'll do another step
-                    tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
+            # Update incremental embedding buffer for next step
+            if t < Tmax:  # Only if we'll do another step
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
 
-                # 3) Now actually advance lengths for sequences that were active
-                lengths = torch.where(active_prev, lengths + 1, lengths)
+            # 3) Now actually advance lengths for sequences that were active
+            lengths = torch.where(active_prev, lengths + 1, lengths)
 
-                # 4) Only AFTER embedding & length update, mark newly-finished for next step
-                newly_finished = (new_tags == self.end_id)
-                finished = finished | newly_finished
+            # 4) Only AFTER embedding & length update, mark newly-finished for next step
+            newly_finished = (new_tags == self.end_id)
+            finished = finished | newly_finished
 
-                # Early exit if all finished
-                if finished.all():
-                    break
+            # Early exit if all finished
+            if finished.all():
+                break
 
-                # ---- BBox emission decisions (TRULY NO SYNCS!) ----
-                # Use LUT for fast membership (no isin!)
-                m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
+            # ---- BBox emission decisions (TRULY NO SYNCS!) ----
+            # Use LUT for fast membership (no isin!)
+            m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
 
-                # Fix: Proper boolean handling for m_is_lcel
-                if self.lcel_id is not None:
-                    m_is_lcel = (new_tags == self.lcel_id)
-                else:
-                    m_is_lcel = torch.zeros(B, dtype=torch.bool, device=device)
+            # Fix: Proper boolean handling for m_is_lcel
+            if self.lcel_id is not None:
+                m_is_lcel = (new_tags == self.lcel_id)
+            else:
+                m_is_lcel = torch.zeros(B, dtype=torch.bool, device=device)
 
-                m_first_lcel = first_lcel & m_is_lcel & (~finished)
+            m_first_lcel = first_lcel & m_is_lcel & (~finished)
 
-                # Collect bbox features - NO PYTHON IFS AT ALL!
-                append_mask = m_emit_bbox | m_first_lcel
+            # Collect bbox features - guard with single check to save kernels
+            append_mask = m_emit_bbox | m_first_lcel
+            
+            # GPT-5 suggestion: Guard the heavy block when nothing happens
+            if append_mask.any():  # Single cheap sync that saves many kernels
                 positions = tag_H_counts  # [B]
                 valid_store = append_mask & (positions < Tmax)  # Bounds check
 
-                # Get samples that need emission (works even if empty!)
+                # Get samples that need emission
                 emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
                 store_pos = positions.index_select(0, emit_samples)  # [K]
                 flat_idx = emit_samples * Tmax + store_pos  # [K]
                 src = last_H.index_select(0, emit_samples)  # [K,D]
-                tag_H_flat.index_copy_(0, flat_idx, src)  # No-op if K=0
+                tag_H_flat.index_copy_(0, flat_idx, src)
 
-                # Span starts: NO IF STATEMENTS!
+                # Span starts
                 start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
                 open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
 
-                # Span ends: NO IF STATEMENTS!
+                # Span ends
                 end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)).nonzero(as_tuple=False).squeeze(-1)
 
                 # Filter for capacity and store
@@ -246,20 +248,20 @@ class BatchedTableDecoderV2:
                 ones = torch.ones(emit_samples.size(0), dtype=torch.long, device=device)
                 tag_H_counts.index_add_(0, emit_samples, ones)
 
-                # ---- Update flags (all on GPU) ----
-                # Reset first_lcel=True on every non-lcel step (matches serial semantics)
-                first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
+            # ---- Update flags (all on GPU) ----
+            # Reset first_lcel=True on every non-lcel step (matches serial semantics)
+            first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
 
-                # Update skip_next using LUT (no isin!)
-                skip_next = skip_lut[new_tags]
+            # Update skip_next using LUT (no isin!)
+            skip_next = skip_lut[new_tags]
 
-                # Update prev_ucel for NEXT iteration
-                prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags,
-                                                                                                         dtype=torch.bool)
+            # Update prev_ucel for NEXT iteration
+            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags,
+                                                                                                     dtype=torch.bool)
 
-                # Update line number
-                if self.nl_id is not None:
-                    line_num += (new_tags == self.nl_id).to(line_num.dtype)
+            # Update line number
+            if self.nl_id is not None:
+                line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
         # ---- Check for overflow AFTER loop (single sync, not per-token!) ----
         if __debug__:
