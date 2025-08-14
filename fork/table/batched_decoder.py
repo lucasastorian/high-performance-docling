@@ -103,6 +103,14 @@ class BatchedTableDecoder:
         emit_lut = self.emit_lut
         skip_lut = self.skip_lut
 
+        # Preallocate fixed-shape tensors for graph capture
+        B_idx = torch.arange(B, device=device)  # [B] for indexing
+        ones_B = torch.ones(B, dtype=torch.long, device=device)  # [B] reusable ones
+        zeros_B = torch.zeros(B, dtype=torch.bool, device=device)  # [B] reusable zeros
+        ones_B_bool = torch.ones(B, dtype=torch.bool, device=device)  # [B] reusable bool ones
+        neg_ones_B = torch.full((B,), -1, dtype=torch.long, device=device)  # [B] reusable -1s
+        col_mask = torch.zeros(B, Tmax, dtype=torch.bool, device=device)  # [B, Tmax] reusable mask
+
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
@@ -189,9 +197,7 @@ class BatchedTableDecoder:
             newly_finished = (new_tags == self.end_id)
             finished = finished | newly_finished
 
-            # Early exit if all finished
-            if finished.all():
-                break
+            # No early exit - keep computing for graph capture compatibility
 
             # ---- BBox emission decisions (TRULY NO SYNCS!) ----
             # Use LUT for fast membership (no isin!)
@@ -201,58 +207,57 @@ class BatchedTableDecoder:
             if self.lcel_id is not None:
                 m_is_lcel = (new_tags == self.lcel_id)
             else:
-                m_is_lcel = torch.zeros(B, dtype=torch.bool, device=device)
+                m_is_lcel = zeros_B
 
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
 
-            # Collect bbox features - NO PYTHON IFS AT ALL!
+            # Collect bbox features with fixed-shape masked writes
             append_mask = m_emit_bbox | m_first_lcel
             positions = tag_H_counts  # [B]
-            valid_store = append_mask & (positions < Tmax)  # Bounds check
+            valid_store = append_mask & (positions < Tmax) & (~finished)  # Bounds check
 
-            # Get samples that need emission (works even if empty!)
-            emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
-            store_pos = positions.index_select(0, emit_samples)  # [K]
-            flat_idx = emit_samples * Tmax + store_pos  # [K]
-            src = last_H.index_select(0, emit_samples)  # [K,D]
-            tag_H_flat.index_copy_(0, flat_idx, src)  # No-op if K=0
+            # Fixed-shape masked write - no variable K tensors
+            row_pos = tag_H_counts.clamp_max(Tmax - 1)  # [B], current per-row cursor
+            col_mask.zero_()  # Reset reusable mask
+            col_mask[B_idx, row_pos] = valid_store  # Mark positions to update
 
-            # Span starts: NO IF STATEMENTS!
-            start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
-            open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
+            # Masked scatter into tag_H_buffer using broadcasting
+            expanded_H = last_H.unsqueeze(1)  # [B, 1, D]
+            tag_H_buffer = torch.where(col_mask.unsqueeze(-1), expanded_H, tag_H_buffer)
 
-            # Span ends: NO IF STATEMENTS!
-            end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)).nonzero(
-                as_tuple=False).squeeze(-1)
+            # Span starts with fixed-shape masked operations
+            start_mask = m_first_lcel & valid_store  # [B]
+            open_span_start = torch.where(start_mask, tag_H_counts, open_span_start)
 
-            # Filter for capacity and store
-            span_idx = span_counts.index_select(0, end_samples)
-            valid = span_idx < span_starts.size(1)
-            valid_end_samples = end_samples[valid]
-            valid_span_idx = span_idx[valid]
+            # Span ends with fixed-shape masked operations
+            end_mask = m_emit_bbox & (~m_first_lcel) & valid_store & (open_span_start >= 0)  # [B]
+            span_capacity_mask = span_counts < Tmax  # [B]
+            valid_end_mask = end_mask & span_capacity_mask  # [B]
 
-            # Store valid spans (read values BEFORE closing!)
-            span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
-            span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
-            span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
+            # Store spans using masked scatter - write at current span_counts position
+            span_positions = span_counts.clamp_max(Tmax - 1)  # [B]
+            # Only update where valid_end_mask is True
+            span_starts[B_idx, span_positions] = torch.where(valid_end_mask, open_span_start, span_starts[B_idx, span_positions])
+            span_ends[B_idx, span_positions] = torch.where(valid_end_mask, tag_H_counts, span_ends[B_idx, span_positions])
+            
+            # Increment span counts with masked addition
+            span_counts = span_counts + valid_end_mask.to(span_counts.dtype)
 
-            # ALWAYS close spans (even if capacity exceeded) to prevent stuck open spans
-            open_span_start.index_fill_(0, end_samples, -1)
+            # Close spans (reset to -1) using masked assignment
+            open_span_start = torch.where(end_mask, neg_ones_B, open_span_start)
 
-            # Counters: increment ONLY rows that actually stored
-            ones = torch.ones(emit_samples.size(0), dtype=torch.long, device=device)
-            tag_H_counts.index_add_(0, emit_samples, ones)
+            # Counters: increment with masked addition (fixed-shape)
+            tag_H_counts = tag_H_counts + valid_store.to(tag_H_counts.dtype)
 
             # ---- Update flags (all on GPU) ----
             # Reset first_lcel=True on every non-lcel step (matches serial semantics)
-            first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
+            first_lcel = torch.where(m_is_lcel, zeros_B, ones_B_bool)
 
             # Update skip_next using LUT (no isin!)
             skip_next = skip_lut[new_tags]
 
             # Update prev_ucel for NEXT iteration
-            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags,
-                                                                                                     dtype=torch.bool)
+            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else zeros_B
 
             # Update line number
             if self.nl_id is not None:
