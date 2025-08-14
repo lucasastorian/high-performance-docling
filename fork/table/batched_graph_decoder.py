@@ -1,4 +1,5 @@
 import torch
+import torch.backends.cudnn as cudnn
 import os
 from typing import List, Dict, Tuple
 
@@ -16,6 +17,9 @@ class BatchedTableDecoder:
         self.model = model
         self.device = device
         self._prof = model._prof
+        
+        # Disable cuDNN benchmark for stable kernel selection during graph capture
+        cudnn.benchmark = False
 
         # Prebind references
         self.tt = model._tag_transformer
@@ -119,11 +123,30 @@ class BatchedTableDecoder:
         S['finished_all_d'] = torch.zeros(1, dtype=torch.uint8, device=device)
         S['t0'] = 0  # Host-side time base for blocks (no device syncs)
         
+        # Per-block buffers for t-agnostic capture (will be sized with U during capture)
+        S['block_tags'] = None  # [U, B_bucket] - tokens from current block
+        S['cur_tok'] = torch.empty(1, B_bucket, D, device=device)  # [1, B_bucket, D] current token
+        
         # Memory placeholders (will be filled during input loading)
         S['mem_enc'] = None  # Will be allocated based on actual input size
         S['mem_kv'] = None   # Precomputed memory K/V
         S['enc_out_batch'] = None  # Will be allocated based on actual input
-        S['sa_kv'] = None    # Self-attention KV cache
+        
+        # Preallocate KV cache with fixed capacity for all layers
+        S['sa_kv'] = []
+        if hasattr(tt, '_decoder') and hasattr(tt._decoder, 'layers'):
+            # Get layer specs from the first layer
+            first_layer = tt._decoder.layers[0]
+            H = first_layer.self_attn.num_heads
+            E = first_layer.self_attn.embed_dim
+            Dh = E // H
+            cap = Tmax + 1  # Fixed capacity
+            
+            for _ in tt._decoder.layers:
+                K_buf = torch.empty(B_bucket, H, cap, Dh, device=device)
+                V_buf = torch.empty(B_bucket, H, cap, Dh, device=device)
+                t = torch.zeros(1, dtype=torch.int32, device=device)  # Device tensor time pointer
+                S['sa_kv'].append((K_buf, V_buf, t, cap))
         
         self._static = S
 
@@ -173,6 +196,14 @@ class BatchedTableDecoder:
         pos_vec = self._pe_gather_bD(pe, pos_idx)
         S['tgt_emb_buf'][0] = tt._embedding(start_tokens) + pos_vec
         
+        # Initialize current token for t-agnostic decoder
+        S['cur_tok'][0] = tt._embedding(start_tokens) + pos_vec
+        
+        # Reset KV cache time pointers for all layers (prevent warmup state corruption)
+        for kv_tuple in S['sa_kv']:
+            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t, cap)
+                kv_tuple[2].zero_()  # Reset time pointer to 0
+        
         # Precompute dummy memory K/V
         S['mem_kv'] = tt.precompute_mem_kv(S['mem_enc']) if hasattr(tt, 'precompute_mem_kv') else None
 
@@ -219,9 +250,14 @@ class BatchedTableDecoder:
         S['t0'] = 0  # Reset host time base
         S['B_active'] = B_actual
         
-        # Rebuild indexing for actual batch size
-        S['B_idx'] = torch.arange(B_actual, device=device)
+        # Rebuild indexing for full bucket (padded rows are finished)
+        S['B_idx'] = torch.arange(S['B_bucket'], device=device)
         S['row_base'] = S['B_idx'] * S['Tmax']
+        
+        # Reset KV cache time pointers for all layers (prevent state corruption between runs)
+        for kv_tuple in S['sa_kv']:
+            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t, cap)
+                kv_tuple[2].zero_()  # Reset time pointer to 0
         
         # Precompute memory K/V outside graph
         S['mem_kv'] = tt.precompute_mem_kv(S['mem_enc']) if hasattr(tt, 'precompute_mem_kv') else None
@@ -232,6 +268,10 @@ class BatchedTableDecoder:
         pos_idx = torch.zeros(B_actual, dtype=torch.long, device=device)
         pos_vec = self._pe_gather_bD(pe, pos_idx)
         S['tgt_emb_buf'][0, :B_actual] = tt._embedding(start_row) + pos_vec
+        
+        # Initialize current token for t-agnostic decoder
+        S['cur_tok'].zero_()  # Clear all positions
+        S['cur_tok'][0, :B_actual] = tt._embedding(start_row) + pos_vec
         
         # Preset padded rows to finished state for graph capture
         if B_actual < S['B_bucket']:
@@ -249,32 +289,28 @@ class BatchedTableDecoder:
         return out.contiguous()
 
     def _ar_block_advance_U(self, U: int):
-        """Advance AR state by exactly U steps with no host syncs or allocations"""
+        """T-agnostic AR block advance - no time indexing, uses current token embedding"""
         S = self._static
         tt = self.tt
-        device = self.device
         
         # Alias for readability
-        B_bucket = S['B_bucket']  # Use full bucket, not B_active
+        B_bucket = S['B_bucket']
         Tmax = S['Tmax']
         emit_lut = self.emit_lut
         skip_lut = self.skip_lut
-        t0 = S['t0']  # Host time base - no device syncs
         
         for i in range(U):
-            t = t0 + i  # Host arithmetic only
-            
-            # Forward pass
-            last_H, _, S['sa_kv'] = tt.step_fullprefix(
-                t, S['tgt_emb_buf'], memory=S['mem_enc'], cache=None, 
-                memory_kv=S['mem_kv'], sa_kv_cache=S['sa_kv'], max_pred_len=Tmax
+            # 1) T-agnostic forward pass using current token embedding
+            last_H, S['sa_kv'] = tt.step_incremental(
+                S['cur_tok'], memory=S['mem_enc'], memory_kv=S['mem_kv'],
+                sa_kv_cache=S['sa_kv'], max_pred_len=Tmax
             )
             
-            # Get token logits and predictions
-            logits = tt._fc(last_H)  # [B_bucket, V] - full bucket
+            # 2) Get token predictions
+            logits = tt._fc(last_H)  # [B_bucket, V]
             new_tags = logits.argmax(dim=1)  # [B_bucket]
             
-            # Structure corrections - use full bucket
+            # 3) Structure corrections - full bucket
             if self.xcel_id is not None and self.lcel_id is not None:
                 mask_first_line = (S['line_num'] == 0) & (new_tags == self.xcel_id)
                 new_tags = torch.where(mask_first_line, self.lcel_id.expand(B_bucket), new_tags)
@@ -286,25 +322,13 @@ class BatchedTableDecoder:
             # Force <end> for finished sequences (includes padded rows)
             new_tags = torch.where(S['finished'], self.end_id.expand(B_bucket), new_tags)
             
-            # Write token to buffer
-            S['t'].add_(1)  # Increment step counter on device
-            t_next = t + 1
-            S['decoded_tags'][t_next] = new_tags  # Full bucket write
+            # 4) Store token in per-block buffer at fixed row i (constant during capture)
+            S['block_tags'][i] = new_tags
             
-            # Position and length tracking - full bucket
+            # 5) Update lengths/finished/flags & collect tag_H/spans
             active_prev = ~S['finished']  # [B_bucket]
-            pos_idx = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
-            pos_idx = pos_idx.clamp_max(tt._positional_encoding.pe.size(0) - 1).to(torch.long)
-            
-            # Update embedding for next step (if not last step in block)
-            if t_next < Tmax:
-                pos_vec = self._pe_gather_bD(tt._positional_encoding.pe, pos_idx)
-                S['tgt_emb_buf'][t_next] = tt._embedding(new_tags) + pos_vec  # Full bucket
-            
-            # Update lengths - full bucket
             S['lengths'] = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
             
-            # Update finished status - full bucket
             newly_finished = (new_tags == self.end_id)
             S['finished'] = S['finished'] | newly_finished
             
@@ -363,8 +387,17 @@ class BatchedTableDecoder:
             
             if self.nl_id is not None:
                 S['line_num'] += (new_tags == self.nl_id).to(S['line_num'].dtype)
+            
+            # 6) Build next current token embedding in-place (no t needed)
+            pos_idx = torch.where(~S['finished'], S['lengths'] + 1, S['lengths'])
+            pos_idx = pos_idx.clamp_max(tt._positional_encoding.pe.size(0) - 1).to(torch.long)
+            pos_vec = self._pe_gather_bD(tt._positional_encoding.pe, pos_idx)  # [B_bucket, D]
+            S['cur_tok'][0] = tt._embedding(new_tags) + pos_vec
+            
+            # 7) Bump device-side t for trimming purposes
+            S['t'].add_(1)
         
-        # At end of block, compute finished_all on device (no .item()!)
+        # At end of block, compute finished_all on device
         S['finished_all_d'].copy_(S['finished'].all().to(torch.uint8))
 
     def _ensure_block_graph(self, B_bucket: int, U: int) -> _GraphBlock:
@@ -377,6 +410,11 @@ class BatchedTableDecoder:
         # Allocate static buffers for this B_bucket
         if self._static is None or self._static['B_bucket'] != B_bucket:
             self._allocate_static(B_bucket)
+        
+        # Allocate block_tags buffer for this specific U
+        if self._static['block_tags'] is None or self._static['block_tags'].shape[0] != U:
+            self._static['block_tags'] = torch.full((U, B_bucket), self.end_id.item(), 
+                                                    dtype=torch.long, device=self.device)
         
         # Load dummy data for warmup and capture
         self._static_load_dummy()
@@ -397,11 +435,6 @@ class BatchedTableDecoder:
         gb.graph = g
         self._graphs[key] = gb
         return gb
-
-    def _set_block_time_base(self, t0: int):
-        """Set the host time base for the next block capture/replay"""
-        if self._static is not None:
-            self._static['t0'] = t0
 
     def _should_compact(self) -> bool:
         """Check if we should compact active rows (simple heuristic)"""
@@ -526,27 +559,29 @@ class BatchedTableDecoder:
         # Block-wise replay with early exit between blocks
         t0 = 0
         for blk in range(num_blocks):
-            # Set host time base for this block
-            self._set_block_time_base(t0)
-            
             # Replay the captured graph for U steps
             gb.graph.replay()
             
-            # Advance host time base
-            t0 += U
+            # Splice block tokens into global buffer (host-side, between blocks)
+            t1 = min(t0 + U, Tmax)
+            u = t1 - t0
+            if u > 0:
+                self._static['decoded_tags'][t0+1:t1+1, :B] = self._static['block_tags'][:u, :B]
+            t0 = t1
             
             # Check if all sequences finished (device->host sync)
             finished_all = bool(self._static['finished_all_d'].item())
             if finished_all:
                 break
             
+            # Skip compaction for now to avoid state loss (as recommended)
             # Optional: compact active rows to smaller buckets
-            if self._should_compact():
-                new_B_active = self._compact_active_rows()
-                new_B_bucket = 1 << (new_B_active - 1).bit_length()
-                if new_B_bucket < B_bucket:
-                    B_bucket = new_B_bucket
-                    gb = self._ensure_block_graph(B_bucket, U)
+            # if self._should_compact():
+            #     new_B_active = self._compact_active_rows()
+            #     new_B_bucket = 1 << (new_B_active - 1).bit_length()
+            #     if new_B_bucket < B_bucket:
+            #         B_bucket = new_B_bucket
+            #         gb = self._ensure_block_graph(B_bucket, U)
         
         # Materialize final outputs (outside graph)
         return self._materialize_outputs()

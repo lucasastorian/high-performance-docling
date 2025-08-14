@@ -341,6 +341,26 @@ class Tag_Transformer(nn.Module):
         # Convert [1, B, D] -> [B, D] for compatibility
         last_H = last_h_1BD.squeeze(0)  # [B, D]
         return last_H, None, sa_kv_out  # [B, D], None (no tag cache), kv_cache
+    
+    def step_incremental(
+            self,
+            cur_tok_1BD: torch.Tensor,  # [1, B, D] current token with positional encoding + embedding
+            memory: torch.Tensor,  # [S, B, D]
+            memory_kv=None,
+            sa_kv_cache=None,
+            max_pred_len: Optional[int] = None,
+    ) -> tuple[torch.Tensor, Optional[List]]:
+        """
+        T-agnostic incremental step using current token embedding directly.
+        No time indexing required - perfect for graph capture.
+        """
+        last_h_1BD, sa_kv_out = self._decoder(
+            cur_tok_1BD, memory=memory, cache=None, memory_key_padding_mask=None,
+            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, max_pred_len=max_pred_len
+        )
+        # Convert [1, B, D] -> [B, D] for compatibility
+        last_H = last_h_1BD.squeeze(0)  # [B, D]
+        return last_H, sa_kv_out  # [B, D], kv_cache
 
     def precompute_mem_kv(self, mem_enc: torch.Tensor):
         """
