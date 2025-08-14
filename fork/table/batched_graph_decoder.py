@@ -145,8 +145,9 @@ class BatchedTableDecoder:
             for _ in tt._decoder.layers:
                 K_buf = torch.empty(B_bucket, H, cap, Dh, device=device)
                 V_buf = torch.empty(B_bucket, H, cap, Dh, device=device)
-                t = torch.zeros(1, dtype=torch.int32, device=device)  # Device tensor time pointer
-                S['sa_kv'].append((K_buf, V_buf, t, cap))
+                t_dev = torch.zeros(1, dtype=torch.int32, device=device)  # Device tensor time pointer
+                pos_cap = torch.arange(cap, device=device, dtype=torch.long)  # Prebuilt indices for masking
+                S['sa_kv'].append((K_buf, V_buf, t_dev, cap, pos_cap))
         
         self._static = S
 
@@ -201,7 +202,7 @@ class BatchedTableDecoder:
         
         # Reset KV cache time pointers for all layers (prevent warmup state corruption)
         for kv_tuple in S['sa_kv']:
-            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t, cap)
+            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t_dev, cap, pos_cap)
                 kv_tuple[2].zero_()  # Reset time pointer to 0
         
         # Precompute dummy memory K/V
@@ -256,7 +257,7 @@ class BatchedTableDecoder:
         
         # Reset KV cache time pointers for all layers (prevent state corruption between runs)
         for kv_tuple in S['sa_kv']:
-            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t, cap)
+            if len(kv_tuple) >= 3:  # (K_buf, V_buf, t_dev, cap, pos_cap)
                 kv_tuple[2].zero_()  # Reset time pointer to 0
         
         # Precompute memory K/V outside graph
@@ -429,8 +430,12 @@ class BatchedTableDecoder:
         g = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         
-        with torch.cuda.graph(g, pool=gb.pool):
-            self._ar_block_advance_U(U)
+        try:
+            with torch.cuda.graph(g, pool=gb.pool):
+                self._ar_block_advance_U(U)
+        except Exception:
+            # Make sure no more CUDA calls run here; let the exception unwind
+            raise
         
         gb.graph = g
         self._graphs[key] = gb
