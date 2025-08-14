@@ -215,14 +215,21 @@ class BatchedTableDecoderV2:
             # Write to preallocated buffer
             decoded_tags[t + 1, :] = new_tags
             
-            # PE using broadcast (no per-sample gather)
-            pe_row = pe[t + 1] if pe.dim() == 2 else pe[t + 1].squeeze(0)  # [D]
-            if t + 1 < Tmax:
-                tgt_emb_buf[t + 1] = tt._embedding(new_tags) + pe_row  # broadcast
-            
             # Advance lengths for active sequences (IN-PLACE)
             active_prev = ~finished
             lengths.add_(active_prev.to(lengths.dtype))
+            
+            # PE using per-sample positions (same logic as eager path)
+            peL = pe.size(0)
+            pos_idx = torch.minimum(lengths, torch.tensor(peL - 1, device=dev, dtype=lengths.dtype)).to(torch.long)
+            
+            if pe.dim() == 2:         # [L, D]
+                pos_vec = pe.index_select(0, pos_idx)                 # [B, D]
+            else:                     # [L, 1, D]
+                pos_vec = pe.index_select(0, pos_idx).squeeze(1)      # [B, D]
+            
+            if t + 1 < Tmax:
+                tgt_emb_buf[t + 1] = tt._embedding(new_tags) + pos_vec
             
             # Mark newly finished (IN-PLACE)
             finished.logical_or_((new_tags == self.end_id))
@@ -311,12 +318,24 @@ class BatchedTableDecoderV2:
         st["sa_kv_cache"] = sa_kv_cache
     
     def _capture_if_needed(self, enc_out_batch, mem_enc, Tmax, B):
-        """Capture CUDA Graph if not already captured"""
-        if self._graph is not None:
-            return
+        """Capture CUDA Graph if not already captured or if shapes changed"""
+        # Check if recapture is needed
+        need_capture = (
+            self._graph is None
+            or self._static.get("B", None) != B
+            or self._static.get("Tmax", None) != Tmax
+        )
+        
+        if not need_capture:
+            return  # Already captured with correct shapes
         
         if not torch.cuda.is_available():
             return  # Not on CUDA
+        
+        # Clear old graph if recapturing
+        if self._graph is not None:
+            del self._graph
+            self._graph = None
         
         torch.cuda.synchronize()
         
@@ -333,6 +352,10 @@ class BatchedTableDecoderV2:
             self._ar_loop_graph_body(Tmax, B)
         
         self._graph = g
+        
+        # Store shape metadata for future shape guards
+        self._static["B"] = B
+        self._static["Tmax"] = Tmax
     
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
@@ -355,14 +378,14 @@ class BatchedTableDecoderV2:
         B_orig = enc_out_batch.size(0)
         S = mem_enc.size(0)
         
-        # Use fixed graph dimensions
-        B = self._graph_bs
-        Tmax = self._graph_tmax
+        # Use actual request dimensions (clamped)
+        Tmax_req = min(max_steps, self.model._max_pred_len, self._graph_tmax)
+        B_req = min(self._graph_bs, max(B_orig, 1))  # At least original batch size
         
         # Pad inputs to graph size if needed
-        if B_orig < B:
+        if B_orig < B_req:
             # Pad enc_out_batch
-            pad_b = B - B_orig
+            pad_b = B_req - B_orig
             enc_out_batch = torch.cat([
                 enc_out_batch,
                 torch.zeros(pad_b, *enc_out_batch.shape[1:], device=device, dtype=enc_out_batch.dtype)
@@ -374,8 +397,8 @@ class BatchedTableDecoderV2:
                 torch.zeros(S, pad_b, mem_enc.size(2), device=device, dtype=mem_enc.dtype)
             ], dim=1)
         
-        # Capture graph if needed
-        self._capture_if_needed(enc_out_batch, mem_enc, Tmax, B)
+        # Capture graph if needed (with shape guards)
+        self._capture_if_needed(enc_out_batch, mem_enc, Tmax_req, B_req)
         
         # Reset state for this batch
         st = self._static
@@ -385,7 +408,7 @@ class BatchedTableDecoderV2:
         st["finished"].zero_()
         
         # Mark padded samples as finished from the start
-        if B_orig < B:
+        if B_orig < B_req:
             st["finished"][B_orig:] = True
         
         st["first_lcel"].fill_(True)
@@ -432,7 +455,7 @@ class BatchedTableDecoderV2:
         for b in range(B_orig):
             # Find actual length
             actual_len = lengths[b].item() + 1  # +1 for start token
-            seq_len = min(Tmax + 1, actual_len)
+            seq_len = min(Tmax_req + 1, actual_len)
             seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
             seqs.append(seq)
         
