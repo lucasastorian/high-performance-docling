@@ -66,10 +66,10 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         new_sa_kv_cache = [] if sa_kv_cache is not None else None
         
         for i, mod in enumerate(self.layers):
-            # Use KV cache only for layer 0
+            # Use KV cache for all layers
             layer_self_kv = None
-            if sa_kv_cache is not None and i == 0:  # only layer 0 uses KV
-                layer_self_kv = sa_kv_cache[0]
+            if sa_kv_cache is not None and i < len(sa_kv_cache):  # all layers use KV
+                layer_self_kv = sa_kv_cache[i]
             
             result = mod(
                 output, memory,
@@ -96,9 +96,9 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                 # first step: no history; output_last is the only row
                 output = output_last
                 
-            # Build new KV cache
+            # Build new KV cache  
             if new_sa_kv_cache is not None:
-                new_sa_kv_cache.append(layer_kv_new if i == 0 else None)
+                new_sa_kv_cache.append(layer_kv_new)  # All layers now have KV cache
 
         if cache is not None:
             out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
