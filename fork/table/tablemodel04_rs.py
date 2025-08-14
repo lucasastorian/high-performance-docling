@@ -176,8 +176,8 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== BATCHED DECODER =====
         with timer.time_section('batched_ar_decoder'):
-            with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-                results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+            # with sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:

@@ -155,7 +155,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
             q, k_sdp, v_sdp, 
             attn_mask=None, 
             dropout_p=0.0, 
-            is_causal=False
+            is_causal=True  # Set to True for causal attention (CUDA Graphs optimization)
         )  # [B*H,1,Dh]
 
         # Merge heads -> [1,B,E]
