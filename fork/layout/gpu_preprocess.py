@@ -336,6 +336,26 @@ class GPUPreprocessorV2(nn.Module):
         
         # Pre-allocated pinned staging tensor for large batches (avoid allocator churn)
         self._staging_cache = {}  # key: (B_bucket, H, W, C, dtype) -> pinned tensor
+        
+        # Persistent CUDA streams and events (avoid creation overhead per call)
+        if self.device.type == "cuda":
+            self._stream_h2d = torch.cuda.Stream()
+            self._stream_compute = torch.cuda.Stream()
+            self._h2d_event = torch.cuda.Event()
+            
+            # Warmup: initialize CUDA context and JIT compile kernels to avoid first-call overhead
+            with torch.cuda.stream(self._stream_compute):
+                dummy = torch.ones(1, 224, 224, 3, device=self.device, dtype=self.dtype)
+                dummy.mul_(1.0)
+                dummy_nchw = dummy.permute(0, 3, 1, 2).contiguous()
+                dummy_resized = F.resize(dummy_nchw, [224, 224], 
+                                       interpolation=T.InterpolationMode.BILINEAR, antialias=False)
+                dummy_result = dummy_resized.contiguous().permute(0, 2, 3, 1).contiguous()
+            torch.cuda.synchronize()  # Ensure warmup completes
+        else:
+            self._stream_h2d = None
+            self._stream_compute = None
+            self._h2d_event = None
     
     def _make_resize(self, size_dict: Dict[str, int]):
         """Create appropriate resize operation based on size specification."""
@@ -397,10 +417,10 @@ class GPUPreprocessorV2(nn.Module):
         # Stack into batch (NHWC format)
         batch_np = np.stack(np_images)
         
-        # Create local streams for thread safety
-        stream_h2d = torch.cuda.Stream() if self.device.type == "cuda" else None
-        stream_compute = torch.cuda.Stream() if self.device.type == "cuda" else None
-        h2d_event = torch.cuda.Event() if self.device.type == "cuda" else None
+        # Use persistent streams (created in __init__)
+        stream_h2d = self._stream_h2d
+        stream_compute = self._stream_compute
+        h2d_event = self._h2d_event
         
         # Create pinned tensor using staging buffer to avoid allocator churn
         batch_tensor = torch.from_numpy(batch_np)
