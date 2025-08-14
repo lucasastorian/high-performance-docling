@@ -129,8 +129,8 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         # Interpret/initialize cache (always 4-tuple now)
         if kv_prev is None:
-            # New cache: allocate with good initial capacity to avoid reallocs
-            cap = cap_hint if cap_hint is not None else 64
+            # New cache: allocate EXACT capacity upfront (no reallocation ever!)
+            cap = cap_hint if cap_hint is not None else 128
             K_buf = k.new_empty((B, H, cap, Dh))
             V_buf = v.new_empty((B, H, cap, Dh))
             t = 0
@@ -138,14 +138,9 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
             # Existing cache: unpack 4-tuple
             K_buf, V_buf, t, cap = kv_prev
 
-        # Grow buffer if needed (double capacity)
-        if t >= cap:
-            new_cap = cap * 2
-            K_new = K_buf.new_empty((B, H, new_cap, Dh))
-            K_new[..., :cap, :] = K_buf
-            V_new = V_buf.new_empty((B, H, new_cap, Dh))
-            V_new[..., :cap, :] = V_buf
-            K_buf, V_buf, cap = K_new, V_new, new_cap
+        # No growing needed - we allocated exact capacity upfront!
+        # Just assert for safety in debug mode
+        assert t < cap, f"KV cache overflow: t={t}, cap={cap}"
 
         # O(1) in-place append 
         K_buf[..., t:t+1, :] = k
@@ -197,8 +192,8 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Detect incremental mode vs full sequence mode
         if tgt.size(0) == 1:
             # Incremental mode: always use KV cache (seed if self_kv is None)
-            # Use max_pred_len for optimal initial capacity, fallback to reasonable default
-            cap_hint = max_pred_len if max_pred_len is not None else 64
+            # Use max_pred_len for EXACT capacity allocation (no reallocs!)
+            cap_hint = max_pred_len + 1 if max_pred_len is not None else 128
             sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv, cap_hint=cap_hint)
         else:
             # Full-sequence path (training / non-incremental)
