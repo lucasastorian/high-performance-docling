@@ -170,20 +170,27 @@ class BatchedTableDecoderV2:
             t += 1
             decoded_tags[t, :] = new_tags
 
-            # Update incremental embedding buffer for next step (per-sample position indexing)
+            # 1) Decide which samples were active BEFORE this step's token
+            #    (i.e., they were not already finished)
+            active_prev = ~finished  # [B]  -- use the old 'finished' from BEFORE this step
+
+            # 2) Assign the position for the token we just emitted:
+            #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
+            #    - Previously-finished sequences DO NOT advance (they keep their last pos)
+            pos_idx = torch.where(active_prev, lengths + 1, lengths)          # int32
+            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)        # bounds + dtype
+            pos_vec = pe_gather_bD(pe, pos_idx)                               # [B, D]
+            
+            # Update incremental embedding buffer for next step
             if t < Tmax:  # Only if we'll do another step
-                # pos for next token per sample = current emitted length (don't advance finished)
-                next_pos_idx = torch.where(~finished, lengths + 0, lengths)  # int32 -> cast below
-                next_pos_idx = next_pos_idx.clamp_max(pe.size(0) - 1)        # stay in-bounds
-                pos_vec = pe_gather_bD(pe, next_pos_idx)                     # [B, D]
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec           # [B, D]
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec                # [B, D]
 
-            # Update lengths for non-finished sequences
-            lengths = torch.where(~finished, lengths + 1, lengths)
+            # 3) Now actually advance lengths for sequences that were active
+            lengths = torch.where(active_prev, lengths + 1, lengths)
 
-            # Update finished status
+            # 4) Only AFTER embedding & length update, mark newly-finished for next step
             newly_finished = (new_tags == self.end_id)
-            finished |= newly_finished
+            finished = finished | newly_finished
 
             # Early exit if all finished
             if finished.all():
