@@ -114,7 +114,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             # Incremental path: last token only, with per-layer KV cache
             # tgt must be [1, B, D] (single token with PE already added)
             tgt_last = tgt  # Should be [1, B, D]
-            new_sa_kv_cache = [] if sa_kv_cache is not None else None
+            new_sa_kv_cache = []  # Always create KV list
             
             for i, mod in enumerate(self.layers):
                 # Get KV cache for this layer
@@ -139,8 +139,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
                     tgt_last, layer_kv_new = result, None
                 
                 # Collect new KV cache
-                if new_sa_kv_cache is not None:
-                    new_sa_kv_cache.append(layer_kv_new)
+                new_sa_kv_cache.append(layer_kv_new)
             
             # Return: no tag cache, just the final last token output
             return tgt_last, new_sa_kv_cache  # [1, B, D], list of KV
@@ -230,12 +229,12 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # From PyTorch but modified to only use the last tag
         tgt_last_tok = tgt[-1:, :, :]
 
-        # Use KV cache if provided, otherwise use stock MHA
-        use_sa_kv = (self_kv is not None) and (tgt.size(0) >= 1)  # guard
-
-        if use_sa_kv:
+        # Detect incremental mode vs full sequence mode
+        if tgt.size(0) == 1:
+            # Incremental mode: always use KV cache (seed if self_kv is None)
             sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv)
         else:
+            # Full-sequence path (training / non-incremental)
             sa_out = self.self_attn(
                 tgt_last_tok,
                 tgt,
