@@ -237,41 +237,51 @@ class BatchedTableDecoderV2:
             append_mask = m_emit_bbox | m_first_lcel
             
             # Fixed-shape bbox storage using masked operations
-            # Always do the operations, but mask controls what gets written
             positions = tag_H_counts
             valid_store = append_mask & (positions < Tmax)
             
-            # Use 2D indexing with mask instead of nonzero
-            # This writes to all B positions but only updates where valid_store is True
-            flat_idx = arangeB * Tmax + positions
-            mask_expanded = valid_store.unsqueeze(1).expand(-1, last_H.size(1))
-            tag_H_flat[flat_idx] = torch.where(mask_expanded, last_H, tag_H_flat[flat_idx])
-            
-            # Update counts where valid
+            # Pure masked write - no branching, fixed shapes
+            flat_idx = arangeB * Tmax + positions  # [B]
+            mask2d = valid_store.unsqueeze(1).expand(-1, last_H.size(1))
+            old_vals = tag_H_flat[flat_idx]  # [B, D]
+            tag_H_flat[flat_idx] = torch.where(mask2d, last_H, old_vals)
             tag_H_counts = tag_H_counts + valid_store.to(tag_H_counts.dtype)
             
-            # Span tracking with fixed shapes
+            # Span tracking with fixed shapes - NO BRANCHING
             # Start spans where m_first_lcel & append_mask
             span_start_mask = m_first_lcel & append_mask
             open_span_start = torch.where(span_start_mask, positions, open_span_start)
             
-            # End spans where appropriate
+            # End spans - FIXED SHAPE, NO IF STATEMENTS
             span_end_mask = m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)
-            if span_end_mask.any():  # Single check to avoid unnecessary work
-                # Find where to write spans (use span_counts as index)
-                can_write = span_counts < Tmax
-                write_mask = span_end_mask & can_write
-                
-                # Write spans using advanced indexing
-                write_idx = torch.where(write_mask)[0]
-                if write_idx.numel() > 0:
-                    span_idx = span_counts[write_idx]
-                    span_starts[write_idx, span_idx] = open_span_start[write_idx]
-                    span_ends[write_idx, span_idx] = positions[write_idx]
-                    span_counts[write_idx] = span_counts[write_idx] + 1
-                
-                # Close spans that ended
-                open_span_start = torch.where(span_end_mask, torch.tensor(-1, device=dev), open_span_start)
+            
+            # Fixed-shape span updates (no variable-length indices)
+            can_write = span_counts < Tmax  # [B]
+            write_mask = span_end_mask & can_write  # [B]
+            
+            # Compute safe indices for writing
+            span_idx = span_counts  # [B] current write slot per row
+            safe_idx = torch.minimum(span_idx, torch.tensor(Tmax-1, device=dev))
+            
+            # Write starts/ends with mask - every sample gets touched but only masked ones change
+            row = arangeB
+            col = safe_idx
+            
+            # Start coords
+            cur_starts = span_starts[row, col]
+            new_starts = torch.where(write_mask, open_span_start, cur_starts)
+            span_starts[row, col] = new_starts
+            
+            # End coords
+            cur_ends = span_ends[row, col]
+            new_ends = torch.where(write_mask, positions, cur_ends)
+            span_ends[row, col] = new_ends
+            
+            # Increment counts only where we actually wrote
+            span_counts = span_counts + write_mask.to(span_counts.dtype)
+            
+            # Always close spans that attempted to end (even if capacity exceeded)
+            open_span_start = torch.where(span_end_mask, torch.tensor(-1, device=dev), open_span_start)
             
             # Update flags
             first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
@@ -609,45 +619,42 @@ class BatchedTableDecoderV2:
 
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
 
-            # Collect bbox features - guard with single check to save kernels
+            # Collect bbox features
             append_mask = m_emit_bbox | m_first_lcel
-            
-            # GPT-5 suggestion: Guard the heavy block when nothing happens
-            if append_mask.any():  # Single cheap sync that saves many kernels
-                positions = tag_H_counts  # [B]
-                valid_store = append_mask & (positions < Tmax)  # Bounds check
+            positions = tag_H_counts  # [B]
+            valid_store = append_mask & (positions < Tmax)  # Bounds check
 
-                # Get samples that need emission
-                emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
-                store_pos = positions.index_select(0, emit_samples)  # [K]
-                flat_idx = emit_samples * Tmax + store_pos  # [K]
-                src = last_H.index_select(0, emit_samples)  # [K,D]
-                tag_H_flat.index_copy_(0, flat_idx, src)
+            # Get samples that need emission
+            emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
+            store_pos = positions.index_select(0, emit_samples)  # [K]
+            flat_idx = emit_samples * Tmax + store_pos  # [K]
+            src = last_H.index_select(0, emit_samples)  # [K,D]
+            tag_H_flat.index_copy_(0, flat_idx, src)
 
-                # Span starts
-                start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
-                open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
+            # Span starts
+            start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
+            open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
 
-                # Span ends
-                end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)).nonzero(as_tuple=False).squeeze(-1)
+            # Span ends
+            end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)).nonzero(as_tuple=False).squeeze(-1)
 
-                # Filter for capacity and store
-                span_idx = span_counts.index_select(0, end_samples)
-                valid = span_idx < span_starts.size(1)
-                valid_end_samples = end_samples[valid]
-                valid_span_idx = span_idx[valid]
+            # Filter for capacity and store
+            span_idx = span_counts.index_select(0, end_samples)
+            valid = span_idx < span_starts.size(1)
+            valid_end_samples = end_samples[valid]
+            valid_span_idx = span_idx[valid]
 
-                # Store valid spans (read values BEFORE closing!)
-                span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
-                span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
-                span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
+            # Store valid spans (read values BEFORE closing!)
+            span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
+            span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
+            span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
 
-                # ALWAYS close spans (even if capacity exceeded) to prevent stuck open spans
-                open_span_start.index_fill_(0, end_samples, -1)
+            # ALWAYS close spans (even if capacity exceeded) to prevent stuck open spans
+            open_span_start.index_fill_(0, end_samples, -1)
 
-                # Counters: increment ONLY rows that actually stored
-                ones = torch.ones(emit_samples.size(0), dtype=torch.long, device=device)
-                tag_H_counts.index_add_(0, emit_samples, ones)
+            # Counters: increment ONLY rows that actually stored
+            ones = torch.ones(emit_samples.size(0), dtype=torch.long, device=device)
+            tag_H_counts.index_add_(0, emit_samples, ones)
 
             # ---- Update flags (all on GPU) ----
             # Reset first_lcel=True on every non-lcel step (matches serial semantics)
