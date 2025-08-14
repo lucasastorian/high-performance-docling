@@ -448,3 +448,5 @@ class BatchedTableDecoderV3:
         out_cls = torch.stack(out_cls) if out_cls else torch.empty(0, device=device)
         out_coord = torch.stack(out_coord) if out_coord else torch.empty(0, device=device)
         return out_cls, out_coord
+
+
