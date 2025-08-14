@@ -138,7 +138,10 @@ class BatchedTableDecoderV2:
 
         # Track current step
         t = 0
-        cache = None
+        
+        # Step 3: Enable KV cache for layer 0 only (for testing)
+        USE_SA_KV_L0 = True  # Enable self-attention KV cache for layer 0
+        cache = [None] * len(tt._decoder.layers) if USE_SA_KV_L0 else None
 
         # Step 4: Precompute cross-attention memory K/V once
         USE_MEM_KV = False  # set False to disable the custom path
