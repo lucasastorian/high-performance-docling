@@ -49,6 +49,7 @@ class TMTransformerDecoder(nn.TransformerDecoder):
         memory_key_padding_mask: Optional[Tensor] = None,
         memory_kv=None,   # NEW
         sa_kv_cache=None,  # NEW: self-attention KV cache list
+        incremental: bool = False,  # NEW: incremental mode flag
     ):
         """
         Args:
@@ -59,53 +60,60 @@ class TMTransformerDecoder(nn.TransformerDecoder):
             output (Tensor): (tags_len,bsz,hidden_dim)
         """
 
-        output = tgt
+        if not incremental:
+            # Current path: uses tag cache (full sequence rebuild)
+            output = tgt
 
-        # cache
-        tag_cache = []
-        new_sa_kv_cache = [] if sa_kv_cache is not None else None
-        
-        for i, mod in enumerate(self.layers):
-            # Use KV cache for all layers
-            layer_self_kv = None
-            if sa_kv_cache is not None and i < len(sa_kv_cache):  # all layers use KV
-                layer_self_kv = sa_kv_cache[i]
+            # cache
+            tag_cache = []
+            new_sa_kv_cache = [] if sa_kv_cache is not None else None
             
-            result = mod(
-                output, memory,
-                memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-                memory_kv=None if memory_kv is None else memory_kv[i],
-                self_kv=layer_self_kv,
-            )
-            
-            # Handle the new tuple return format
-            if isinstance(result, tuple):
-                output_last, layer_kv_new = result
-            else:
-                # Fallback for compatibility
-                output_last, layer_kv_new = result, None
-            
-            tag_cache.append(output_last)
-            
-            # Rebuild full prefix to feed next layer (unchanged)
-            if cache is not None:
-                output = torch.cat([cache[i], output_last], dim=0)
-            else:
-                # first step: no history; output_last is the only row
-                output = output_last
+            for i, mod in enumerate(self.layers):
+                # Use KV cache for all layers
+                layer_self_kv = None
+                if sa_kv_cache is not None and i < len(sa_kv_cache):  # all layers use KV
+                    layer_self_kv = sa_kv_cache[i]
                 
-            # Build new KV cache  
-            if new_sa_kv_cache is not None:
-                new_sa_kv_cache.append(layer_kv_new)  # All layers now have KV cache
+                result = mod(
+                    output, memory,
+                    memory_mask=memory_mask,
+                    tgt_key_padding_mask=tgt_key_padding_mask,
+                    memory_key_padding_mask=memory_key_padding_mask,
+                    memory_kv=None if memory_kv is None else memory_kv[i],
+                    self_kv=layer_self_kv,
+                )
+                
+                # Handle the new tuple return format
+                if isinstance(result, tuple):
+                    output_last, layer_kv_new = result
+                else:
+                    # Fallback for compatibility
+                    output_last, layer_kv_new = result, None
+                
+                tag_cache.append(output_last)
+                
+                # Rebuild full prefix to feed next layer (unchanged)
+                if cache is not None:
+                    output = torch.cat([cache[i], output_last], dim=0)
+                else:
+                    # first step: no history; output_last is the only row
+                    output = output_last
+                    
+                # Build new KV cache  
+                if new_sa_kv_cache is not None:
+                    new_sa_kv_cache.append(layer_kv_new)  # All layers now have KV cache
 
-        if cache is not None:
-            out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
+            if cache is not None:
+                out_cache = torch.cat([cache, torch.stack(tag_cache, dim=0)], dim=1)
+            else:
+                out_cache = torch.stack(tag_cache, dim=0)
+
+            return output, out_cache, new_sa_kv_cache  # Return 3 items now
+        
         else:
-            out_cache = torch.stack(tag_cache, dim=0)
-
-        return output, out_cache, new_sa_kv_cache  # Return 3 items now
+            # TODO: Incremental path (Checkpoint B)
+            # For now, fall back to old behavior
+            raise NotImplementedError("Incremental path not implemented yet")
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
@@ -329,14 +337,20 @@ class Tag_Transformer(nn.Module):
         cache=None,
         memory_kv=None,
         sa_kv_cache=None,           # NEW: self-attention KV cache
+        incremental: bool = False,   # NEW: incremental mode flag
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List]]:
-        # feed the full prefix up to t (exactly your current behavior)
-        tgt = tgt_emb_buf[: t + 1, :, :]             # [t+1, B, D]
-        decoded, cache_out, sa_kv_out = self._decoder(
-            tgt, memory=memory, cache=cache, memory_key_padding_mask=None,
-            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache
-        )
-        return decoded[-1, :, :], cache_out, sa_kv_out  # [B, D], cache, kv_cache
+        if not incremental:
+            # Current path: feed the full prefix up to t
+            tgt = tgt_emb_buf[: t + 1, :, :]             # [t+1, B, D]
+            decoded, cache_out, sa_kv_out = self._decoder(
+                tgt, memory=memory, cache=cache, memory_key_padding_mask=None,
+                memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, incremental=False
+            )
+            return decoded[-1, :, :], cache_out, sa_kv_out  # [B, D], cache, kv_cache
+        else:
+            # TODO: Incremental path (Checkpoint B) 
+            # For now, fall back to old behavior
+            raise NotImplementedError("Incremental step_fullprefix not implemented yet")
 
     def precompute_mem_kv(self, mem_enc: torch.Tensor):
         """
