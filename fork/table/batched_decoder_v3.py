@@ -1,49 +1,11 @@
-# fork/table/batched_decoder_v3.py
-# Optimized Batched AR decoder with GPT-5 Phase 1 & 2 optimizations implemented
-# PHASE 1: Reduced GPU→CPU sync frequency - check "all finished" every 8 steps
-# PHASE 2: Reduced nonzero() calls from 3 to 2 per step - CRITICAL: keep ~first_lcel in end condition
-#
+# fork/table/batched_decoder_v2.py
+# Optimized Batched AR decoder with all CPU syncs eliminated
 
 import torch
-from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
 
-def _make_alive_pos(B: int, alive_idx: torch.Tensor, device) -> torch.Tensor:
-    """Map original batch index -> position in alive batch (or -1)"""
-    alive_pos = torch.full((B,), -1, device=device, dtype=torch.long)
-    # 0..B_alive-1 assigned into positions 'alive_idx'
-    alive_pos.index_copy_(0, alive_idx, torch.arange(alive_idx.numel(), device=device))
-    return alive_pos
-
-
-@dataclass
-class BatchState:
-    """State for batched AR decoding with preallocated buffers"""
-    decoded_tags: torch.Tensor  # [Tmax+1, B] Long - preallocated
-    lengths: torch.Tensor  # [B] Int - actual length per seq (excluding start)
-    finished: torch.Tensor  # [B] Bool
-    cache: Optional[torch.Tensor]  # transformer cache
-
-    # Per-seq ragged buffers for bbox head (keep as flat list + indices for less sync)
-    tag_H_flat: List[torch.Tensor]  # flat list of all hidden states
-    tag_H_sample_ids: List[int]  # which sample each belongs to
-
-    # Decoding flags (device tensors)
-    first_lcel: torch.Tensor  # [B] Bool
-    skip_next: torch.Tensor  # [B] Bool
-    prev_ucel: torch.Tensor  # [B] Bool
-    line_num: torch.Tensor  # [B] Long
-
-    # Bbox indexing (device counters)
-    bbox_ind: torch.Tensor  # [B] Long (running index)
-
-    # Span bookkeeping - track one open span per sample
-    open_span_start: List[int]  # [-1 if no open span, else start index] per sample
-
-
-class BatchedTableDecoderV3:
+class BatchedTableDecoder:
     def __init__(self, model, device: str):
         self.model = model
         self.device = device
@@ -76,15 +38,16 @@ class BatchedTableDecoderV3:
             device=device, dtype=torch.long
         )
 
-        # OPTIMIZATION 1: Replace torch.isin with LUTs for O(1) lookup
-        V = model._tag_transformer._fc.out_features  # Vocabulary size
-        self.emit_lut = torch.zeros(V, dtype=torch.bool, device=device)
+        # Pre-build lookup tables for fast membership checks (no torch.isin!)
+        vocab_size = len(wm)
+        emit_lut = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        skip_lut = torch.zeros(vocab_size, dtype=torch.bool, device=device)
         if self.emit_ids.numel() > 0:
-            self.emit_lut[self.emit_ids] = True
-
-        self.skip_lut = torch.zeros(V, dtype=torch.bool, device=device)
+            emit_lut[self.emit_ids] = True
         if self.skip_ids.numel() > 0:
-            self.skip_lut[self.skip_ids] = True
+            skip_lut[self.skip_ids] = True
+        self.emit_lut = emit_lut  # Store as attribute
+        self.skip_lut = skip_lut
 
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
@@ -95,287 +58,314 @@ class BatchedTableDecoderV3:
         except ValueError:
             return seq_list
 
-    def _maybe_grow_buffer(self, buf: torch.Tensor, counters: torch.Tensor, needed_idx: torch.Tensor):
-        """FIX 2: Grow buffer on demand if any sample is about to overflow"""
-        if needed_idx.numel() == 0:
-            return buf, counters
-
-        # Check if any sample needs more space
-        need = (counters[needed_idx] >= buf.size(1)).any()
-        if not bool(need):
-            return buf, counters
-
-        # Grow by 50% + 8
-        new_K = int(buf.size(1) * 1.5 + 8)
-        B, Kold, D = buf.shape
-        grown = torch.empty(B, new_K, D, device=buf.device, dtype=buf.dtype)
-        grown[:, :Kold].copy_(buf)
-        return grown, counters
-
-    def _maybe_grow_spans(self, starts: torch.Tensor, ends: torch.Tensor, cnt: torch.Tensor, idx: torch.Tensor):
-        """Grow span buffers on demand if any sample is about to overflow"""
-        if idx.numel() == 0:
-            return starts, ends, cnt
-
-        need = (cnt[idx] >= starts.size(1)).any()
-        if not bool(need):
-            return starts, ends, cnt
-
-        newK = int(starts.size(1) * 1.5 + 8)
-        B = starts.size(0)
-        s2 = torch.full((B, newK), -1, device=starts.device, dtype=starts.dtype)
-        s2[:, :starts.size(1)] = starts
-        e2 = torch.full((B, newK), -1, device=ends.device, dtype=ends.dtype)
-        e2[:, :ends.size(1)] = ends
-        return s2, e2, cnt
-
     @torch.inference_mode()
     def predict_batched(
             self,
-            enc_out_batch: torch.Tensor,  # [B0,C,H,W] NCHW
-            mem_enc: torch.Tensor,  # [S,B0,D]
-            max_steps: int,
-            timer=None
+            enc_out_batch: torch.Tensor,  # [B,C,H,W] NCHW - bbox decoder optimized for NCHW
+            mem_enc: torch.Tensor,  # [S,B,D] encoder memory (precomputed, no duplicate processing)
+            max_steps: int
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
         device = self.device
         tt = self.tt
+        B = enc_out_batch.size(0)
 
-        # ---- Keep original batch size/order everywhere ----
-        B0 = enc_out_batch.size(0)
-
-        # Cached module refs
-        E = tt._embedding
-        FC = tt._fc
-        decoder = tt._decoder
-        pos_enc = tt._positional_encoding
-
+        # Clamp to model's max
         Tmax = min(max_steps, self.model._max_pred_len)
-        D = E.embedding_dim
 
-        # Global (full-B0) buffers — DO NOT SHRINK THESE
-        decoded_tags = torch.full((Tmax + 1, B0), self.end_id.item(),
-                                  dtype=torch.long, device=device)
+        # ---- Preallocate all buffers (Fix B: avoid reallocation) ----
+        decoded_tags = torch.full((Tmax + 1, B), self.end_id.item(), dtype=torch.long, device=device)
         decoded_tags[0, :] = self.start_id
 
-        lengths = torch.zeros(B0, dtype=torch.int32, device=device)
-        finished = torch.zeros(B0, dtype=torch.bool, device=device)
-        first_lcel = torch.ones(B0, dtype=torch.bool, device=device)
-        skip_next = torch.ones(B0, dtype=torch.bool, device=device)
-        prev_ucel = torch.zeros(B0, dtype=torch.bool, device=device)
-        line_num = torch.zeros(B0, dtype=torch.long, device=device)
-        bbox_ind = torch.zeros(B0, dtype=torch.long, device=device)
+        # Device-only state tracking
+        lengths = torch.zeros(B, dtype=torch.int32, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        first_lcel = torch.ones(B, dtype=torch.bool, device=device)
+        skip_next = torch.ones(B, dtype=torch.bool, device=device)
+        prev_ucel = torch.zeros(B, dtype=torch.bool, device=device)
+        line_num = torch.zeros(B, dtype=torch.long, device=device)
+        # bbox_ind removed - using tag_H_counts instead
 
-        # Tag hidden states per sample for bbox head (fixed B0, grow K when needed)
-        Kmax = max(1, Tmax // 2)
-        tag_H_buf = torch.empty(B0, Kmax, D, device=device)
-        k_counters = torch.zeros(B0, dtype=torch.int32, device=device)
+        # GPU-only bbox tracking with preallocated buffers
+        # Worst case: every token emits bbox = Tmax emissions per sample
+        hidden_dim = tt._decoder_dim  # This is an attribute of Tag_Transformer, not the decoder!
+        # Defer buffer creation until we know the dtype from last_H
+        tag_H_buffer = None
+        tag_H_flat = None
+        tag_H_counts = torch.zeros(B, dtype=torch.long, device=device)  # [B] count per sample
 
-        # Span tracking (fixed B0)
-        Kspan = max(1, Tmax // 2)
-        span_starts = torch.full((B0, Kspan), -1, device=device, dtype=torch.long)
-        span_ends = torch.full((B0, Kspan), -1, device=device, dtype=torch.long)
-        span_cnt = torch.zeros(B0, device=device, dtype=torch.long)
+        # Span tracking on GPU - allocate more capacity (Tmax instead of Tmax//2)
+        open_span_start = torch.full((B,), -1, dtype=torch.long, device=device)  # [B]
+        # Allocate Tmax spans per sample (safe, won't overflow)
+        span_starts = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
+        span_ends = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
+        span_counts = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Incremental embedding buffer (full B0; we only slice alive rows when running the decoder)
-        tgt_emb_buf = torch.empty(Tmax + 1, B0, D, device=device)
-        pe_rows = pos_enc.pe[:Tmax + 1, 0]  # [Tmax+1, D]
-        tgt_emb_buf[0] = E(decoded_tags[0, :]) + pe_rows[0]
+        # Drop bbox_ind - just use tag_H_counts (they're identical)
 
-        zerosB0 = torch.zeros(B0, dtype=torch.bool, device=device)
+        # Use pre-built LUTs from __init__
+        emit_lut = self.emit_lut
+        skip_lut = self.skip_lut
+
+        # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
+        D = tt._embedding.embedding_dim
+        tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
+        pe = tt._positional_encoding.pe  # could be [L, D] OR [L, 1, D]
+
+        def pe_gather_bD(pe: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            """
+            Gather PE rows by per-sample positions -> [B, D], regardless of pe's rank.
+            idx must be Long on CUDA.
+            """
+            idx = idx.to(torch.long)
+            out = pe.index_select(0, idx)  # [B, D] or [B,1,D]
+            if out.dim() == 3:  # common case: [B,1,D]
+                out = out.squeeze(1)  # -> [B, D]
+            return out.contiguous()
+
+        # Initialize first step with start tokens (per-sample position indexing)
+        start_row = decoded_tags[0, :]  # [B] start tokens
+        pos_idx = torch.zeros(B, dtype=torch.long, device=device)  # [B] all zeros
+        pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
+        tgt_emb_buf[0] = tt._embedding(start_row) + pos_vec  # [B, D]
+
+        # Track current step
         t = 0
+        # Checkpoint B: Switch to incremental mode (no tag cache)
+        sa_kv_cache = None  # KV cache for all layers
 
-        # Helper: map original batch index -> position in alive subset (or -1)
-        def make_alive_pos(B0: int, alive_idx: torch.Tensor) -> torch.Tensor:
-            alive_pos = torch.full((B0,), -1, device=device, dtype=torch.long)
-            alive_pos.index_copy_(0, alive_idx, torch.arange(alive_idx.numel(), device=device))
-            return alive_pos
-
-        if timer:
-            timer.start_section('ar_loop')
+        # Step 4: Precompute cross-attention memory K/V once
+        USE_MEM_KV = True  # set False to disable the custom path
+        mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
 
         for step in range(Tmax):
-            # 1) Alive set (no CPU sync)
-            alive_idx = (~finished).nonzero(as_tuple=False).squeeze(1)  # [B_alive]
-            B_alive = alive_idx.numel()
-            if B_alive == 0:
-                break
+            # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
+            # Pass max_pred_len for optimal KV cache sizing
+            last_H, _, sa_kv_cache = tt.step_fullprefix(
+                t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv,
+                sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
+            )
 
-            # 2) Slice alive inputs for this step
-            tgt_alive = tgt_emb_buf[:t + 1, alive_idx, :]  # [t+1, B_alive, D]
-            mem_alive = mem_enc[:, alive_idx, :]  # [S,   B_alive, D]
+            # Create tag_H_buffer with correct dtype on first iteration
+            if tag_H_buffer is None:
+                tag_H_buffer = torch.empty(B, Tmax, hidden_dim, device=device, dtype=last_H.dtype)
+                tag_H_flat = tag_H_buffer.view(B * Tmax, hidden_dim)
 
-            # 3) Decoder on alive only (no cache for robustness)
-            if timer: timer.start_section('ar_transformer')
-            decoded_alive, _ = decoder(tgt_alive, memory=mem_alive, cache=None, memory_key_padding_mask=None)
-            last_H_alive = decoded_alive[-1].contiguous()  # [B_alive, D]
-            logits_alive = FC(last_H_alive)  # [B_alive, V]
-            new_tags_alive = logits_alive.argmax(dim=1)  # [B_alive]
-            if timer:
-                timer.end_section('ar_transformer')
-                timer.start_section('ar_other')
+            logits = tt._fc(last_H)  # [B,V]
+            new_tags = logits.argmax(dim=1)  # [B] Long
 
-            # 4) Scatter predicted tags back to full batch
-            new_tags = torch.full((B0,), self.end_id.item(), device=device, dtype=torch.long)
-            new_tags.index_copy_(0, alive_idx, new_tags_alive)
-
-            # 5) Structure corrections (global masks, identical semantics)
+            # ---- Structure corrections (all on GPU) ----
             if self.xcel_id is not None and self.lcel_id is not None:
-                new_tags = torch.where((line_num == 0) & (new_tags == self.xcel_id), self.lcel_id, new_tags)
+                mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
+                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
+
+            # For ucel->lcel correction, check prev_ucel from PREVIOUS step
             if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                new_tags = torch.where(prev_ucel & (new_tags == self.lcel_id), self.fcel_id, new_tags)
+                mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
+                new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
 
-            # 6) Finish mask & force <end> (global)
-            is_end = (new_tags == self.end_id)
-            finished |= is_end
-            new_tags = torch.where(finished, torch.full_like(new_tags, self.end_id.item()), new_tags)
+            # Force <end> for already finished sequences
+            new_tags = torch.where(finished, self.end_id.expand(B), new_tags)
 
-            # 7) Write to decoded_tags (global order)
+            # Write to preallocated buffer
             t += 1
             decoded_tags[t, :] = new_tags
 
-            # 8) Update incremental embeddings **only for alive rows**
-            if t < Tmax:
-                emb_alive_next = E(new_tags_alive) + pe_rows[t]  # [B_alive, D]
-                tgt_emb_buf[t, alive_idx, :] = emb_alive_next
+            # 1) Decide which samples were active BEFORE this step's token
+            #    (i.e., they were not already finished)
+            active_prev = ~finished  # [B]  -- use the old 'finished' from BEFORE this step
 
-            # 9) Lengths update (global)
-            lengths = torch.where(~finished, lengths + 1, lengths)
+            # 2) Assign the position for the token we just emitted:
+            #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
+            #    - Previously-finished sequences DO NOT advance (they keep their last pos)
+            pos_idx = torch.where(active_prev, lengths + 1, lengths)  # int32
+            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)  # bounds + dtype
+            pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
 
-            # 10) Early exit host sync every 8 steps
-            if (step & 7) == 7:
-                if not (~finished).any().item():
-                    if timer: timer.end_section('ar_other')
-                    break
+            # Update incremental embedding buffer for next step
+            if t < Tmax:  # Only if we'll do another step
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
 
-            # 11) BBox emission logic (global masks, but rows picked from last_H_alive)
-            emit = self.emit_lut[new_tags]
-            skip_now = self.skip_lut[new_tags]
-            is_lcel = (new_tags == self.lcel_id) if self.lcel_id is not None else zerosB0
+            # 3) Now actually advance lengths for sequences that were active
+            lengths = torch.where(active_prev, lengths + 1, lengths)
 
-            m_emit_bbox = (~skip_next) & emit & (~finished)
-            m_first_lcel = first_lcel & is_lcel & (~finished)
+            # 4) Only AFTER embedding & length update, mark newly-finished for next step
+            newly_finished = (new_tags == self.end_id)
+            finished = finished | newly_finished
+
+            # Early exit if all finished
+            if finished.all():
+                break
+
+            # ---- BBox emission decisions (TRULY NO SYNCS!) ----
+            # Use LUT for fast membership (no isin!)
+            m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
+
+            # Fix: Proper boolean handling for m_is_lcel
+            if self.lcel_id is not None:
+                m_is_lcel = (new_tags == self.lcel_id)
+            else:
+                m_is_lcel = torch.zeros(B, dtype=torch.bool, device=device)
+
+            m_first_lcel = first_lcel & m_is_lcel & (~finished)
+
+            # Collect bbox features - NO PYTHON IFS AT ALL!
             append_mask = m_emit_bbox | m_first_lcel
+            positions = tag_H_counts  # [B]
+            valid_store = append_mask & (positions < Tmax)  # Bounds check
 
-            if append_mask.any():
-                append_idx = append_mask.nonzero(as_tuple=False).squeeze(1)  # original B0 indices
-                # map original indices -> positions inside last_H_alive
-                alive_pos = make_alive_pos(B0, alive_idx)
-                ap = alive_pos.index_select(0, append_idx)  # [K]
-                rows = last_H_alive.index_select(0, ap)  # [K, D]
+            # Get samples that need emission (works even if empty!)
+            emit_samples = valid_store.nonzero(as_tuple=False).squeeze(-1)  # [K]
+            store_pos = positions.index_select(0, emit_samples)  # [K]
+            flat_idx = emit_samples * Tmax + store_pos  # [K]
+            src = last_H.index_select(0, emit_samples)  # [K,D]
+            tag_H_flat.index_copy_(0, flat_idx, src)  # No-op if K=0
 
-                # Ensure capacity and scatter into per-B slots
-                tag_H_buf, k_counters = self._maybe_grow_buffer(tag_H_buf, k_counters, append_idx)
-                slots = k_counters[append_idx].long()
-                flat = append_idx * tag_H_buf.size(1) + slots
-                tag_H_buf.view(-1, D).index_copy_(0, flat, rows)
-                k_counters[append_idx] += 1
+            # Span starts: NO IF STATEMENTS!
+            start_samples = (m_first_lcel & append_mask).nonzero(as_tuple=False).squeeze(-1)
+            open_span_start.index_copy_(0, start_samples, tag_H_counts.index_select(0, start_samples))
 
-                # Span starts (first lcel)
-                if m_first_lcel.any():
-                    first_lcel_idx = m_first_lcel.nonzero(as_tuple=False).squeeze(1)
-                    span_starts, span_ends, span_cnt = self._maybe_grow_spans(span_starts, span_ends, span_cnt,
-                                                                              first_lcel_idx)
-                    slot = span_cnt[first_lcel_idx]
-                    span_starts[first_lcel_idx, slot] = bbox_ind[first_lcel_idx]
-                    span_cnt[first_lcel_idx] += 1
+            # Span ends: NO IF STATEMENTS!
+            end_samples = (m_emit_bbox & (~m_first_lcel) & append_mask & (open_span_start >= 0)).nonzero(
+                as_tuple=False).squeeze(-1)
 
-                # Span ends (emit but not first_lcel)
-                m_end_global = m_emit_bbox & (~first_lcel) & (~finished)
-                if m_end_global.any():
-                    end_idx = m_end_global.nonzero(as_tuple=False).squeeze(1)
-                    slot = (span_cnt[end_idx] - 1).clamp_min(0)
-                    span_ends[end_idx, slot] = bbox_ind[end_idx]
+            # Filter for capacity and store
+            span_idx = span_counts.index_select(0, end_samples)
+            valid = span_idx < span_starts.size(1)
+            valid_end_samples = end_samples[valid]
+            valid_span_idx = span_idx[valid]
 
-                # Increment bbox indices for appended rows
-                bbox_ind[append_idx] += 1
+            # Store valid spans (read values BEFORE closing!)
+            span_starts[valid_end_samples, valid_span_idx] = open_span_start.index_select(0, valid_end_samples)
+            span_ends[valid_end_samples, valid_span_idx] = tag_H_counts.index_select(0, valid_end_samples)
+            span_counts.index_add_(0, valid_end_samples, torch.ones_like(valid_span_idx))
 
-            # 12) Update flags (global)
-            first_lcel = ~is_lcel | finished
-            skip_next = skip_now
-            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else zerosB0
+            # ALWAYS close spans (even if capacity exceeded) to prevent stuck open spans
+            open_span_start.index_fill_(0, end_samples, -1)
+
+            # Counters: increment ONLY rows that actually stored
+            ones = torch.ones(emit_samples.size(0), dtype=torch.long, device=device)
+            tag_H_counts.index_add_(0, emit_samples, ones)
+
+            # ---- Update flags (all on GPU) ----
+            # Reset first_lcel=True on every non-lcel step (matches serial semantics)
+            first_lcel = torch.where(m_is_lcel, torch.zeros_like(first_lcel), torch.ones_like(first_lcel))
+
+            # Update skip_next using LUT (no isin!)
+            skip_next = skip_lut[new_tags]
+
+            # Update prev_ucel for NEXT iteration
+            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags,
+                                                                                                     dtype=torch.bool)
+
+            # Update line number
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
-            if timer: timer.end_section('ar_other')
+        # ---- Check for overflow AFTER loop (single sync, not per-token!) ----
+        if __debug__:
+            if (tag_H_counts > Tmax).any():
+                raise RuntimeError(f"tag_H_counts overflow: max={tag_H_counts.max().item()} > {Tmax}")
+            if (span_counts > span_starts.size(1)).any():
+                raise RuntimeError(f"span buffer overflow: max={span_counts.max().item()} > {span_starts.size(1)}")
 
-        if timer:
-            timer.end_section('ar_loop')
-
-        # ---- Materialize outputs in original order (B0) ----
+        # ---- Materialize outputs (SINGLE sync point after loop!) ----
+        # Trim sequences to actual length
         end_id_int = self.end_id.item()
         seqs = []
-        for b in range(B0):
-            seq_len = min(t + 1, lengths[b].item() + 1)
-            seqs.append(self._trim_sequence(decoded_tags[:seq_len, b], end_id_int))
+        for b in range(B):
+            seq_len = min(t + 1, lengths[b].item() + 1)  # +1 for start token
+            seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
+            seqs.append(seq)
 
+        # Keep everything on GPU as long as possible
+        # Only sync tag_H_counts to know how many hiddens per sample
+        tag_H_counts_cpu = tag_H_counts.cpu()
+
+        # ---- Per-table bbox head with tensor inputs ----
         outputs = []
-        if timer: timer.start_section('bbox_decode')
+        for b in range(B):
+            count = tag_H_counts_cpu[b].item()
 
-        k_list = k_counters.detach().cpu().tolist()
-        for b, k_b in enumerate(k_list):
-            if self.model._bbox and k_b > 0:
-                enc_nchw = enc_out_batch[b:b + 1]
-                tag_H_tensor = tag_H_buf[b, :k_b]
-                cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
+            if self.model._bbox and count > 0:
+                # Pass tensor directly (no list construction!)
+                tag_H_tensor = tag_H_buffer[b, :count].contiguous()  # [N, D] on device
+                enc_nchw = enc_out_batch[b:b + 1]  # [1, 256, 28, 28] NCHW
+
+                # Check type explicitly (no try/except overhead)
+                if isinstance(tag_H_tensor, torch.Tensor):
+                    cls_logits, coords = self.model._bbox_decoder.inference(
+                        enc_nchw, tag_H_tensor  # Pass tensor directly!
+                    )
+                else:
+                    # Should never hit this path with our GPU-only collection
+                    tag_H_list = [tag_H_tensor[i:i + 1] for i in range(count)]
+                    cls_logits, coords = self.model._bbox_decoder.inference(
+                        enc_nchw, tag_H_list
+                    )
             else:
                 cls_logits = torch.empty(0, device=device)
                 coords = torch.empty(0, device=device)
 
-            merged_cls, merged_coord = self._merge_spans_tensor(
+            # GPU-based span merging
+            merged_cls, merged_coord = self._merge_spans_gpu(
                 cls_logits, coords,
-                span_starts[b:b + 1], span_ends[b:b + 1], span_cnt[b:b + 1]
+                span_starts[b], span_ends[b], span_counts[b]
             )
             outputs.append((seqs[b], merged_cls, merged_coord))
 
-        if timer: timer.end_section('bbox_decode')
-
         return outputs
 
-    def _merge_spans_tensor(self, cls_logits: torch.Tensor, coords: torch.Tensor,
-                            starts: torch.Tensor, ends: torch.Tensor, cnt: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor]:
-        """Tensorized span merging - no Python dicts"""
+    def _merge_spans_gpu(
+            self,
+            cls_logits: torch.Tensor,
+            coords: torch.Tensor,
+            starts: torch.Tensor,  # [Tmax] with -1 for invalid
+            ends: torch.Tensor,  # [Tmax] with -1 for invalid
+            count: torch.Tensor  # scalar, number of valid spans
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GPU-based span merging without CPU sync"""
         device = coords.device if coords is not None and coords.numel() > 0 else self.device
+        N = len(coords) if coords is not None else 0
 
-        if coords.numel() == 0:
-            return torch.empty(0, device=device), torch.empty(0, device=device)
+        if N == 0 or count == 0:
+            return cls_logits, coords
 
-        N = coords.size(0)
-        keep = torch.ones(N, device=device, dtype=torch.bool)
-        merged_cls = []
-        merged_coord = []
+        # Extract valid spans
+        num_spans = count.item()  # Single sync point
+        if num_spans == 0:
+            return cls_logits, coords
 
-        # Build a dense map for start->end lookup
-        end_map = torch.full((N,), -1, device=device, dtype=torch.long)
-        nspans = int(cnt[0].item()) if cnt.numel() > 0 else 0
+        valid_starts = starts[:num_spans].clamp_min(0)  # [M]
+        valid_ends = ends[:num_spans].clamp_min(0)  # [M]
 
-        if nspans > 0:
-            # Extract valid spans from the first sample (b=0)
-            valid = (starts[0, :nspans] >= 0) & (ends[0, :nspans] >= 0)
-            if valid.any():
-                st = starts[0, :nspans][valid]
-                ed = ends[0, :nspans][valid]
-                # Ensure indices are within bounds
-                valid_idx = (st < N) & (ed < N)
-                if valid_idx.any():
-                    st = st[valid_idx]
-                    ed = ed[valid_idx]
-                    end_map[st] = ed
+        # Create drop mask (mark ends for removal)
+        drop = torch.zeros(N, dtype=torch.bool, device=device)
+        valid_mask = (valid_ends < N) & (valid_starts < N)
+        drop[valid_ends[valid_mask]] = True
+        keep = ~drop
 
-        for i in range(N):
-            if not keep[i]:
-                continue
-            j = int(end_map[i].item())
-            if 0 <= j < N:
-                keep[j] = False
-                merged_cls.append(cls_logits[i])
-                merged_coord.append(self.model.mergebboxes(coords[i], coords[j]))
+        # Merge coordinates for start positions (BATCHED - no Python loop!)
+        if valid_mask.any():
+            merge_starts = valid_starts[valid_mask]
+            merge_ends = valid_ends[valid_mask]
+
+            # Clone coords to avoid in-place issues
+            coords = coords.clone()
+
+            # Use batched merge - single kernel, no loop!
+            if hasattr(self.model, 'mergebboxes_batch'):
+                coords[merge_starts] = self.model.mergebboxes_batch(
+                    coords[merge_starts], coords[merge_ends]
+                )
             else:
-                merged_cls.append(cls_logits[i])
-                merged_coord.append(coords[i])
+                # Fallback to loop if batched version not available
+                for i in range(len(merge_starts)):
+                    coords[merge_starts[i]] = self.model.mergebboxes(
+                        coords[merge_starts[i]], coords[merge_ends[i]]
+                    )
 
-        return (torch.stack(merged_cls) if merged_cls else torch.empty(0, device=device),
-                torch.stack(merged_coord) if merged_coord else torch.empty(0, device=device))
+        # Select only kept rows
+        return cls_logits[keep], coords[keep]
 
     def _merge_spans(self, cls_logits: torch.Tensor, coords: torch.Tensor, merge_map: Dict[int, int]) -> Tuple[
         torch.Tensor, torch.Tensor]:
@@ -402,33 +392,3 @@ class BatchedTableDecoderV3:
         out_cls = torch.stack(out_cls) if out_cls else torch.empty(0, device=device)
         out_coord = torch.stack(out_coord) if out_coord else torch.empty(0, device=device)
         return out_cls, out_coord
-
-    def _compact_batch(self, state: BatchState, alive_idx: torch.Tensor):
-        """
-        In-place compaction of all per-sequence state tensors after some sequences are finished.
-        Keeps only sequences indexed by alive_idx.
-        """
-        # Basic batch vars
-        state.decoded_tags = state.decoded_tags.index_select(1, alive_idx)
-        state.lengths = state.lengths.index_select(0, alive_idx)
-        state.finished = state.finished.index_select(0, alive_idx)
-        state.first_lcel = state.first_lcel.index_select(0, alive_idx)
-        state.skip_next = state.skip_next.index_select(0, alive_idx)
-
-        # Cache: [num_layers, B, ...]
-        if state.cache is not None:
-            state.cache = state.cache.index_select(1, alive_idx)
-
-        # BBox head ragged buffers
-        # Keep only entries where sample_id is still alive
-        old_to_new = {int(old.item()): i for i, old in enumerate(alive_idx)}
-        new_H_flat = []
-        new_sample_ids = []
-        for hid, sid in zip(state.tag_H_flat, state.tag_H_sample_ids):
-            if sid in old_to_new:
-                new_H_flat.append(hid)
-                new_sample_ids.append(old_to_new[sid])
-        state.tag_H_flat = new_H_flat
-        state.tag_H_sample_ids = new_sample_ids
-
-        return state

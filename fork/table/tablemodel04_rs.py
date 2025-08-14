@@ -16,7 +16,7 @@ from fork.timers import _CPUTimer, _CudaTimer
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
 from fork.table.transformer_rs import Tag_Transformer
-from fork.table.batched_decoder_v2 import BatchedTableDecoderV2
+from fork.table.batched_decoder_v3 import BatchedTableDecoder
 
 LOG_LEVEL = logging.WARN
 
@@ -109,21 +109,16 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._skip_ids = torch.stack([self._ids[n] for n in _skip_names if n in self._ids]) \
             if any(n in self._ids for n in _skip_names) else torch.empty(0, dtype=torch.long, device=device)
 
-        self._batched_decoder = BatchedTableDecoderV2(self, self._device)
+        self._batched_decoder = BatchedTableDecoder(self, self._device)
 
-        # Enable fast kernels where safe
         if device == 'cuda':
-            # Don't enable benchmark globally - it interferes with CUDA Graphs!
-            # torch.backends.cudnn.benchmark = True  # REMOVED - causes slowdown with graphs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision("high")  # Ampere+ only
 
-        # Optimization 8: Optionally disable gradients globally for inference
         if os.getenv("DISABLE_GRAD", "1") == "1":
             torch.set_grad_enabled(False)
 
-        # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
     def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
