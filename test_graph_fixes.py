@@ -32,7 +32,7 @@ def test_correctness():
     
     # Import the decoder (assuming it's available)
     try:
-        from fork.table.batched_decoder_v2 import BatchedTableDecoderV2
+        from fork.table.batched_decoder import BatchedTableDecoderV2
         
         # Mock model for testing
         class MockModel:
@@ -163,7 +163,7 @@ def test_performance():
     print("\\n=== Testing Performance ===")
     
     try:
-        from fork.table.batched_decoder_v2 import BatchedTableDecoderV2
+        from fork.table.batched_decoder import BatchedTableDecoderV2
         
         # Create a more realistic mock for performance testing
         # (This would need actual model components in real testing)
