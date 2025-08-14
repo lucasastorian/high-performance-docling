@@ -1,5 +1,14 @@
 import torch
+import os
 from typing import List, Dict, Tuple
+
+
+class _GraphBlock:
+    """Manages a single captured CUDA graph for U-step blocks"""
+    def __init__(self, U: int):
+        self.U = U
+        self.graph = None
+        self.pool = None
 
 
 class BatchedTableDecoder:
@@ -45,6 +54,10 @@ class BatchedTableDecoder:
             skip_lut[self.skip_ids] = True
         self.emit_lut = emit_lut  # Store as attribute
         self.skip_lut = skip_lut
+        
+        # Block graph infrastructure for CUDA graph capture
+        self._graphs = {}  # Dict[(B_bucket, U) -> _GraphBlock]
+        self._static = None  # Static tensors for graph capture
 
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
@@ -55,6 +68,435 @@ class BatchedTableDecoder:
         except ValueError:
             return seq_list
 
+    def _allocate_static(self, B_bucket: int):
+        """Allocate static tensors for graph capture at given B_bucket size"""
+        device = self.device
+        tt = self.tt
+        Tmax = self.model._max_pred_len
+        hidden_dim = tt._decoder_dim
+        D = tt._embedding.embedding_dim
+        
+        S = {}
+        S['B_bucket'] = B_bucket
+        S['B_active'] = B_bucket
+        S['Tmax'] = Tmax
+        S['hidden_dim'] = hidden_dim
+        S['D'] = D
+        
+        # Core sequence state
+        S['decoded_tags'] = torch.full((Tmax + 1, B_bucket), self.end_id.item(), dtype=torch.long, device=device)
+        S['tgt_emb_buf'] = torch.empty(Tmax + 1, B_bucket, D, device=device)
+        
+        # Per-row state tracking
+        S['lengths'] = torch.zeros(B_bucket, dtype=torch.int32, device=device)
+        S['finished'] = torch.zeros(B_bucket, dtype=torch.bool, device=device)
+        S['first_lcel'] = torch.ones(B_bucket, dtype=torch.bool, device=device)
+        S['skip_next'] = torch.ones(B_bucket, dtype=torch.bool, device=device)
+        S['prev_ucel'] = torch.zeros(B_bucket, dtype=torch.bool, device=device)
+        S['line_num'] = torch.zeros(B_bucket, dtype=torch.long, device=device)
+        
+        # BBox tracking
+        S['tag_H_buffer'] = torch.empty(B_bucket, Tmax, hidden_dim, device=device)
+        S['tag_H_flat'] = S['tag_H_buffer'].view(B_bucket * Tmax, hidden_dim)
+        S['tag_H_counts'] = torch.zeros(B_bucket, dtype=torch.long, device=device)
+        
+        # Span tracking
+        S['open_span_start'] = torch.full((B_bucket,), -1, dtype=torch.long, device=device)
+        S['span_starts'] = torch.full((B_bucket, Tmax), -1, dtype=torch.long, device=device)
+        S['span_ends'] = torch.full((B_bucket, Tmax), -1, dtype=torch.long, device=device)
+        S['span_counts'] = torch.zeros(B_bucket, dtype=torch.long, device=device)
+        
+        # Constants and indexing helpers
+        S['B_idx'] = torch.arange(B_bucket, device=device)
+        S['row_base'] = S['B_idx'] * Tmax
+        S['ones_B'] = torch.ones(B_bucket, dtype=torch.long, device=device)
+        S['zeros_B'] = torch.zeros(B_bucket, dtype=torch.bool, device=device)
+        S['ones_B_bool'] = torch.ones(B_bucket, dtype=torch.bool, device=device)
+        S['neg_ones_B'] = torch.full((B_bucket,), -1, dtype=torch.long, device=device)
+        
+        # Step tracking and control (device scalars)
+        S['t'] = torch.zeros(1, dtype=torch.int32, device=device)
+        S['finished_all_d'] = torch.zeros(1, dtype=torch.uint8, device=device)
+        S['t0'] = 0  # Host-side time base for blocks (no device syncs)
+        
+        # Memory placeholders (will be filled during input loading)
+        S['mem_enc'] = None  # Will be allocated based on actual input size
+        S['mem_kv'] = None   # Precomputed memory K/V
+        S['enc_out_batch'] = None  # Will be allocated based on actual input
+        S['sa_kv'] = None    # Self-attention KV cache
+        
+        self._static = S
+
+    def _static_load_dummy(self):
+        """Load dummy data for warmup before graph capture"""
+        S = self._static
+        device = self.device
+        tt = self.tt
+        B_bucket = S['B_bucket']
+        Tmax = S['Tmax']
+        D = S['D']
+        hidden_dim = S['hidden_dim']
+        
+        # Create minimal dummy memory if not allocated
+        if S['mem_enc'] is None:
+            S['mem_enc'] = torch.zeros(10, B_bucket, D, device=device)  # Dummy [S=10, B_bucket, D]
+        
+        # Create dummy encoder outputs if not allocated
+        if S['enc_out_batch'] is None:
+            S['enc_out_batch'] = torch.zeros(B_bucket, 256, 28, 28, device=device)  # Dummy NCHW
+        
+        # Initialize with start tokens for all positions
+        S['decoded_tags'].fill_(self.end_id.item())
+        S['decoded_tags'][0] = self.start_id
+        
+        # Reset all state - mark all as finished for warmup
+        for k in ['lengths', 'tag_H_counts', 'span_counts', 'line_num']:
+            S[k].zero_()
+        
+        S['finished'].fill_(True)  # All finished for warmup
+        S['first_lcel'].fill_(True)
+        S['skip_next'].fill_(True)
+        S['prev_ucel'].zero_()
+        
+        S['open_span_start'].fill_(-1)
+        S['span_starts'].fill_(-1)
+        S['span_ends'].fill_(-1)
+        
+        S['t'].zero_()
+        S['t0'] = 0
+        S['finished_all_d'].zero_()
+        
+        # Initialize dummy embeddings
+        pe = tt._positional_encoding.pe
+        start_tokens = S['decoded_tags'][0]
+        pos_idx = torch.zeros(B_bucket, dtype=torch.long, device=device)
+        pos_vec = self._pe_gather_bD(pe, pos_idx)
+        S['tgt_emb_buf'][0] = tt._embedding(start_tokens) + pos_vec
+        
+        # Precompute dummy memory K/V
+        S['mem_kv'] = tt.precompute_mem_kv(S['mem_enc']) if hasattr(tt, 'precompute_mem_kv') else None
+
+    def _static_load_inputs(self, enc_out_batch: torch.Tensor, mem_enc: torch.Tensor, Tmax: int, B_actual: int):
+        """Load inputs into static tensors and reset state"""
+        S = self._static
+        device = self.device
+        tt = self.tt
+        
+        # Allocate memory tensors if needed or resize if different
+        S_mem, B_mem, D_mem = mem_enc.shape
+        if S['mem_enc'] is None or S['mem_enc'].shape != (S_mem, S['B_bucket'], D_mem):
+            S['mem_enc'] = torch.empty(S_mem, S['B_bucket'], D_mem, device=device, dtype=mem_enc.dtype)
+        
+        # Copy memory (front slice if B_actual < B_bucket)
+        S['mem_enc'][:, :B_actual].copy_(mem_enc)
+        
+        # Allocate encoder output if needed
+        if S['enc_out_batch'] is None or S['enc_out_batch'].shape[0] != S['B_bucket']:
+            S['enc_out_batch'] = torch.empty(S['B_bucket'], *enc_out_batch.shape[1:], device=device, dtype=enc_out_batch.dtype)
+        
+        # Copy encoder outputs (front slice)
+        S['enc_out_batch'][:B_actual].copy_(enc_out_batch)
+        
+        # Reset all state tensors
+        S['decoded_tags'].fill_(self.end_id.item())
+        S['decoded_tags'][0, :B_actual] = self.start_id
+        
+        # Reset counters and flags
+        for k in ['lengths', 'tag_H_counts', 'span_counts', 'line_num']:
+            S[k].zero_()
+        
+        S['finished'].zero_()
+        S['first_lcel'].fill_(True)
+        S['skip_next'].fill_(True)
+        S['prev_ucel'].zero_()
+        
+        S['open_span_start'].fill_(-1)
+        S['span_starts'].fill_(-1)
+        S['span_ends'].fill_(-1)
+        
+        S['t'].zero_()
+        S['finished_all_d'].zero_()
+        S['t0'] = 0  # Reset host time base
+        S['B_active'] = B_actual
+        
+        # Rebuild indexing for actual batch size
+        S['B_idx'] = torch.arange(B_actual, device=device)
+        S['row_base'] = S['B_idx'] * S['Tmax']
+        
+        # Precompute memory K/V outside graph
+        S['mem_kv'] = tt.precompute_mem_kv(S['mem_enc']) if hasattr(tt, 'precompute_mem_kv') else None
+        
+        # Initialize first step embeddings for actual batch
+        pe = tt._positional_encoding.pe
+        start_row = S['decoded_tags'][0, :B_actual]
+        pos_idx = torch.zeros(B_actual, dtype=torch.long, device=device)
+        pos_vec = self._pe_gather_bD(pe, pos_idx)
+        S['tgt_emb_buf'][0, :B_actual] = tt._embedding(start_row) + pos_vec
+        
+        # Preset padded rows to finished state for graph capture
+        if B_actual < S['B_bucket']:
+            S['finished'][B_actual:] = True
+            S['lengths'][B_actual:] = 0
+            S['tag_H_counts'][B_actual:] = 0
+            S['span_counts'][B_actual:] = 0
+
+    def _pe_gather_bD(self, pe: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Gather PE rows by per-sample positions -> [B, D]"""
+        idx = idx.to(torch.long)
+        out = pe.index_select(0, idx)
+        if out.dim() == 3:
+            out = out.squeeze(1)
+        return out.contiguous()
+
+    def _ar_block_advance_U(self, U: int):
+        """Advance AR state by exactly U steps with no host syncs or allocations"""
+        S = self._static
+        tt = self.tt
+        device = self.device
+        
+        # Alias for readability
+        B_bucket = S['B_bucket']  # Use full bucket, not B_active
+        Tmax = S['Tmax']
+        emit_lut = self.emit_lut
+        skip_lut = self.skip_lut
+        t0 = S['t0']  # Host time base - no device syncs
+        
+        for i in range(U):
+            t = t0 + i  # Host arithmetic only
+            
+            # Forward pass
+            last_H, _, S['sa_kv'] = tt.step_fullprefix(
+                t, S['tgt_emb_buf'], memory=S['mem_enc'], cache=None, 
+                memory_kv=S['mem_kv'], sa_kv_cache=S['sa_kv'], max_pred_len=Tmax
+            )
+            
+            # Get token logits and predictions
+            logits = tt._fc(last_H)  # [B_bucket, V] - full bucket
+            new_tags = logits.argmax(dim=1)  # [B_bucket]
+            
+            # Structure corrections - use full bucket
+            if self.xcel_id is not None and self.lcel_id is not None:
+                mask_first_line = (S['line_num'] == 0) & (new_tags == self.xcel_id)
+                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B_bucket), new_tags)
+            
+            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
+                mask_ucel_lcel = S['prev_ucel'] & (new_tags == self.lcel_id)
+                new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B_bucket), new_tags)
+            
+            # Force <end> for finished sequences (includes padded rows)
+            new_tags = torch.where(S['finished'], self.end_id.expand(B_bucket), new_tags)
+            
+            # Write token to buffer
+            S['t'].add_(1)  # Increment step counter on device
+            t_next = t + 1
+            S['decoded_tags'][t_next] = new_tags  # Full bucket write
+            
+            # Position and length tracking - full bucket
+            active_prev = ~S['finished']  # [B_bucket]
+            pos_idx = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
+            pos_idx = pos_idx.clamp_max(tt._positional_encoding.pe.size(0) - 1).to(torch.long)
+            
+            # Update embedding for next step (if not last step in block)
+            if t_next < Tmax:
+                pos_vec = self._pe_gather_bD(tt._positional_encoding.pe, pos_idx)
+                S['tgt_emb_buf'][t_next] = tt._embedding(new_tags) + pos_vec  # Full bucket
+            
+            # Update lengths - full bucket
+            S['lengths'] = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
+            
+            # Update finished status - full bucket
+            newly_finished = (new_tags == self.end_id)
+            S['finished'] = S['finished'] | newly_finished
+            
+            # BBox emission with efficient indexing - full bucket
+            m_emit_bbox = (~S['skip_next']) & emit_lut[new_tags] & (~S['finished'])
+            
+            if self.lcel_id is not None:
+                m_is_lcel = (new_tags == self.lcel_id)
+            else:
+                m_is_lcel = S['zeros_B']
+            
+            m_first_lcel = S['first_lcel'] & m_is_lcel & (~S['finished'])
+            
+            # Efficient bbox feature collection - full bucket
+            append_mask = m_emit_bbox | m_first_lcel
+            valid_store = append_mask & (S['tag_H_counts'] < Tmax)
+            
+            # Per-row indexed write for tag_H_buffer - full bucket
+            dest_col = S['tag_H_counts'].clamp_max(Tmax - 1)
+            flat_idx = S['row_base'] + dest_col
+            old_vals = S['tag_H_flat'].index_select(0, flat_idx)
+            src = torch.where(valid_store.unsqueeze(1), last_H, old_vals)
+            S['tag_H_flat'].index_copy_(0, flat_idx, src)
+            
+            # Span tracking - full bucket
+            start_mask = m_first_lcel & valid_store
+            S['open_span_start'] = torch.where(start_mask, S['tag_H_counts'], S['open_span_start'])
+            
+            end_mask = m_emit_bbox & (~m_first_lcel) & valid_store & (S['open_span_start'] >= 0)
+            span_capacity_mask = S['span_counts'] < Tmax
+            valid_end_mask = end_mask & span_capacity_mask
+            
+            # Efficient span storage - full bucket
+            span_pos = S['span_counts'].clamp_max(Tmax - 1)
+            span_flat_idx = S['row_base'] + span_pos
+            
+            span_starts_flat = S['span_starts'].view(-1)
+            old_starts = span_starts_flat.index_select(0, span_flat_idx)
+            new_starts = torch.where(valid_end_mask, S['open_span_start'], old_starts)
+            span_starts_flat.index_copy_(0, span_flat_idx, new_starts)
+            
+            span_ends_flat = S['span_ends'].view(-1)
+            old_ends = span_ends_flat.index_select(0, span_flat_idx)
+            new_ends = torch.where(valid_end_mask, S['tag_H_counts'], old_ends)
+            span_ends_flat.index_copy_(0, span_flat_idx, new_ends)
+            
+            # Update counters - full bucket
+            S['span_counts'] = S['span_counts'] + valid_end_mask.to(S['span_counts'].dtype)
+            S['open_span_start'] = torch.where(end_mask, S['neg_ones_B'], S['open_span_start'])
+            S['tag_H_counts'] = S['tag_H_counts'] + valid_store.to(S['tag_H_counts'].dtype)
+            
+            # Update flags - full bucket
+            S['first_lcel'] = torch.where(m_is_lcel, S['zeros_B'], S['ones_B_bool'])
+            S['skip_next'] = skip_lut[new_tags]
+            S['prev_ucel'] = (new_tags == self.ucel_id) if self.ucel_id is not None else S['zeros_B']
+            
+            if self.nl_id is not None:
+                S['line_num'] += (new_tags == self.nl_id).to(S['line_num'].dtype)
+        
+        # At end of block, compute finished_all on device (no .item()!)
+        S['finished_all_d'].copy_(S['finished'].all().to(torch.uint8))
+
+    def _ensure_block_graph(self, B_bucket: int, U: int) -> _GraphBlock:
+        """Ensure we have a captured graph for the given (B_bucket, U) configuration"""
+        key = (B_bucket, U)
+        gb = self._graphs.get(key)
+        if gb and gb.graph:
+            return gb
+        
+        # Allocate static buffers for this B_bucket
+        if self._static is None or self._static['B_bucket'] != B_bucket:
+            self._allocate_static(B_bucket)
+        
+        # Load dummy data for warmup and capture
+        self._static_load_dummy()
+        
+        # Warmup with eager execution to settle kernels
+        for _ in range(3):
+            self._ar_block_advance_U(U)
+        
+        # Create and capture the graph
+        gb = _GraphBlock(U)
+        gb.pool = torch.cuda.graphs.graph_pool_handle()
+        g = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        
+        with torch.cuda.graph(g, pool=gb.pool):
+            self._ar_block_advance_U(U)
+        
+        gb.graph = g
+        self._graphs[key] = gb
+        return gb
+
+    def _set_block_time_base(self, t0: int):
+        """Set the host time base for the next block capture/replay"""
+        if self._static is not None:
+            self._static['t0'] = t0
+
+    def _should_compact(self) -> bool:
+        """Check if we should compact active rows (simple heuristic)"""
+        if self._static is None:
+            return False
+        S = self._static
+        # Compact if active batch drops to half the bucket size
+        active_count = (~S['finished'][:S['B_active']]).sum().item()
+        return active_count <= S['B_bucket'] // 2 and S['B_bucket'] > 8
+
+    def _compact_active_rows(self) -> int:
+        """Compact active rows and return new B_active"""
+        S = self._static
+        active = (~S['finished'][:S['B_active']]).nonzero(as_tuple=False).squeeze(-1)
+        B_active = active.numel()
+        
+        if B_active == S['B_active']:
+            return B_active
+        
+        # Helper functions for row-wise selection
+        def take1D(buf):
+            return buf.index_select(0, active)
+        
+        def take2D(buf):
+            return buf.index_select(0, active)
+        
+        # Compact all per-row state
+        for name in ['lengths', 'finished', 'first_lcel', 'skip_next', 'prev_ucel', 'line_num',
+                     'tag_H_counts', 'open_span_start', 'span_counts']:
+            S[name] = take1D(S[name])
+        
+        for name in ['span_starts', 'span_ends', 'tag_H_buffer']:
+            S[name] = take2D(S[name])
+        
+        # Update derived tensors
+        S['tag_H_flat'] = S['tag_H_buffer'].view(B_active * S['Tmax'], S['hidden_dim'])
+        S['B_active'] = B_active
+        
+        # Recompute indexing helpers
+        S['B_idx'] = torch.arange(B_active, device=self.device)
+        S['row_base'] = S['B_idx'] * S['Tmax']
+        
+        # Update reusable tensors to match new size
+        S['ones_B'] = torch.ones(B_active, dtype=torch.long, device=self.device)
+        S['zeros_B'] = torch.zeros(B_active, dtype=torch.bool, device=self.device)
+        S['ones_B_bool'] = torch.ones(B_active, dtype=torch.bool, device=self.device)
+        S['neg_ones_B'] = torch.full((B_active,), -1, dtype=torch.long, device=self.device)
+        
+        return B_active
+
+    def _materialize_outputs(self) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
+        """Convert static tensors to final output format"""
+        S = self._static
+        device = self.device
+        B_active = S['B_active']
+        t_final = S['t'].item()
+        end_id_int = self.end_id.item()
+        
+        # Trim sequences to actual length
+        seqs = []
+        for b in range(B_active):
+            seq_len = min(t_final + 1, S['lengths'][b].item() + 1)
+            seq = self._trim_sequence(S['decoded_tags'][:seq_len, b], end_id_int)
+            seqs.append(seq)
+        
+        # Get tag_H_counts for bbox processing
+        tag_H_counts_cpu = S['tag_H_counts'].cpu()
+        
+        # Process bbox outputs
+        outputs = []
+        for b in range(B_active):
+            count = tag_H_counts_cpu[b].item()
+            
+            if self.model._bbox and count > 0:
+                tag_H_tensor = S['tag_H_buffer'][b, :count].contiguous()
+                enc_nchw = S['enc_out_batch'][b:b + 1]
+                
+                if isinstance(tag_H_tensor, torch.Tensor):
+                    cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_tensor)
+                else:
+                    tag_H_list = [tag_H_tensor[i:i + 1] for i in range(count)]
+                    cls_logits, coords = self.model._bbox_decoder.inference(enc_nchw, tag_H_list)
+            else:
+                cls_logits = torch.empty(0, device=device)
+                coords = torch.empty(0, device=device)
+            
+            # GPU-based span merging
+            merged_cls, merged_coord = self._merge_spans_gpu(
+                cls_logits, coords,
+                S['span_starts'][b], S['span_ends'][b], S['span_counts'][b]
+            )
+            outputs.append((seqs[b], merged_cls, merged_coord))
+        
+        return outputs
+
     @torch.inference_mode()
     def predict_batched(
             self,
@@ -62,274 +504,52 @@ class BatchedTableDecoder:
             mem_enc: torch.Tensor,  # [S,B,D] encoder memory (precomputed, no duplicate processing)
             max_steps: int
     ) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
-        device = self.device
-        tt = self.tt
+        """
+        Block graph approach: capture U-step blocks, replay with early exit between blocks
+        """
         B = enc_out_batch.size(0)
-
-        # Clamp to model's max
         Tmax = min(max_steps, self.model._max_pred_len)
-
-        # ---- Preallocate all buffers (Fix B: avoid reallocation) ----
-        decoded_tags = torch.full((Tmax + 1, B), self.end_id.item(), dtype=torch.long, device=device)
-        decoded_tags[0, :] = self.start_id
-
-        # Device-only state tracking
-        lengths = torch.zeros(B, dtype=torch.int32, device=device)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
-        first_lcel = torch.ones(B, dtype=torch.bool, device=device)
-        skip_next = torch.ones(B, dtype=torch.bool, device=device)
-        prev_ucel = torch.zeros(B, dtype=torch.bool, device=device)
-        line_num = torch.zeros(B, dtype=torch.long, device=device)
-        # bbox_ind removed - using tag_H_counts instead
-
-        # GPU-only bbox tracking with preallocated buffers
-        # Worst case: every token emits bbox = Tmax emissions per sample
-        hidden_dim = tt._decoder_dim  # This is an attribute of Tag_Transformer, not the decoder!
-        # Defer buffer creation until we know the dtype from last_H
-        tag_H_buffer = None
-        tag_H_flat = None
-        tag_H_counts = torch.zeros(B, dtype=torch.long, device=device)  # [B] count per sample
-
-        # Span tracking on GPU - allocate more capacity (Tmax instead of Tmax//2)
-        open_span_start = torch.full((B,), -1, dtype=torch.long, device=device)  # [B]
-        # Allocate Tmax spans per sample (safe, won't overflow)
-        span_starts = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
-        span_ends = torch.full((B, Tmax), -1, dtype=torch.long, device=device)
-        span_counts = torch.zeros(B, dtype=torch.long, device=device)
-
-        # Drop bbox_ind - just use tag_H_counts (they're identical)
-
-        # Use pre-built LUTs from __init__
-        emit_lut = self.emit_lut
-        skip_lut = self.skip_lut
-
-        # Preallocate fixed-shape tensors for graph capture
-        B_idx = torch.arange(B, device=device)  # [B] for indexing
-        ones_B = torch.ones(B, dtype=torch.long, device=device)  # [B] reusable ones
-        zeros_B = torch.zeros(B, dtype=torch.bool, device=device)  # [B] reusable zeros
-        ones_B_bool = torch.ones(B, dtype=torch.bool, device=device)  # [B] reusable bool ones
-        neg_ones_B = torch.full((B,), -1, dtype=torch.long, device=device)  # [B] reusable -1s
         
-        # Efficient indexing: precompute row base offsets for flat indexing
-        row_base = B_idx * Tmax  # [B] base offset for each row in flattened view
-
-        # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
-        D = tt._embedding.embedding_dim
-        tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
-        pe = tt._positional_encoding.pe  # could be [L, D] OR [L, 1, D]
-
-        def pe_gather_bD(pe: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-            """
-            Gather PE rows by per-sample positions -> [B, D], regardless of pe's rank.
-            idx must be Long on CUDA.
-            """
-            idx = idx.to(torch.long)
-            out = pe.index_select(0, idx)  # [B, D] or [B,1,D]
-            if out.dim() == 3:  # common case: [B,1,D]
-                out = out.squeeze(1)  # -> [B, D]
-            return out.contiguous()
-
-        # Initialize first step with start tokens (per-sample position indexing)
-        start_row = decoded_tags[0, :]  # [B] start tokens
-        pos_idx = torch.zeros(B, dtype=torch.long, device=device)  # [B] all zeros
-        pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
-        tgt_emb_buf[0] = tt._embedding(start_row) + pos_vec  # [B, D]
-
-        # Track current step
-        t = 0
-        # Checkpoint B: Switch to incremental mode (no tag cache)
-        sa_kv_cache = None  # KV cache for all layers
-
-        # Step 4: Precompute cross-attention memory K/V once
-        USE_MEM_KV = True  # set False to disable the custom path
-        mem_kv = tt.precompute_mem_kv(mem_enc) if USE_MEM_KV else None
-
-        for step in range(Tmax):
-            # Use step_fullprefix wrapper - now always incremental (Checkpoint C)
-            # Pass max_pred_len for optimal KV cache sizing
-            last_H, _, sa_kv_cache = tt.step_fullprefix(
-                t, tgt_emb_buf, memory=mem_enc, cache=None, memory_kv=mem_kv,
-                sa_kv_cache=sa_kv_cache, max_pred_len=Tmax
-            )
-
-            # Create tag_H_buffer with correct dtype on first iteration
-            if tag_H_buffer is None:
-                tag_H_buffer = torch.empty(B, Tmax, hidden_dim, device=device, dtype=last_H.dtype)
-                tag_H_flat = tag_H_buffer.view(B * Tmax, hidden_dim)
-
-            logits = tt._fc(last_H)  # [B,V]
-            new_tags = logits.argmax(dim=1)  # [B] Long
-
-            # ---- Structure corrections (all on GPU) ----
-            if self.xcel_id is not None and self.lcel_id is not None:
-                mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
-                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
-
-            # For ucel->lcel correction, check prev_ucel from PREVIOUS step
-            if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
-                mask_ucel_lcel = prev_ucel & (new_tags == self.lcel_id)
-                new_tags = torch.where(mask_ucel_lcel, self.fcel_id.expand(B), new_tags)
-
-            # Force <end> for already finished sequences
-            new_tags = torch.where(finished, self.end_id.expand(B), new_tags)
-
-            # Write to preallocated buffer
-            t += 1
-            decoded_tags[t, :] = new_tags
-
-            # 1) Decide which samples were active BEFORE this step's token
-            #    (i.e., they were not already finished)
-            active_prev = ~finished  # [B]  -- use the old 'finished' from BEFORE this step
-
-            # 2) Assign the position for the token we just emitted:
-            #    - Active sequences advance by +1 (first real token goes to PE[1], etc.)
-            #    - Previously-finished sequences DO NOT advance (they keep their last pos)
-            pos_idx = torch.where(active_prev, lengths + 1, lengths)  # int32
-            pos_idx = pos_idx.clamp_max(pe.size(0) - 1).to(torch.long)  # bounds + dtype
-            pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
-
-            # Update incremental embedding buffer for next step
-            if t < Tmax:  # Only if we'll do another step
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
-
-            # 3) Now actually advance lengths for sequences that were active
-            lengths = torch.where(active_prev, lengths + 1, lengths)
-
-            # 4) Only AFTER embedding & length update, mark newly-finished for next step
-            newly_finished = (new_tags == self.end_id)
-            finished = finished | newly_finished
-
-            # No early exit - keep computing for graph capture compatibility
-
-            # ---- BBox emission decisions (TRULY NO SYNCS!) ----
-            # Use LUT for fast membership (no isin!)
-            m_emit_bbox = (~skip_next) & emit_lut[new_tags] & (~finished)
-
-            # Fix: Proper boolean handling for m_is_lcel
-            if self.lcel_id is not None:
-                m_is_lcel = (new_tags == self.lcel_id)
-            else:
-                m_is_lcel = zeros_B
-
-            m_first_lcel = first_lcel & m_is_lcel & (~finished)
-
-            # Collect bbox features with efficient per-row index_copy_
-            append_mask = m_emit_bbox | m_first_lcel
-            positions = tag_H_counts  # [B]
-            valid_store = append_mask & (positions < Tmax) & (~finished)  # Bounds check
-
-            # Efficient per-row indexed write - O(B*D) not O(B*Tmax*D)
-            dest_col = tag_H_counts.clamp_max(Tmax - 1)  # [B] current column position
-            flat_idx = row_base + dest_col  # [B] flat indices for each row's write position
+        # Block size from environment or default
+        U = int(os.getenv("AR_BLOCK_STEPS", "32"))
+        num_blocks = (Tmax + U - 1) // U
+        
+        # Choose B bucket (powers of two for better graph reuse)
+        B_bucket = 1 << (B - 1).bit_length()  # next power of 2
+        
+        # Ensure we have a captured graph for this configuration
+        gb = self._ensure_block_graph(B_bucket, U)
+        
+        # Load inputs into static tensors and reset state
+        self._static_load_inputs(enc_out_batch, mem_enc, Tmax, B)
+        
+        # Block-wise replay with early exit between blocks
+        t0 = 0
+        for blk in range(num_blocks):
+            # Set host time base for this block
+            self._set_block_time_base(t0)
             
-            # Build source that preserves old values for rows we don't want to write
-            old_vals = tag_H_flat.index_select(0, flat_idx)  # [B, D] current values
-            src = torch.where(valid_store.unsqueeze(1), last_H, old_vals)  # [B, D]
+            # Replay the captured graph for U steps
+            gb.graph.replay()
             
-            # Fixed-size copy for all B rows (touches only B*D elements, not B*Tmax*D)
-            tag_H_flat.index_copy_(0, flat_idx, src)
-
-            # Span tracking with efficient per-row index_copy_
-            start_mask = m_first_lcel & valid_store  # [B]
-            open_span_start = torch.where(start_mask, tag_H_counts, open_span_start)
-
-            # Span ends with efficient indexing
-            end_mask = m_emit_bbox & (~m_first_lcel) & valid_store & (open_span_start >= 0)  # [B]
-            span_capacity_mask = span_counts < Tmax  # [B]
-            valid_end_mask = end_mask & span_capacity_mask  # [B]
-
-            # Efficient span storage using flat indexing - O(B) not O(B*Tmax)
-            span_pos = span_counts.clamp_max(Tmax - 1)  # [B]
-            span_flat_idx = row_base + span_pos  # [B] reuse row_base concept for spans
+            # Advance host time base
+            t0 += U
             
-            # Update span starts
-            span_starts_flat = span_starts.view(-1)  # [B*Tmax]
-            old_starts = span_starts_flat.index_select(0, span_flat_idx)  # [B]
-            new_starts = torch.where(valid_end_mask, open_span_start, old_starts)  # [B]
-            span_starts_flat.index_copy_(0, span_flat_idx, new_starts)
+            # Check if all sequences finished (device->host sync)
+            finished_all = bool(self._static['finished_all_d'].item())
+            if finished_all:
+                break
             
-            # Update span ends
-            span_ends_flat = span_ends.view(-1)  # [B*Tmax]
-            old_ends = span_ends_flat.index_select(0, span_flat_idx)  # [B]
-            new_ends = torch.where(valid_end_mask, tag_H_counts, old_ends)  # [B]
-            span_ends_flat.index_copy_(0, span_flat_idx, new_ends)
-            
-            # Increment span counts with masked addition (fixed-size)
-            span_counts = span_counts + valid_end_mask.to(span_counts.dtype)
-
-            # Close spans (reset to -1) using masked assignment
-            open_span_start = torch.where(end_mask, neg_ones_B, open_span_start)
-
-            # Counters: increment with masked addition (fixed-shape)
-            tag_H_counts = tag_H_counts + valid_store.to(tag_H_counts.dtype)
-
-            # ---- Update flags (all on GPU) ----
-            # Reset first_lcel=True on every non-lcel step (matches serial semantics)
-            first_lcel = torch.where(m_is_lcel, zeros_B, ones_B_bool)
-
-            # Update skip_next using LUT (no isin!)
-            skip_next = skip_lut[new_tags]
-
-            # Update prev_ucel for NEXT iteration
-            prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else zeros_B
-
-            # Update line number
-            if self.nl_id is not None:
-                line_num += (new_tags == self.nl_id).to(line_num.dtype)
-
-        # ---- Check for overflow AFTER loop (single sync, not per-token!) ----
-        if __debug__:
-            if (tag_H_counts > Tmax).any():
-                raise RuntimeError(f"tag_H_counts overflow: max={tag_H_counts.max().item()} > {Tmax}")
-            if (span_counts > span_starts.size(1)).any():
-                raise RuntimeError(f"span buffer overflow: max={span_counts.max().item()} > {span_starts.size(1)}")
-
-        # ---- Materialize outputs (SINGLE sync point after loop!) ----
-        # Trim sequences to actual length
-        end_id_int = self.end_id.item()
-        seqs = []
-        for b in range(B):
-            seq_len = min(t + 1, lengths[b].item() + 1)  # +1 for start token
-            seq = self._trim_sequence(decoded_tags[:seq_len, b], end_id_int)
-            seqs.append(seq)
-
-        # Keep everything on GPU as long as possible
-        # Only sync tag_H_counts to know how many hiddens per sample
-        tag_H_counts_cpu = tag_H_counts.cpu()
-
-        # ---- Per-table bbox head with tensor inputs ----
-        outputs = []
-        for b in range(B):
-            count = tag_H_counts_cpu[b].item()
-
-            if self.model._bbox and count > 0:
-                # Pass tensor directly (no list construction!)
-                tag_H_tensor = tag_H_buffer[b, :count].contiguous()  # [N, D] on device
-                enc_nchw = enc_out_batch[b:b + 1]  # [1, 256, 28, 28] NCHW
-
-                # Check type explicitly (no try/except overhead)
-                if isinstance(tag_H_tensor, torch.Tensor):
-                    cls_logits, coords = self.model._bbox_decoder.inference(
-                        enc_nchw, tag_H_tensor  # Pass tensor directly!
-                    )
-                else:
-                    # Should never hit this path with our GPU-only collection
-                    tag_H_list = [tag_H_tensor[i:i + 1] for i in range(count)]
-                    cls_logits, coords = self.model._bbox_decoder.inference(
-                        enc_nchw, tag_H_list
-                    )
-            else:
-                cls_logits = torch.empty(0, device=device)
-                coords = torch.empty(0, device=device)
-
-            # GPU-based span merging
-            merged_cls, merged_coord = self._merge_spans_gpu(
-                cls_logits, coords,
-                span_starts[b], span_ends[b], span_counts[b]
-            )
-            outputs.append((seqs[b], merged_cls, merged_coord))
-
-        return outputs
+            # Optional: compact active rows to smaller buckets
+            if self._should_compact():
+                new_B_active = self._compact_active_rows()
+                new_B_bucket = 1 << (new_B_active - 1).bit_length()
+                if new_B_bucket < B_bucket:
+                    B_bucket = new_B_bucket
+                    gb = self._ensure_block_graph(B_bucket, U)
+        
+        # Materialize final outputs (outside graph)
+        return self._materialize_outputs()
 
     def _merge_spans_gpu(
             self,
