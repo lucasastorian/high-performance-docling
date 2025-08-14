@@ -138,9 +138,7 @@ class BatchedTableDecoderV2:
 
         # Track current step
         t = 0
-        
-        # Step 1: Initialize cache as placeholder (no-op for now)
-        cache = [None] * len(tt._decoder.layers)  # Per-layer cache placeholders
+        cache = None
 
         # Step 4: Precompute cross-attention memory K/V once
         USE_MEM_KV = False  # set False to disable the custom path
