@@ -117,12 +117,23 @@ class BatchedTableDecoderV2:
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
         tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
-        pe = tt._positional_encoding.pe  # [max_len, D] positional encoding buffer
+        pe = tt._positional_encoding.pe  # could be [L, D] OR [L, 1, D]
+
+        def pe_gather_bD(pe: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            """
+            Gather PE rows by per-sample positions -> [B, D], regardless of pe's rank.
+            idx must be Long on CUDA.
+            """
+            idx = idx.to(torch.long)
+            out = pe.index_select(0, idx)  # [B, D] or [B,1,D]
+            if out.dim() == 3:             # common case: [B,1,D]
+                out = out.squeeze(1)       # -> [B, D]
+            return out.contiguous()
 
         # Initialize first step with start tokens (per-sample position indexing)
         start_row = decoded_tags[0, :]  # [B] start tokens
         pos_idx = torch.zeros(B, dtype=torch.long, device=device)  # [B] all zeros
-        pos_vec = pe.index_select(0, pos_idx)  # [B, D]
+        pos_vec = pe_gather_bD(pe, pos_idx)  # [B, D]
         tgt_emb_buf[0] = tt._embedding(start_row) + pos_vec  # [B, D]
 
         # Track current step
@@ -161,10 +172,11 @@ class BatchedTableDecoderV2:
 
             # Update incremental embedding buffer for next step (per-sample position indexing)
             if t < Tmax:  # Only if we'll do another step
-                # pos for *next* token = current lengths (how many tokens each sample has emitted so far)
-                pos_idx = lengths.clamp_max(pe.size(0) - 1)  # [B]
-                pos_vec = pe.index_select(0, pos_idx)  # [B, D]
-                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec  # [B, D]
+                # pos for next token per sample = current emitted length (don't advance finished)
+                next_pos_idx = torch.where(~finished, lengths + 0, lengths)  # int32 -> cast below
+                next_pos_idx = next_pos_idx.clamp_max(pe.size(0) - 1)        # stay in-bounds
+                pos_vec = pe_gather_bD(pe, next_pos_idx)                     # [B, D]
+                tgt_emb_buf[t] = tt._embedding(new_tags) + pos_vec           # [B, D]
 
             # Update lengths for non-finished sequences
             lengths = torch.where(~finished, lengths + 1, lengths)
