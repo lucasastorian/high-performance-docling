@@ -37,6 +37,17 @@ class BatchedTableDecoderV2:
             [wm[t] for t in skip_names if t in wm],
             device=device, dtype=torch.long
         )
+        
+        # Pre-build lookup tables for fast membership checks (no torch.isin!)
+        vocab_size = len(wm)
+        emit_lut = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        skip_lut = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        if self.emit_ids.numel() > 0:
+            emit_lut[self.emit_ids] = True
+        if self.skip_ids.numel() > 0:
+            skip_lut[self.skip_ids] = True
+        self.emit_lut = emit_lut  # Store as attribute
+        self.skip_lut = skip_lut
 
     def _trim_sequence(self, seq_tensor: torch.Tensor, end_id: int) -> List[int]:
         """Trim sequence to first <end> token"""
@@ -65,9 +76,6 @@ class BatchedTableDecoderV2:
         decoded_tags = torch.full((Tmax + 1, B), self.end_id.item(), dtype=torch.long, device=device)
         decoded_tags[0, :] = self.start_id
 
-        # Initialize span maps correctly - one dict per sample
-        span_maps: List[Dict[int, int]] = [dict() for _ in range(B)]
-
         # Device-only state tracking
         lengths = torch.zeros(B, dtype=torch.int32, device=device)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
@@ -79,7 +87,7 @@ class BatchedTableDecoderV2:
 
         # GPU-only bbox tracking with preallocated buffers
         # Worst case: every token emits bbox = Tmax emissions per sample
-        hidden_dim = tt._decoder._decoder_dim
+        hidden_dim = tt._decoder_dim  # This is an attribute of Tag_Transformer, not the decoder!
         # Defer buffer creation until we know the dtype from last_H
         tag_H_buffer = None
         tag_H_flat = None
@@ -94,17 +102,9 @@ class BatchedTableDecoderV2:
         
         # Drop bbox_ind - just use tag_H_counts (they're identical)
 
-        # Create lookup tables for fast membership checks (no isin!)
-        V = tt._fc.out_features  # vocab size
-        emit_lut = torch.zeros(V, dtype=torch.bool, device=device)
-        skip_lut = torch.zeros(V, dtype=torch.bool, device=device)
-        if self.emit_ids.numel() > 0:
-            emit_lut[self.emit_ids] = True
-        if self.skip_ids.numel() > 0:
-            skip_lut[self.skip_ids] = True
-        
-        # Precompute batch indices
-        batch_indices = torch.arange(B, device=device)
+        # Use pre-built LUTs from __init__
+        emit_lut = self.emit_lut
+        skip_lut = self.skip_lut
 
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
@@ -259,11 +259,13 @@ class BatchedTableDecoderV2:
             # Update line number
             if self.nl_id is not None:
                 line_num += (new_tags == self.nl_id).to(line_num.dtype)
-            
-            # Debug asserts for capacity overflow (only in debug mode)
-            if __debug__:
-                assert (tag_H_counts <= Tmax).all(), f"tag_H_counts overflow: max={tag_H_counts.max().item()}"
-                assert (span_counts <= span_starts.size(1)).all(), f"span buffer overflow: max={span_counts.max().item()}"
+
+        # ---- Check for overflow AFTER loop (single sync, not per-token!) ----
+        if __debug__:
+            if (tag_H_counts > Tmax).any():
+                raise RuntimeError(f"tag_H_counts overflow: max={tag_H_counts.max().item()} > {Tmax}")
+            if (span_counts > span_starts.size(1)).any():
+                raise RuntimeError(f"span buffer overflow: max={span_counts.max().item()} > {span_starts.size(1)}")
 
         # ---- Materialize outputs (SINGLE sync point after loop!) ----
         # Trim sequences to actual length
