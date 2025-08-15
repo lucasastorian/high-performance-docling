@@ -5,7 +5,6 @@
 import json
 import logging
 import math
-import statistics
 import numpy as np
 
 import docling_ibm_models.tableformer.settings as s
@@ -179,12 +178,12 @@ class MatchingPostProcessor:
             middles.append(x_middle)
 
         if len(lefts) > 0:
-            delta_left = max(lefts) - min(lefts)
-            delta_middle = max(middles) - min(middles)
-            delta_right = max(rights) - min(rights)
+            delta_left = np.max(lefts) - np.min(lefts)
+            delta_middle = np.max(middles) - np.min(middles)
+            delta_right = np.max(rights) - np.min(rights)
 
             deltas = [delta_left, delta_middle, delta_right]
-            align_index = deltas.index(min(deltas))
+            align_index = deltas.index(np.min(deltas))
             alignment = possible_alignments[align_index]
 
         return alignment
@@ -256,13 +255,14 @@ class MatchingPostProcessor:
                 self._log().debug(cell)
 
         if len(coords_x) > 0:
-            median_x = statistics.median(coords_x)
+            median_x = np.median(coords_x)
         if len(coords_y) > 0:
-            median_y = statistics.median(coords_y)
+            median_y = np.median(coords_y)
         if len(widths) > 0:
-            median_width = statistics.median(widths)
+            median_width = np.median(widths)
         if len(heights) > 0:
-            median_height = statistics.median(heights)
+            median_height = np.median(heights)
+
         return median_x, median_y, median_width, median_height
 
     def _move_cells_to_left_pos(
@@ -387,6 +387,7 @@ class MatchingPostProcessor:
         return clean_matches
 
     def _find_overlapping(self, table_cells):
+        # NOTE: Tried vectorizing - was actually slower...
 
         def correct_overlap(box1, box2):
             # Extract coordinates from the bounding boxes
@@ -394,8 +395,8 @@ class MatchingPostProcessor:
             x2_min, y2_min, x2_max, y2_max = box2["bbox"]
 
             # Calculate the overlap in both x and y directions
-            overlap_x = min(x1_max, x2_max) - max(x1_min, x2_min)
-            overlap_y = min(y1_max, y2_max) - max(y1_min, y2_min)
+            overlap_x = np.min(x1_max, x2_max) - np.max(x1_min, x2_min)
+            overlap_y = np.min(y1_max, y2_max) - np.max(y1_min, y2_min)
 
             # If there is no overlap, return the original boxes
             if overlap_x <= 0 or overlap_y <= 0:
@@ -425,46 +426,48 @@ class MatchingPostProcessor:
 
             # Will flip coordinates in proper order, if previous operations reversed it
             box1["bbox"] = [
-                min(box1["bbox"][0], box1["bbox"][2]),
-                min(box1["bbox"][1], box1["bbox"][3]),
-                max(box1["bbox"][0], box1["bbox"][2]),
-                max(box1["bbox"][1], box1["bbox"][3]),
+                np.min(box1["bbox"][0], box1["bbox"][2]),
+                np.min(box1["bbox"][1], box1["bbox"][3]),
+                np.max(box1["bbox"][0], box1["bbox"][2]),
+                np.max(box1["bbox"][1], box1["bbox"][3]),
             ]
             box2["bbox"] = [
-                min(box2["bbox"][0], box2["bbox"][2]),
-                min(box2["bbox"][1], box2["bbox"][3]),
-                max(box2["bbox"][0], box2["bbox"][2]),
-                max(box2["bbox"][1], box2["bbox"][3]),
+                np.min(box2["bbox"][0], box2["bbox"][2]),
+                np.min(box2["bbox"][1], box2["bbox"][3]),
+                np.max(box2["bbox"][0], box2["bbox"][2]),
+                np.max(box2["bbox"][1], box2["bbox"][3]),
             ]
 
             return box1, box2
 
-        table_cells = list(table_cells)
-        bboxes = np.array([c["bbox"] for c in table_cells], dtype=np.int32)
-        N = len(bboxes)
+        def do_boxes_overlap(box1, box2):
+            B1 = box1["bbox"]
+            B2 = box2["bbox"]
+            if (
+                (B1[0] >= B2[2])
+                or (B1[2] <= B2[0])
+                or (B1[3] <= B2[1])
+                or (B1[1] >= B2[3])
+            ):
+                return False
+            else:
+                return True
 
-        x1_min = bboxes[:, 0][:, None]
-        y1_min = bboxes[:, 1][:, None]
-        x1_max = bboxes[:, 2][:, None]
-        y1_max = bboxes[:, 3][:, None]
+        def find_overlapping_pairs_indexes(bboxes):
+            overlapping_indexes = []
+            # Compare each box with every other box (combinations)
+            for i in range(len(bboxes)):
+                for j in range(i + 1, len(bboxes)):
+                    if i != j:
+                        if bboxes[i] != bboxes[j]:
+                            if do_boxes_overlap(bboxes[i], bboxes[j]):
+                                bboxes[i], bboxes[j] = correct_overlap(
+                                    bboxes[i], bboxes[j]
+                                )
 
-        x2_min = bboxes[:, 0][None, :]
-        y2_min = bboxes[:, 1][None, :]
-        x2_max = bboxes[:, 2][None, :]
-        y2_max = bboxes[:, 3][None, :]
+            return overlapping_indexes, bboxes
 
-        overlap_x = (np.minimum(x1_max, x2_max) - np.maximum(x1_min, x2_min)) > 0
-        overlap_y = (np.minimum(y1_max, y2_max) - np.maximum(y1_min, y2_min)) > 0
-        overlap_mask = overlap_x & overlap_y
-
-        tri_mask = np.triu(np.ones_like(overlap_mask), k=1).astype(bool)
-        overlap_mask &= tri_mask
-
-        overlap_pairs = np.argwhere(overlap_mask)
-
-        for i, j in overlap_pairs:
-            table_cells[i], table_cells[j] = correct_overlap(table_cells[i], table_cells[j])
-
+        overlapping_indexes, table_cells = find_overlapping_pairs_indexes(table_cells)
         return table_cells
 
     def _align_table_cells_to_pdf(self, table_cells, pdf_cells, matches):
@@ -527,7 +530,7 @@ class MatchingPostProcessor:
                 x2s = [bbox[2] for bbox in bboxes]
                 y2s = [bbox[3] for bbox in bboxes]
 
-                cell["bbox"] = [min(x1s), min(y1s), max(x2s), max(y2s)]
+                cell["bbox"] = [np.min(x1s), np.min(y1s), np.max(x2s), np.max(y2s)]
 
             clean_table_cells.append(cell)
             processed_ids.add(cell_id)
@@ -707,7 +710,7 @@ class MatchingPostProcessor:
         new_matches = {}
 
         for pdf_cell_id, pdf_cell_matches in ioc_matches.items():
-            max_ioc_match = max(pdf_cell_matches, key=lambda x: x["iopdf"])
+            max_ioc_match = np.max(pdf_cell_matches, key=lambda x: x["iopdf"])
             new_matches[pdf_cell_id] = [max_ioc_match]
 
         return new_matches
@@ -729,10 +732,10 @@ class MatchingPostProcessor:
             bbox that encompasses two input bboxes
         """
         bbox_result = [-1, -1, -1, -1]
-        bbox_result[0] = min([bbox1[0], bbox2[0]])
-        bbox_result[1] = min([bbox1[1], bbox2[1]])
-        bbox_result[2] = max([bbox1[2], bbox2[2]])
-        bbox_result[3] = max([bbox1[3], bbox2[3]])
+        bbox_result[0] = np.min([bbox1[0], bbox2[0]])
+        bbox_result[1] = np.min([bbox1[1], bbox2[1]])
+        bbox_result[2] = np.max([bbox1[2], bbox2[2]])
+        bbox_result[3] = np.max([bbox1[3], bbox2[3]])
         return bbox_result
 
     def _pick_orphan_cells(
@@ -814,9 +817,9 @@ class MatchingPostProcessor:
 
             # Y coordinates that define band of rows
             if len(bbox_y1s) > 0:
-                row_y1 = min(bbox_y1s)
+                row_y1 = np.min(bbox_y1s)
             if len(bbox_y2s) > 0:
-                row_y2 = max(bbox_y2s)
+                row_y2 = np.max(bbox_y2s)
 
             # Find "orphan" cells that intersect the band
             for pdf_cell in pdf_cells:
@@ -930,9 +933,9 @@ class MatchingPostProcessor:
 
             # X coordinates that define band of columns
             if len(bbox_x1s) > 0:
-                col_x1 = min(bbox_x1s)
+                col_x1 = np.min(bbox_x1s)
             if len(bbox_x2s) > 0:
-                col_x2 = max(bbox_x2s)
+                col_x2 = np.max(bbox_x2s)
 
             # Find "orphan" cells that intersect the band
             for pdf_cell in pdf_cells:
