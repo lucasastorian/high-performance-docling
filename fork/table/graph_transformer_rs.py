@@ -101,72 +101,69 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
     def _sa_kv_step(
             self,
             last_in: torch.Tensor,  # [1, B, D]  (layer input for the *last* token)
-            kv_prev,  # Either (K_prev, V_prev) or (K_buf, V_buf, t, cap) for O(1) growth
+            kv_prev,  # (K_buf, V_buf, t_dev, cap, pos_cap) for capture-safe O(1) growth
             cap_hint: Optional[int] = None,  # Capacity hint for initial allocation
     ):
         """
-        Incremental self-attention with O(1) KV cache growth and SDPA.
+        Capture-safe incremental self-attention with O(1) KV cache growth and SDPA.
         Return:
           sa_out: [1, B, D]   (self-attention output, before residual)
-          kv_new: (K_buf, V_buf, t, cap) with O(1) growth buffer
+          kv_new: (K_buf, V_buf, t_dev, cap, pos_cap) with O(1) growth buffer
         """
         mha = self.self_attn
         E = mha.embed_dim
         H = mha.num_heads
         Dh = E // H
-        B = last_in.size(1)
 
         # Fused QKV projection: ONE matmul instead of three
         x = last_in.squeeze(0)  # [1,B,D] -> [B,D] to avoid permutes
-        W = mha.in_proj_weight  # [3E, E]
-        b = mha.in_proj_bias  # [3E] or None
-
-        qkv = F.linear(x, W, b)  # [B, 3E] - single GEMM!
+        qkv = F.linear(x, mha.in_proj_weight, mha.in_proj_bias).contiguous()  # [B, 3E] - single GEMM!
         q, k, v = qkv.split(E, dim=-1)  # each [B, E]
+        B = q.size(0)
 
-        # Reshape with views only (no permute, no contiguous!)
-        q = q.view(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
-        k = k.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
-        v = v.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        # Reshape to heads - use .reshape instead of .view for non-contiguous tensors
+        q = q.reshape(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
+        k = k.reshape(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        v = v.reshape(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
 
-        # Interpret/initialize cache (always 4-tuple now)
-        if kv_prev is None:
-            # New cache: allocate EXACT capacity upfront (no reallocation ever!)
-            cap = cap_hint if cap_hint is not None else 128
-            K_buf = k.new_empty((B, H, cap, Dh))
-            V_buf = v.new_empty((B, H, cap, Dh))
-            t = 0
-        else:
-            # Existing cache: unpack 4-tuple
-            K_buf, V_buf, t, cap = kv_prev
+        # Use preallocated KV and device cursor
+        K_buf, V_buf, t_dev, cap, pos_cap = kv_prev  # K/V: [B, H, cap, Dh]; t_dev: [1] int32
 
-        # No growing needed - we allocated exact capacity upfront!
-        # Just assert for safety in debug mode
-        assert t < cap, f"KV cache overflow: t={t}, cap={cap}"
+        # Capture-safe KV write using scatter_ on flattened views
+        BH = B * H
+        Kvh = K_buf.view(BH, cap, Dh)  # [BH, cap, Dh] - OK: K_buf is preallocated and contiguous
+        Vvh = V_buf.view(BH, cap, Dh)  # [BH, cap, Dh] - OK: V_buf is preallocated and contiguous
+        k1 = k.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous k
+        v1 = v.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous v
 
-        # O(1) in-place append
-        K_buf[..., t:t + 1, :] = k
-        V_buf[..., t:t + 1, :] = v
-        t += 1
+        # Device cursor -> per-row index [BH,1,Dh] - must match all dims except scatter dim
+        t_idx_bh = t_dev.to(torch.long).view(1, 1, 1).expand(BH, 1, Dh)  # [BH,1,Dh]
+        Kvh.scatter_(1, t_idx_bh, k1)  # Write key at time t for each row
+        Vvh.scatter_(1, t_idx_bh, v1)  # Write value at time t for each row
 
-        # Always use SDPA (no branching, better kernel selection)
-        k_sdp = K_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
-        v_sdp = V_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
+        # Build boolean attention mask that disables positions > t (allow attending to <= t)
+        # pos_cap is [cap] long, precomputed outside capture
+        # True means "MASK OUT"
+        mask_bool = pos_cap > t_dev.to(dtype=pos_cap.dtype)  # [cap] bool - mask strictly > t
+        attn_mask = mask_bool.view(1, 1, cap).expand(BH, 1, cap)  # [BH,1,cap]
 
+        # SDPA over full cap with boolean mask
         ctx = F.scaled_dot_product_attention(
-            q, k_sdp, v_sdp,
-            attn_mask=None,
+            q,                      # [BH,1,Dh]
+            Kvh, Vvh,              # [BH,cap,Dh]
+            attn_mask=attn_mask,   # boolean mask
             dropout_p=0.0,
-            is_causal=False
-        )  # [B*H,1,Dh]
+            is_causal=False        # we supply the mask; don't double-mask
+        )  # [BH,1,Dh]
 
         # Merge heads -> [1,B,E]
         ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
-
-        # Out projection
         sa_out = mha.out_proj(ctx)  # [1,B,E]
 
-        return sa_out, (K_buf, V_buf, t, cap)
+        # Advance time cursor on device (in-place)
+        t_dev.add_(1)
+
+        return sa_out, (K_buf, V_buf, t_dev, cap, pos_cap)
 
     def forward(  # type: ignore
             self,
@@ -193,8 +190,8 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         # Detect incremental mode vs full sequence mode
         if tgt.size(0) == 1:
-            # Incremental mode: always use KV cache (seed if self_kv is None)
-            # Use max_pred_len for EXACT capacity allocation (no reallocs!)
+            # Incremental mode: always use preallocated KV cache (no allocation during capture)
+            # self_kv should be (K_buf, V_buf, t_dev, cap, pos_cap) from preallocation
             cap_hint = max_pred_len + 1 if max_pred_len is not None else 128
             sa_out, self_kv_new = self._sa_kv_step(tgt_last_tok, self_kv, cap_hint=cap_hint)
         else:
@@ -341,6 +338,26 @@ class Tag_Transformer(nn.Module):
         # Convert [1, B, D] -> [B, D] for compatibility
         last_H = last_h_1BD.squeeze(0)  # [B, D]
         return last_H, None, sa_kv_out  # [B, D], None (no tag cache), kv_cache
+    
+    def step_incremental(
+            self,
+            cur_tok_1BD: torch.Tensor,  # [1, B, D] current token with positional encoding + embedding
+            memory: torch.Tensor,  # [S, B, D]
+            memory_kv=None,
+            sa_kv_cache=None,
+            max_pred_len: Optional[int] = None,
+    ) -> tuple[torch.Tensor, Optional[List]]:
+        """
+        T-agnostic incremental step using current token embedding directly.
+        No time indexing required - perfect for graph capture.
+        """
+        last_h_1BD, sa_kv_out = self._decoder(
+            cur_tok_1BD, memory=memory, cache=None, memory_key_padding_mask=None,
+            memory_kv=memory_kv, sa_kv_cache=sa_kv_cache, max_pred_len=max_pred_len
+        )
+        # Convert [1, B, D] -> [B, D] for compatibility
+        last_H = last_h_1BD.squeeze(0)  # [B, D]
+        return last_H, sa_kv_out  # [B, D], kv_cache
 
     def precompute_mem_kv(self, mem_enc: torch.Tensor):
         """

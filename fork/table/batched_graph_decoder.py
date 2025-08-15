@@ -327,8 +327,7 @@ class BatchedTableDecoder:
             S['block_tags'][i] = new_tags
             
             # 5) Update lengths/finished/flags & collect tag_H/spans
-            active_prev = ~S['finished']  # [B_bucket]
-            S['lengths'] = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
+            active_prev = ~S['finished']  # [B_bucket] - state BEFORE marking newly_finished
             
             newly_finished = (new_tags == self.end_id)
             S['finished'] = S['finished'] | newly_finished
@@ -389,11 +388,15 @@ class BatchedTableDecoder:
             if self.nl_id is not None:
                 S['line_num'] += (new_tags == self.nl_id).to(S['line_num'].dtype)
             
-            # 6) Build next current token embedding in-place (no t needed)
-            pos_idx = torch.where(~S['finished'], S['lengths'] + 1, S['lengths'])
+            # 6) Build next current token embedding with per-sample PE (critical for correctness)
+            # Use active_prev to compute positions for sequences that were active BEFORE this step
+            pos_idx = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
             pos_idx = pos_idx.clamp_max(tt._positional_encoding.pe.size(0) - 1).to(torch.long)
             pos_vec = self._pe_gather_bD(tt._positional_encoding.pe, pos_idx)  # [B_bucket, D]
             S['cur_tok'][0] = tt._embedding(new_tags) + pos_vec
+            
+            # NOW increment lengths after computing PE (only for sequences that were active)
+            S['lengths'] = torch.where(active_prev, S['lengths'] + 1, S['lengths'])
             
             # 7) Bump device-side t for trimming purposes
             S['t'].add_(1)
