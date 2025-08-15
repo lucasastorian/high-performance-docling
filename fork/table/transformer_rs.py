@@ -98,35 +98,6 @@ class TMTransformerDecoder(nn.TransformerDecoder):
 
 
 class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
-    def _flash_debug_guard(self, q, k, v, is_causal, where=""):
-        """Debug function to check Flash Attention eligibility"""
-        def info(t): 
-            return (t.device.type, t.dtype, t.shape, t.is_contiguous(), t.stride())
-        B,H,S_q,Dh = q.shape
-        _,_,S_k,_ = k.shape
-        problems = []
-        if q.device.type != "cuda" or k.device.type != "cuda" or v.device.type != "cuda":
-            problems.append("not on CUDA")
-        if not (q.dtype == k.dtype == v.dtype):
-            problems.append(f"dtype mismatch: {q.dtype},{k.dtype},{v.dtype}")
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            problems.append(f"bad dtype: {q.dtype}")
-        if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
-            problems.append("non-contiguous q/k/v")
-        if Dh % 8 != 0:
-            problems.append(f"Dh % 8 != 0 (Dh={Dh})")
-        if min(B,H,S_q,S_k,Dh) <= 0:
-            problems.append(f"zero-sized dim: B={B},H={H},S_q={S_q},S_k={S_k},Dh={Dh}")
-        if problems:
-            print(f"[FLASH ELIGIBILITY FAIL @ {where}] {problems}")
-            print("  q:", info(q))
-            print("  k:", info(k))
-            print("  v:", info(v))
-            return False
-        else:
-            print(f"[FLASH OK @ {where}] B={B},H={H},S_q={S_q},S_k={S_k},Dh={Dh}")
-        return True
-    
     def _sa_kv_step(
             self,
             last_in: torch.Tensor,  # [1, B, D]  (layer input for the *last* token)
@@ -188,18 +159,15 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         k_sdp = k_sdp.contiguous()
         v_sdp = v_sdp.contiguous()
 
-        # Debug: Check Flash eligibility
-        self._flash_debug_guard(q, k_sdp, v_sdp, True, "self-attn")
+        # Flash backend can't do is_causal when q_len != k_len.
+        # For incremental decoding (q_len==1 over past keys), causal mask is redundant anyway.
+        use_causal = (q.size(2) == k_sdp.size(2))  # True only when square (t=1); else False
 
-        # Flash-compatible call: For incremental decoding with S_q=1, S_k>1, 
-        # we can't use is_causal=True (Flash requires square attention for causal flag).
-        # Since we're always querying the last position against all previous positions,
-        # we don't need a mask - it's inherently causal.
         ctx = F.scaled_dot_product_attention(
             q, k_sdp, v_sdp,
             attn_mask=None,
             dropout_p=0.0,
-            is_causal=False  # False for non-square attention in incremental mode
+            is_causal=use_causal  # Dynamic: True when square, False otherwise
         )  # [B,H,1,Dh]
 
         # Merge heads -> [1,B,E]
@@ -280,9 +248,6 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 q = q.contiguous()
                 k = k.contiguous()
                 v = v.contiguous()
-
-                # Debug: Check Flash eligibility
-                self._flash_debug_guard(q, k, v, False, "cross-attn")
 
                 # Flash-compatible: No mask for better performance (assumes no padding)
                 # If you have fixed CNN grid with no padding, this is optimal
