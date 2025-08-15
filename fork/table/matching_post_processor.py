@@ -178,12 +178,12 @@ class MatchingPostProcessor:
             middles.append(x_middle)
 
         if len(lefts) > 0:
-            delta_left = np.max(lefts) - np.min(lefts)
-            delta_middle = np.max(middles) - np.min(middles)
-            delta_right = np.max(rights) - np.min(rights)
+            delta_left = max(lefts) - min(lefts)
+            delta_middle = max(middles) - min(middles)
+            delta_right = max(rights) - min(rights)
 
             deltas = [delta_left, delta_middle, delta_right]
-            align_index = deltas.index(np.min(deltas))
+            align_index = deltas.index(min(deltas))
             alignment = possible_alignments[align_index]
 
         return alignment
@@ -395,8 +395,8 @@ class MatchingPostProcessor:
             x2_min, y2_min, x2_max, y2_max = box2["bbox"]
 
             # Calculate the overlap in both x and y directions
-            overlap_x = np.min(x1_max, x2_max) - np.max(x1_min, x2_min)
-            overlap_y = np.min(y1_max, y2_max) - np.max(y1_min, y2_min)
+            overlap_x = min(x1_max, x2_max) - max(x1_min, x2_min)
+            overlap_y = min(y1_max, y2_max) - max(y1_min, y2_min)
 
             # If there is no overlap, return the original boxes
             if overlap_x <= 0 or overlap_y <= 0:
@@ -426,16 +426,16 @@ class MatchingPostProcessor:
 
             # Will flip coordinates in proper order, if previous operations reversed it
             box1["bbox"] = [
-                np.min(box1["bbox"][0], box1["bbox"][2]),
-                np.min(box1["bbox"][1], box1["bbox"][3]),
-                np.max(box1["bbox"][0], box1["bbox"][2]),
-                np.max(box1["bbox"][1], box1["bbox"][3]),
+                min(box1["bbox"][0], box1["bbox"][2]),
+                min(box1["bbox"][1], box1["bbox"][3]),
+                max(box1["bbox"][0], box1["bbox"][2]),
+                max(box1["bbox"][1], box1["bbox"][3]),
             ]
             box2["bbox"] = [
-                np.min(box2["bbox"][0], box2["bbox"][2]),
-                np.min(box2["bbox"][1], box2["bbox"][3]),
-                np.max(box2["bbox"][0], box2["bbox"][2]),
-                np.max(box2["bbox"][1], box2["bbox"][3]),
+                min(box2["bbox"][0], box2["bbox"][2]),
+                min(box2["bbox"][1], box2["bbox"][3]),
+                max(box2["bbox"][0], box2["bbox"][2]),
+                max(box2["bbox"][1], box2["bbox"][3]),
             ]
 
             return box1, box2
@@ -530,7 +530,7 @@ class MatchingPostProcessor:
                 x2s = [bbox[2] for bbox in bboxes]
                 y2s = [bbox[3] for bbox in bboxes]
 
-                cell["bbox"] = [np.min(x1s), np.min(y1s), np.max(x2s), np.max(y2s)]
+                cell["bbox"] = [min(x1s), min(y1s), max(x2s), max(y2s)]
 
             clean_table_cells.append(cell)
             processed_ids.add(cell_id)
@@ -710,7 +710,7 @@ class MatchingPostProcessor:
         new_matches = {}
 
         for pdf_cell_id, pdf_cell_matches in ioc_matches.items():
-            max_ioc_match = np.max(pdf_cell_matches, key=lambda x: x["iopdf"])
+            max_ioc_match = max(pdf_cell_matches, key=lambda x: x["iopdf"])
             new_matches[pdf_cell_id] = [max_ioc_match]
 
         return new_matches
@@ -732,10 +732,10 @@ class MatchingPostProcessor:
             bbox that encompasses two input bboxes
         """
         bbox_result = [-1, -1, -1, -1]
-        bbox_result[0] = np.min([bbox1[0], bbox2[0]])
-        bbox_result[1] = np.min([bbox1[1], bbox2[1]])
-        bbox_result[2] = np.max([bbox1[2], bbox2[2]])
-        bbox_result[3] = np.max([bbox1[3], bbox2[3]])
+        bbox_result[0] = min([bbox1[0], bbox2[0]])
+        bbox_result[1] = mi([bbox1[1], bbox2[1]])
+        bbox_result[2] = max([bbox1[2], bbox2[2]])
+        bbox_result[3] = max([bbox1[3], bbox2[3]])
         return bbox_result
 
     def _pick_orphan_cells(
@@ -817,9 +817,9 @@ class MatchingPostProcessor:
 
             # Y coordinates that define band of rows
             if len(bbox_y1s) > 0:
-                row_y1 = np.min(bbox_y1s)
+                row_y1 = mi(bbox_y1s)
             if len(bbox_y2s) > 0:
-                row_y2 = np.max(bbox_y2s)
+                row_y2 = max(bbox_y2s)
 
             # Find "orphan" cells that intersect the band
             for pdf_cell in pdf_cells:
@@ -933,9 +933,9 @@ class MatchingPostProcessor:
 
             # X coordinates that define band of columns
             if len(bbox_x1s) > 0:
-                col_x1 = np.min(bbox_x1s)
+                col_x1 = min(bbox_x1s)
             if len(bbox_x2s) > 0:
-                col_x2 = np.max(bbox_x2s)
+                col_x2 = max(bbox_x2s)
 
             # Find "orphan" cells that intersect the band
             for pdf_cell in pdf_cells:
