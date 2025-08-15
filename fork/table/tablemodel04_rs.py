@@ -130,11 +130,19 @@ class TableModel04_rs(BaseModel, nn.Module):
 
     def setup_for_inference(self):
         """Call this AFTER loading checkpoint to prepare model for optimized inference"""
-        # Convert transformer components to bf16 for Flash Attention
         self._convert_transformers_to_bf16()
-        
-        # Ensure model is in eval mode
+
+        # Compile the decoder
+        self._tag_transformer._decoder = torch.compile(
+            self._tag_transformer._decoder,
+            backend="inductor",
+            dynamic=True,
+            fullgraph=False,
+            mode="max-autotune-no-cudagraphs",
+        )
+
         self.eval()
+
         return self
     
     def _convert_transformers_to_bf16(self):
