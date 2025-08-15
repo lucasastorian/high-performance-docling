@@ -108,8 +108,10 @@ class BatchedTableDecoder:
 
         # ---- Incremental embedding buffer optimization (Fix B: avoid O(T²)) ----
         D = tt._embedding.embedding_dim
-        tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device)
-        pe = tt._positional_encoding.pe  # could be [L, D] OR [L, 1, D]
+        # Match dtype of embedding weights (bf16 after setup_for_inference)
+        emb_dtype = tt._embedding.weight.dtype
+        tgt_emb_buf = torch.empty(Tmax + 1, B, D, device=device, dtype=emb_dtype)
+        pe = tt._positional_encoding.pe  # already bf16 after setup_for_inference
 
         def pe_gather_bD(pe: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             """
