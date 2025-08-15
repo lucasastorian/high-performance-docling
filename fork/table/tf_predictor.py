@@ -49,35 +49,13 @@ class bcolors:
     UNDERLINE = "\033[4m"
 
 
-def _process_matching_worker(cell_matcher, post_processor, enable_post_process,
-                            idx, iocr_page, tbl_bbox_for_match, prediction, 
-                            do_matching, correct_overlapping_cells):
-    """Worker function for parallel matching and postprocessing"""
-    # Prepare matching details
-    matching_details = {
-        "table_cells": [],
-        "matches": {},
-        "pdf_cells": [],
-        "prediction_bboxes_page": [],
-    }
-    
-    # Matching (faithful to original)
-    if len(prediction["bboxes"]) > 0:
-        if do_matching:
-            matching_details = cell_matcher.match_cells(
-                iocr_page, tbl_bbox_for_match, prediction
-            )
-            # Post-processing if tokens exist and post-process enabled
-            if len(iocr_page.get("tokens", [])) > 0 and enable_post_process:
-                matching_details = post_processor.process(
-                    matching_details, correct_overlapping_cells
-                )
-        else:
-            matching_details = cell_matcher.match_cells_dummy(
-                iocr_page, tbl_bbox_for_match, prediction
-            )
-    
-    return (idx, matching_details)
+def _postprocess_worker(post_processor, idx, matching_details, correct_overlapping_cells):
+    """Worker function for parallel postprocessing - minimal pickle overhead"""
+    # Only postprocess, matching already done
+    processed_details = post_processor.process(
+        matching_details, correct_overlapping_cells
+    )
+    return (idx, processed_details)
 
 
 def otsl_sqr_chk(rs_list, logdebug):
@@ -780,9 +758,11 @@ class TFPredictor:
         # --- 3) Per-item: bbox/tag sync, matching, (optional) postproc, docling response, merge ---
         with timer.time_section('cell_matching_and_postprocess'):
             outputs: list[tuple[list[dict], dict]] = []
-
-            # Prepare data for parallel processing
-            process_args = []
+            
+            # First pass: Do matching serially (it's fast and avoids pickle overhead)
+            matching_results = []
+            postprocess_args = []
+            
             for i, prediction in enumerate(all_predictions):
                 iocr_page = iocr_pages[i]
                 scaled_bbox = table_bboxes[i]  # coords in RESIZED-PAGE space
@@ -801,27 +781,59 @@ class TFPredictor:
                     scaled_bbox[3] / scale_factor,
                 ]
                 
-                process_args.append((i, iocr_page, tbl_bbox_for_match, prediction, 
-                                   do_matching, correct_overlapping_cells))
+                # Prepare matching details
+                matching_details = {
+                    "table_cells": [],
+                    "matches": {},
+                    "pdf_cells": [],
+                    "prediction_bboxes_page": [],
+                }
+                
+                # Do matching (serial - fast and avoids heavy pickle of iocr_page)
+                if len(prediction["bboxes"]) > 0:
+                    if do_matching:
+                        matching_details = self._cell_matcher.match_cells(
+                            iocr_page, tbl_bbox_for_match, prediction
+                        )
+                        # Check if postprocessing is needed
+                        if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
+                            # Queue for parallel postprocessing
+                            postprocess_args.append((i, matching_details, correct_overlapping_cells))
+                        else:
+                            matching_results.append((i, matching_details))
+                    else:
+                        matching_details = self._cell_matcher.match_cells_dummy(
+                            iocr_page, tbl_bbox_for_match, prediction
+                        )
+                        matching_results.append((i, matching_details))
+                else:
+                    matching_results.append((i, matching_details))
             
-            # Process matching in parallel if pool is available and we have multiple items
-            if self._mp_pool is not None and len(process_args) > 1:
-                # Use multiprocessing for matching
-                matching_results = self._mp_pool.starmap(
-                    _process_matching_worker,
-                    [(self._cell_matcher, self._post_processor, self.enable_post_process, *args) 
-                     for args in process_args]
+            # Second pass: Parallel postprocessing (if needed)
+            if postprocess_args and self._mp_pool is not None and len(postprocess_args) > 1:
+                AggProfiler().begin("post_process_parallel", self._prof)
+                # Use multiprocessing for postprocessing only
+                postprocessed = self._mp_pool.starmap(
+                    _postprocess_worker,
+                    [(self._post_processor, *args) for args in postprocess_args]
                 )
-            else:
-                # Fall back to serial processing
-                matching_results = []
-                for args in process_args:
-                    result = _process_matching_worker(
-                        self._cell_matcher, self._post_processor, self.enable_post_process, *args
+                matching_results.extend(postprocessed)
+                AggProfiler().end("post_process_parallel", self._prof)
+            elif postprocess_args:
+                # Serial postprocessing fallback
+                AggProfiler().begin("post_process_serial", self._prof)
+                for args in postprocess_args:
+                    idx, matching_details, correct_overlapping_cells = args
+                    processed = self._post_processor.process(
+                        matching_details, correct_overlapping_cells
                     )
-                    matching_results.append(result)
+                    matching_results.append((idx, processed))
+                AggProfiler().end("post_process_serial", self._prof)
             
-            # Process docling response generation and merging (serial for now)
+            # Sort results by index to maintain order
+            matching_results.sort(key=lambda x: x[0])
+            
+            # Third pass: Generate docling responses and merge (serial - fast)
             for (idx, matching_details) in matching_results:
                 prediction = all_predictions[idx]
                 
