@@ -191,7 +191,7 @@ class TableStructureModel(BasePageModel):
                     "width": page.size.width * self.scale,
                     "height": page.size.height * self.scale,
                     "image": page.get_image_np(scale=self.scale),
-                    "index": page.word_index
+                    # "index": page.word_index
                 }
 
                 # Aggregate tokens once per page when matching is on
