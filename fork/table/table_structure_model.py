@@ -191,6 +191,7 @@ class TableStructureModel(BasePageModel):
                     "width": page.size.width * self.scale,
                     "height": page.size.height * self.scale,
                     "image": page.get_image_np(scale=self.scale),
+                    "index": page.word_index
                 }
 
                 # Aggregate tokens once per page when matching is on
@@ -230,7 +231,7 @@ class TableStructureModel(BasePageModel):
         # Create timer for detailed table structure timing
         device_type = getattr(self.tf_predictor, '_device', 'cpu')
         timer = _CudaTimer() if device_type == 'cuda' else _CPUTimer()
-        
+
         # Predictor call over the whole batch (order-preserving; predictor does not reorder)
         with TimeRecorder(conv_res, "table_structure_predict"):
             with timer.time_section('tf_predictor_call'):
@@ -255,7 +256,7 @@ class TableStructureModel(BasePageModel):
                 for output, table_cluster in zip(page_outputs, clusters):
                     table = self._process_table_output(page, table_cluster, output)
                     page.predictions.tablestructure.table_map[table_cluster.id] = table
-        
+
         # Finalize timing and log results
         timer.finalize()
         print(f"   └─ table structure breakdown: tf_call={timer.get_time('tf_predictor_call'):.1f}ms "

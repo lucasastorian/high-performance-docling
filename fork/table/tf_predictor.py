@@ -23,12 +23,11 @@ import docling_ibm_models.tableformer.utils.utils as u
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
-from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
 from docling_ibm_models.tableformer.data_management.matching_post_processor import MatchingPostProcessor
 
 from fork.table.tablemodel04_rs import TableModel04_rs
-# from optimized.table.matching_post_processor import MatchingPostProcessor
 from fork.timers import _CPUTimer, _CudaTimer
+from fork.table.tf_cell_matcher import CellMatcher
 
 LOG_LEVEL = logging.WARN
 
