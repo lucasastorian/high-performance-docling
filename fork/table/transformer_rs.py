@@ -129,29 +129,32 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Use preallocated KV and device cursor
         K_buf, V_buf, t_dev, cap, pos_cap = kv_prev  # K/V: [B, H, cap, Dh]; t_dev: [1] int32
 
-        # Clamp time cursor (device) and build a 1D index tensor (no host reads)
-        t_idx = torch.clamp(t_dev, max=cap-1).to(dtype=torch.long)  # [1]
-        # index_copy_ along time dim=2 (broadcasts over B,H)
-        K_buf.index_copy_(2, t_idx, k)  # src [B,H,1,Dh]
-        V_buf.index_copy_(2, t_idx, v)
+        # Capture-safe KV write using scatter_ on flattened views
+        BH = B * H
+        Kvh = K_buf.view(BH, cap, Dh)  # [BH, cap, Dh]
+        Vvh = V_buf.view(BH, cap, Dh)  # [BH, cap, Dh]
+        k1 = k.view(BH, 1, Dh)         # [BH, 1, Dh]
+        v1 = v.view(BH, 1, Dh)         # [BH, 1, Dh]
 
-        # Build additive mask that disables positions >= t
+        # Device cursor -> per-row index [BH,1]
+        t_idx_bh = t_dev.to(torch.long).view(1, 1).expand(BH, 1)  # [BH,1]
+        Kvh.scatter_(1, t_idx_bh, k1)  # Write key at time t for each row
+        Vvh.scatter_(1, t_idx_bh, v1)  # Write value at time t for each row
+
+        # Build boolean attention mask that disables positions >= t
         # pos_cap is [cap] long, precomputed outside capture
-        # mask: [cap] bool -> [1,1,cap] -> [B*H,1,cap] float(-inf) where masked
-        ge_mask = pos_cap >= t_dev.to(dtype=pos_cap.dtype)  # [cap] bool
-        attn_mask = ge_mask.view(1, 1, cap).expand(B*H, 1, cap)  # [B*H,1,cap]
-        attn_mask = attn_mask.to(dtype=q.dtype).masked_fill(attn_mask, float('-inf'))
+        # True means "MASK OUT"
+        mask_bool = pos_cap >= t_dev.to(dtype=pos_cap.dtype)  # [cap] bool
+        attn_mask = mask_bool.view(1, 1, cap).expand(BH, 1, cap)  # [BH,1,cap]
 
-        # SDPA over full cap with mask; keys/vals are the whole buffers (no slicing)
-        k_sdp = K_buf.reshape(B*H, cap, Dh)  # [B*H, cap, Dh]
-        v_sdp = V_buf.reshape(B*H, cap, Dh)  # [B*H, cap, Dh]
-
+        # SDPA over full cap with boolean mask
         ctx = F.scaled_dot_product_attention(
-            q, k_sdp, v_sdp,
-            attn_mask=attn_mask,  # additive mask
+            q,                      # [BH,1,Dh]
+            Kvh, Vvh,              # [BH,cap,Dh]
+            attn_mask=attn_mask,   # boolean mask
             dropout_p=0.0,
-            is_causal=False
-        )  # [B*H,1,Dh]
+            is_causal=False        # we supply the mask; don't double-mask
+        )  # [BH,1,Dh]
 
         # Merge heads -> [1,B,E]
         ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)

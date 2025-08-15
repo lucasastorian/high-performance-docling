@@ -490,6 +490,35 @@ class BatchedTableDecoder:
         
         return B_active
 
+    def _debug_validate_first_steps(self, max_steps: int = 4):
+        """Quick correctness probe for first few steps"""
+        if not os.getenv("DEBUG_GRAPH_CAPTURE"):
+            return
+        
+        S = self._static
+        print(f"🔍 Debug validation for first {max_steps} steps:")
+        
+        for step in range(min(max_steps, S['t'].item())):
+            if step < S['block_tags'].shape[0]:
+                # Top-3 token predictions for this step
+                tokens = S['block_tags'][step, :3]  # First 3 batch items
+                print(f"  Step {step}: top tokens = {tokens.tolist()}")
+        
+        # KV cache state validation
+        if S['sa_kv']:
+            kv_means = []
+            t_values = []
+            for i, kv_tuple in enumerate(S['sa_kv'][:2]):  # First 2 layers
+                if len(kv_tuple) >= 3:
+                    K_buf, V_buf, t_dev = kv_tuple[:3]
+                    k_mean = K_buf.abs().mean().item()
+                    v_mean = V_buf.abs().mean().item()
+                    t_val = t_dev.item()
+                    kv_means.append((k_mean, v_mean))
+                    t_values.append(t_val)
+            print(f"  t_dev values: {t_values}")
+            print(f"  KV means (K,V): {kv_means}")
+
     def _materialize_outputs(self) -> List[Tuple[List[int], torch.Tensor, torch.Tensor]]:
         """Convert static tensors to final output format"""
         S = self._static
@@ -566,6 +595,10 @@ class BatchedTableDecoder:
         for blk in range(num_blocks):
             # Replay the captured graph for U steps
             gb.graph.replay()
+            
+            # Debug validation after first block
+            if blk == 0:
+                self._debug_validate_first_steps()
             
             # Splice block tokens into global buffer (host-side, between blocks)
             t1 = min(t0 + U, Tmax)
