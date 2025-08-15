@@ -142,6 +142,8 @@ class TableModel04_rs(BaseModel, nn.Module):
         )
 
         self.eval()
+        torch.set_grad_enabled(False)
+
         self._warmup_decoder()
 
         return self
