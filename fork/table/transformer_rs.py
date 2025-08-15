@@ -136,15 +136,15 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         k1 = k.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous k
         v1 = v.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous v
 
-        # Device cursor -> per-row index [BH,1]
-        t_idx_bh = t_dev.to(torch.long).view(1, 1).expand(BH, 1)  # [BH,1]
+        # Device cursor -> per-row index [BH,1,Dh] - must match all dims except scatter dim
+        t_idx_bh = t_dev.to(torch.long).view(1, 1, 1).expand(BH, 1, Dh)  # [BH,1,Dh]
         Kvh.scatter_(1, t_idx_bh, k1)  # Write key at time t for each row
         Vvh.scatter_(1, t_idx_bh, v1)  # Write value at time t for each row
 
-        # Build boolean attention mask that disables positions >= t
+        # Build boolean attention mask that disables positions > t (allow attending to <= t)
         # pos_cap is [cap] long, precomputed outside capture
         # True means "MASK OUT"
-        mask_bool = pos_cap >= t_dev.to(dtype=pos_cap.dtype)  # [cap] bool
+        mask_bool = pos_cap > t_dev.to(dtype=pos_cap.dtype)  # [cap] bool - mask strictly > t
         attn_mask = mask_bool.view(1, 1, cap).expand(BH, 1, cap)  # [BH,1,cap]
 
         # SDPA over full cap with boolean mask
