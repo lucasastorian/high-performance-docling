@@ -15,8 +15,8 @@ from fork.timers import _CPUTimer, _CudaTimer
 
 from fork.table.encoder04_rs import Encoder04
 from fork.table.bbox_decoder_rs import BBoxDecoder
-from fork.table.graph_transformer_rs import Tag_Transformer
-from fork.table.batched_graph_decoder import BatchedTableDecoder
+from fork.table.transformer_rs import Tag_Transformer
+from fork.table.batched_decoder import BatchedTableDecoder
 
 LOG_LEVEL = logging.WARN
 
