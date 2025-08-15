@@ -8,10 +8,12 @@ import logging
 import os
 import threading
 from itertools import groupby
+from typing import List
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_model
 
 import docling_ibm_models.tableformer.common as c
@@ -178,14 +180,6 @@ class TFPredictor:
         # Use lock to prevent threading issues during model initialization
         with _model_init_lock:
             model = TableModel04_rs(self._config, self._init_data, self._device)
-
-            # Ensure model parameters are in default contiguous format before safetensors load
-            model = model.to(memory_format=torch.contiguous_format)
-
-            if model is None:
-                err_msg = "Not able to initiate a model for {}".format(self._model_type)
-                self._log().error(err_msg)
-                raise ValueError(err_msg)
 
             self._remove_padding = False
             if self._model_type == "TableModel02":
@@ -747,28 +741,33 @@ class TFPredictor:
 
         # --- 1) Image preprocessing (original semantics, but batched) ---
         with timer.time_section('image_preprocessing'):
-            # Equivalent to per-item: _prepare_image(table_image)
-            # i.e., Normalize -> Resize to (S,S) -> transpose to (C,W,H) -> /255 -> to(device) -> add batch dim
-            normalize = T.Normalize(
-                mean=self._config["dataset"]["image_normalization"]["mean"],
-                std=self._config["dataset"]["image_normalization"]["std"],
-            )
             resized_size = self._config["dataset"]["resized_image"]
-            resize = T.Resize([resized_size, resized_size])
-
-            batch_tensors = []
-            for table_img in table_images:
-                img, _ = normalize(table_img, None)
-                img, _ = resize(img, None)
-                img = img.transpose(2, 1, 0)  # (channels, width, height)
-                img = torch.FloatTensor(img / 255.0)  # float32 in [0,1]
-                batch_tensors.append(img)
-
-            if len(batch_tensors) == 0:
-                return []
-
-            image_batch = torch.stack(batch_tensors, dim=0)  # (N, C, W, H) — matches original quirk
-            image_batch = image_batch.to(device=self._device)
+            mean = self._config["dataset"]["image_normalization"]["mean"]
+            std = self._config["dataset"]["image_normalization"]["std"]
+            image_batch = self._batch_preprocess_images(table_images=table_images, resized_size=resized_size,
+                                                        mean=mean, std=std)
+            # # Equivalent to per-item: _prepare_image(table_image)
+            # # i.e., Normalize -> Resize to (S,S) -> transpose to (C,W,H) -> /255 -> to(device) -> add batch dim
+            # normalize = T.Normalize(
+            #     mean=self._config["dataset"]["image_normalization"]["mean"],
+            #     std=self._config["dataset"]["image_normalization"]["std"],
+            # )
+            # resized_size = self._config["dataset"]["resized_image"]
+            # resize = T.Resize([resized_size, resized_size])
+            #
+            # batch_tensors = []
+            # for table_img in table_images:
+            #     img, _ = normalize(table_img, None)
+            #     img, _ = resize(img, None)
+            #     img = img.transpose(2, 1, 0)  # (channels, width, height)
+            #     img = torch.FloatTensor(img / 255.0)  # float32 in [0,1]
+            #     batch_tensors.append(img)
+            #
+            # if len(batch_tensors) == 0:
+            #     return []
+            #
+            # image_batch = torch.stack(batch_tensors, dim=0)  # (N, C, W, H) — matches original quirk
+            # image_batch = image_batch.to(device=self._device)
 
         # --- 2) Model inference (batched) ---
         with timer.time_section('model_inference'):
@@ -1117,3 +1116,41 @@ class TFPredictor:
         html_tags = [self._rev_word_map[ind] for ind in seq[1:-1]]
 
         return html_tags
+
+    def _batch_preprocess_images(self, table_images: List[np.ndarray], resized_size: int,  mean, std, dtype=torch.float32, use_stream=True):
+        """Batch preprocess images"""
+        if len(table_images) == 0:
+            return []
+
+        S = int(resized_size)
+        # Stack to NHWC uint8 on CPU
+        nhwc = np.stack(table_images, axis=0)  # [N,H,W,C], uint8
+
+        # Pin host mem for async H2D; then copy as float32 to device
+        cpu = torch.from_numpy(nhwc).pin_memory()
+        stream = torch.cuda.Stream(device=self._device) if use_stream else torch.cuda.current_stream(device=self._device)
+        with torch.cuda.stream(stream):
+            t = cpu.to(device=self._device, dtype=dtype, non_blocking=True)  # [N,H,W,C], float32
+
+            # Normalize with *your* order:
+            # ((img - 255*mean)/std) / 255 == (img/255 - mean) / std  (algebraically equal)
+            # Do the simpler / more stable variant:
+            t = t / 255.0
+            mean_t = torch.tensor(mean, device=self._device, dtype=dtype).view(1, 1, 1, -1)
+            std_t = torch.tensor(std, device=self._device, dtype=dtype).view(1, 1, 1, -1)
+            t = (t - mean_t) / std_t
+
+            # NCHW for interpolate, channels_last can help kernels
+            t = t.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)  # [N,C,H,W]
+
+            # GPU resize (close to, not identical to, OpenCV bilinear)
+            t = F.interpolate(t, size=(S, S), mode="bilinear", align_corners=False)
+
+            # Your layout quirk: (C, W, H) not (C, H, W)
+            t = t.permute(0, 1, 3, 2).contiguous()  # [N,C,W,H]
+
+        if use_stream:
+            # Optionally let caller sync later; many pipelines just proceed and let CUDA sync naturally.
+            torch.cuda.current_stream(device=self._device).wait_stream(stream)
+
+        return t
