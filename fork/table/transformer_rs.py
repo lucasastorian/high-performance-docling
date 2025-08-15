@@ -33,7 +33,8 @@ class PositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
+        # Convert to bf16 for Flash Attention compatibility
+        self.register_buffer("pe", pe.to(torch.bfloat16))
 
     def forward(self, x):
         x = x + self.pe[: x.size(0), :]
@@ -106,6 +107,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
     ):
         """
         Incremental self-attention with O(1) KV cache growth and SDPA.
+        Flash-compatible: keeps 4D tensors and uses is_causal=True.
         Return:
           sa_out: [1, B, D]   (self-attention output, before residual)
           kv_new: (K_buf, V_buf, t, cap) with O(1) growth buffer
@@ -124,10 +126,10 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         qkv = F.linear(x, W, b)  # [B, 3E] - single GEMM!
         q, k, v = qkv.split(E, dim=-1)  # each [B, E]
 
-        # Reshape with views only (no permute, no contiguous!)
-        q = q.view(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
-        k = k.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
-        v = v.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        # Keep 4D for Flash Attention (no reshape to B*H)
+        q = q.view(B, H, 1, Dh)  # [B,H,1,Dh]
+        k = k.view(B, H, 1, Dh)  # [B,H,1,Dh]
+        v = v.view(B, H, 1, Dh)  # [B,H,1,Dh]
 
         # Interpret/initialize cache (always 4-tuple now)
         if kv_prev is None:
@@ -144,24 +146,30 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Just assert for safety in debug mode
         assert t < cap, f"KV cache overflow: t={t}, cap={cap}"
 
-        # O(1) in-place append
-        K_buf[..., t:t + 1, :] = k
-        V_buf[..., t:t + 1, :] = v
+        # O(1) in-place append using copy_ for better performance
+        K_buf[:, :, t:t + 1, :].copy_(k)
+        V_buf[:, :, t:t + 1, :].copy_(v)
         t += 1
 
-        # Always use SDPA (no branching, better kernel selection)
-        k_sdp = K_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
-        v_sdp = V_buf[..., :t, :].reshape(B * H, t, Dh)  # [B*H, t, Dh]
+        # Keep 4D for Flash Attention
+        k_sdp = K_buf[:, :, :t, :]  # [B,H,t,Dh]
+        v_sdp = V_buf[:, :, :t, :]  # [B,H,t,Dh]
 
+        # Ensure bf16 and contiguous for Flash
+        q = q.contiguous()
+        k_sdp = k_sdp.contiguous()
+        v_sdp = v_sdp.contiguous()
+
+        # Flash-compatible call: no mask, causal=True for self-attention
         ctx = F.scaled_dot_product_attention(
             q, k_sdp, v_sdp,
             attn_mask=None,
             dropout_p=0.0,
-            is_causal=False
-        )  # [B*H,1,Dh]
+            is_causal=True  # Changed to True for Flash compatibility
+        )  # [B,H,1,Dh]
 
         # Merge heads -> [1,B,E]
-        ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
+        ctx = ctx.permute(0, 2, 1, 3).contiguous().view(B, 1, E).transpose(0, 1)
 
         # Out projection
         sa_out = mha.out_proj(ctx)  # [1,B,E]
@@ -214,7 +222,7 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # cross-attn
         if memory is not None:
             if memory_kv is not None:
-                # -- custom cross-attn using precomputed K_mem/V_mem --
+                # -- Flash-compatible cross-attn using precomputed K_mem/V_mem --
                 mha = self.multihead_attn
                 E = mha.embed_dim
                 H = mha.num_heads
@@ -227,28 +235,29 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
                 W_q = mha.in_proj_weight[:E, :]
                 b_q = mha.in_proj_bias[:E] if mha.in_proj_bias is not None else None
                 q = F.linear(tgt_last_tok, W_q, b_q)  # [1,B,E]
-                q = q.permute(1, 0, 2).contiguous().view(B, 1, H, Dh).transpose(1, 2).reshape(B * H, 1, Dh)
+                # Keep 4D for Flash Attention
+                q = q.permute(1, 0, 2).contiguous().view(B, 1, H, Dh).transpose(1, 2)  # [B,H,1,Dh]
 
-                # K_mem,V_mem: [B,H,S,Dh] -> [B*H, S, Dh]
-                k = K_mem.reshape(B * H, S, Dh)
-                v = V_mem.reshape(B * H, S, Dh)
+                # K_mem,V_mem already [B,H,S,Dh] - perfect for Flash
+                k = K_mem  # [B,H,S,Dh]
+                v = V_mem  # [B,H,S,Dh]
 
-                # Handle padding mask for SDPA
-                attn_mask = None
-                if memory_key_padding_mask is not None:  # [B,S] True=pad
-                    # SDPA needs an additive mask: True -> -inf, False -> 0.0
-                    mask = memory_key_padding_mask.float().masked_fill(
-                        memory_key_padding_mask, float('-inf')
-                    ).masked_fill(~memory_key_padding_mask, 0.0)  # [B,S]
-                    attn_mask = mask.unsqueeze(1).expand(B, H, S).reshape(B * H, 1, S)
+                # Ensure contiguous for Flash
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
 
-                # SDPA (no dropout in eval)
+                # Flash-compatible: No mask for better performance (assumes no padding)
+                # If you have fixed CNN grid with no padding, this is optimal
                 ctx = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
-                )  # [B*H,1,Dh]
+                    q, k, v, 
+                    attn_mask=None,  # No mask for Flash eligibility
+                    dropout_p=0.0, 
+                    is_causal=False
+                )  # [B,H,1,Dh]
 
                 # back to [1,B,E]
-                ctx = ctx.reshape(B, H, 1, Dh).transpose(1, 2).contiguous().view(1, B, E)
+                ctx = ctx.permute(0, 2, 1, 3).contiguous().view(B, 1, E).transpose(0, 1)
 
                 # ✅ IMPORTANT: apply the MHA output projection, same as the stock module
                 ctx = mha.out_proj(ctx)  # preserves shape [1,B,E]

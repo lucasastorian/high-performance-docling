@@ -126,6 +126,25 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
+        # Convert model to bf16 for Flash Attention compatibility
+        self._setup_bf16()
+
+    def _setup_bf16(self):
+        """Convert ONLY transformer components to bf16 for Flash Attention, keep encoder in FP32"""
+        def _to_bf16(m):
+            if isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.Embedding, nn.LayerNorm)):
+                m.to(torch.bfloat16)
+            return m
+        
+        # Apply bf16 ONLY to transformer components, NOT the encoder
+        self._tag_transformer.apply(_to_bf16)
+        self._bbox_decoder.apply(_to_bf16)
+        
+        # Ensure positional encoding is also bf16
+        if hasattr(self._tag_transformer._positional_encoding, 'pe'):
+            pe = self._tag_transformer._positional_encoding.pe
+            self._tag_transformer._positional_encoding.pe = pe.to(torch.bfloat16)
+
     def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
         """
         Simple batched encoding without graphs or compilation.
@@ -149,6 +168,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         returns: list of (seq, outputs_class, outputs_coord)
         """
         B = imgs.size(0)
+        self.eval()  # Set entire model to eval mode
         self._encoder.eval()
         self._tag_transformer.eval()
         self._bbox_decoder.eval()
@@ -159,11 +179,15 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== ENCODER TIMING =====
         with timer.time_section('encoder_forward'):
-            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format
+            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format, FP32
+
+        # ===== FP32 → BF16 CUTOFF POINT =====
+        # Cast encoder output to bf16 for transformer components
+        enc_out_batch = enc_out_batch.to(torch.bfloat16)
 
         # ===== MEMORY PREPARATION =====
         with timer.time_section('tag_input_filter'):
-            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW
+            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW, now BF16
 
         with timer.time_section('memory_reshape'):
             filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
@@ -175,8 +199,13 @@ class TableModel04_rs(BaseModel, nn.Module):
             mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
 
         # ===== BATCHED DECODER =====
+        # Wrap decoder in autocast and sdp_kernel context for Flash Attention
+        from torch.backends.cuda import sdp_kernel
+        
         with timer.time_section('batched_ar_decoder'):
-            results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                    results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:
