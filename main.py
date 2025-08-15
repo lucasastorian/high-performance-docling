@@ -17,10 +17,10 @@ logging.basicConfig(level=logging.INFO, format='%(name)s - %(levelname)s - %(mes
 
 if __name__ == '__main__':
     # # 10-K
-    # pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/c87043b9-5d89-4717-9f49-c4f9663d0061.pdf"
+    pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/c87043b9-5d89-4717-9f49-c4f9663d0061.pdf"
 
     # 10-Q
-    pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/a411a029-368f-4479-b416-25c404acca3d.pdf"  # DocLing paper
+    # pdf_url = "https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320193/a411a029-368f-4479-b416-25c404acca3d.pdf"  # DocLing paper
 
     print("=" * 60)
     print("🚀 DISTRIBUTED DOCLING PIPELINE")
