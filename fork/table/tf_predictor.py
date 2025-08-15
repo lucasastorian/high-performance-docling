@@ -1119,38 +1119,60 @@ class TFPredictor:
 
     def _batch_preprocess_images(self, table_images: List[np.ndarray], resized_size: int,  mean, std, dtype=torch.float32, use_stream=True):
         """Batch preprocess images"""
-        if len(table_images) == 0:
+        if not table_images:
             return []
 
-        S = int(resized_size)
-        # Stack to NHWC uint8 on CPU
-        nhwc = np.stack(table_images, axis=0)  # [N,H,W,C], uint8
+            # --- bucket by (H, W, C) so each bucket stacks cleanly ---
+        buckets = {}  # (H, W, C) -> [indices]
+        shapes = []
+        for i, img in enumerate(table_images):
+            if img.ndim == 2:
+                # promote grayscale to HxWx1 to avoid surprises
+                img = img[..., None]
+                table_images[i] = img
+            if img.dtype != np.uint8:
+                table_images[i] = img.astype(np.uint8, copy=False)
+            h, w, c = img.shape
+            key = (h, w, c)
+            buckets.setdefault(key, []).append(i)
+            shapes.append(key)
 
-        # Pin host mem for async H2D; then copy as float32 to device
-        cpu = torch.from_numpy(nhwc).pin_memory()
+        # sanity: channel count should be consistent for your pipeline
+        first_c = shapes[0][2]
+        if any(c != first_c for (_, _, c) in shapes):
+            raise ValueError(f"Inconsistent channel counts detected: {[s[2] for s in shapes]}")
+
+        N, C, S = len(table_images), first_c, int(resized_size)
+        out = torch.empty((N, C, S, S), device=self._device, dtype=dtype)
+
+        # prepare normalization buffers once
+        mean_t = torch.tensor(mean, device=self._device, dtype=dtype).view(1, 1, 1, C)
+        std_t = torch.tensor(std, device=self._device, dtype=dtype).view(1, 1, 1, C)
+
         stream = torch.cuda.Stream(device=self._device) if use_stream else torch.cuda.current_stream(device=self._device)
         with torch.cuda.stream(stream):
-            t = cpu.to(device=self._device, dtype=dtype, non_blocking=True)  # [N,H,W,C], float32
+            for (h, w, c), idxs in buckets.items():
+                # stack this bucket on CPU (identical shapes)
+                nhwc = np.stack([table_images[i] for i in idxs], axis=0)  # [B,H,W,C], uint8
+                cpu = torch.from_numpy(nhwc).pin_memory()
 
-            # Normalize with *your* order:
-            # ((img - 255*mean)/std) / 255 == (img/255 - mean) / std  (algebraically equal)
-            # Do the simpler / more stable variant:
-            t = t / 255.0
-            mean_t = torch.tensor(mean, device=self._device, dtype=dtype).view(1, 1, 1, -1)
-            std_t = torch.tensor(std, device=self._device, dtype=dtype).view(1, 1, 1, -1)
-            t = (t - mean_t) / std_t
+                # H2D once, normalize, resize on GPU
+                t = cpu.to(device=self._device, dtype=dtype, non_blocking=True)  # [B,H,W,C]
+                t = t / 255.0
+                t = (t - mean_t) / std_t
 
-            # NCHW for interpolate, channels_last can help kernels
-            t = t.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)  # [N,C,H,W]
+                # NCHW for interpolate
+                t = t.permute(0, 3, 1, 2).contiguous(memory_format=torch.channels_last)  # [B,C,H,W]
+                t = F.interpolate(t, size=(S, S), mode="bilinear", align_corners=False)
 
-            # GPU resize (close to, not identical to, OpenCV bilinear)
-            t = F.interpolate(t, size=(S, S), mode="bilinear", align_corners=False)
+                # your layout quirk: (C, W, H). Swap the last two dims.
+                t = t.permute(0, 1, 3, 2).contiguous()  # [B,C,W,H]
 
-            # Your layout quirk: (C, W, H) not (C, H, W)
-            t = t.permute(0, 1, 3, 2).contiguous()  # [N,C,W,H]
+                # place back in original order
+                out[torch.as_tensor(idxs, device=self._device, dtype=torch.long)] = t
 
         if use_stream:
-            # Optionally let caller sync later; many pipelines just proceed and let CUDA sync naturally.
             torch.cuda.current_stream(device=self._device).wait_stream(stream)
 
-        return t
+        return out  # (N, C, W, H), float32 on device
+
