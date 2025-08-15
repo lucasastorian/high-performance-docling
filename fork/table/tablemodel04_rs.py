@@ -210,11 +210,12 @@ class TableModel04_rs(BaseModel, nn.Module):
             mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C] BF16
 
         # ===== BATCHED DECODER =====
-        # Wrap decoder in sdpa_kernel context for Flash Attention (no autocast needed - dtypes already set)
-        from torch.nn.attention import sdpa_kernel
+        # Force Flash Attention only for testing - will error if Flash can't be used
+        from torch.nn.attention import SDPBackend, sdpa_kernel
         
         with timer.time_section('batched_ar_decoder'):
-            with sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+            # Only Flash Attention - no fallback
+            with sdpa_kernel(backends=SDPBackend.FLASH_ATTENTION):
                 results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
