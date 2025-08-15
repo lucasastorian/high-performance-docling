@@ -189,22 +189,23 @@ class TableModel04_rs(BaseModel, nn.Module):
         with timer.time_section('encoder_forward'):
             enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format, FP32
 
-        # ===== FP32 → BF16 CUTOFF POINT =====
-        # Cast encoder output to bf16 for transformer components
-        enc_out_batch = enc_out_batch.to(torch.bfloat16)
-
         # ===== MEMORY PREPARATION =====
         with timer.time_section('tag_input_filter'):
-            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW, now BF16
+            # Keep in FP32 for CNN processing
+            filtered_nchw = self._tag_transformer._input_filter(enc_out_batch)  # [B,C,h,w] NCHW, FP32
 
         with timer.time_section('memory_reshape'):
             filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
             B_, h, w, C = filtered_nhwc.shape
             mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
+            
+            # ===== FP32 → BF16 CUTOFF POINT =====
+            # Cast to bf16 for transformer components
+            mem = mem.to(torch.bfloat16)
 
         # ===== TAG TRANSFORMER ENCODER =====
         with timer.time_section('tag_encoder'):
-            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C]
+            mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C] BF16
 
         # ===== BATCHED DECODER =====
         # Wrap decoder in autocast and sdp_kernel context for Flash Attention
