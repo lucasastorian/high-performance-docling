@@ -9,8 +9,6 @@ import os
 import threading
 from itertools import groupby
 from typing import List
-from multiprocessing import Pool, cpu_count
-from functools import partial
 
 import cv2
 import numpy as np
@@ -47,15 +45,6 @@ class bcolors:
     ENDC = "\033[0m"
     BOLD = "\033[1m"
     UNDERLINE = "\033[4m"
-
-
-def _postprocess_worker(post_processor, idx, matching_details, correct_overlapping_cells):
-    """Worker function for parallel postprocessing - minimal pickle overhead"""
-    # Only postprocess, matching already done
-    processed_details = post_processor.process(
-        matching_details, correct_overlapping_cells
-    )
-    return (idx, processed_details)
 
 
 def otsl_sqr_chk(rs_list, logdebug):
@@ -100,7 +89,7 @@ class TFPredictor:
     Table predictions for the in-memory Docling API
     """
 
-    def __init__(self, config, device: str = "cpu", num_threads: int = 4, mp_workers: int = None):
+    def __init__(self, config, device: str = "cpu", num_threads: int = 4):
         r"""
         Parameters
         ----------
@@ -125,13 +114,6 @@ class TFPredictor:
 
         self._cell_matcher = CellMatcher(config)
         self._post_processor = MatchingPostProcessor(config)
-        
-        # Initialize multiprocessing pool for matching/postprocessing
-        self._mp_workers = mp_workers if mp_workers is not None else min(9, cpu_count())
-        self._mp_pool = None
-        if self._mp_workers > 1:
-            self._mp_pool = Pool(processes=self._mp_workers)
-            self._log().info(f"Initialized multiprocessing pool with {self._mp_workers} workers")
 
         self._init_word_map()
 
@@ -239,18 +221,6 @@ class TFPredictor:
 
     def get_model_type(self):
         return self._model_type
-    
-    def cleanup(self):
-        """Clean up multiprocessing pool"""
-        if self._mp_pool is not None:
-            self._mp_pool.close()
-            self._mp_pool.join()
-            self._mp_pool = None
-            self._log().info("Multiprocessing pool closed")
-    
-    def __del__(self):
-        """Ensure pool is cleaned up on object destruction"""
-        self.cleanup()
 
     def _log(self):
         # Setup a custom logger
@@ -641,7 +611,7 @@ class TFPredictor:
             "All batched inputs must be same length"
 
         AggProfiler().start_agg(self._prof)
-        
+
         # Create timer for detailed TF predictor timing
         # Fix: Check device type properly (handles 'cuda:0', 'cuda:1', etc.)
         is_cuda = str(self._device).startswith('cuda')
@@ -758,29 +728,23 @@ class TFPredictor:
         # --- 3) Per-item: bbox/tag sync, matching, (optional) postproc, docling response, merge ---
         with timer.time_section('cell_matching_and_postprocess'):
             outputs: list[tuple[list[dict], dict]] = []
-            
-            # First pass: Do matching serially (it's fast and avoids pickle overhead)
-            matching_results = []
-            postprocess_args = []
-            
+
             for i, prediction in enumerate(all_predictions):
                 iocr_page = iocr_pages[i]
                 scaled_bbox = table_bboxes[i]  # coords in RESIZED-PAGE space
                 scale_factor = scale_factors[i]
-                
-                # Sync bboxes vs tags (quick, keep serial)
+
+                # Logically identical checks to original
+                self._log().debug("----- rs_seq -----")
+                self._log().debug(prediction["rs_seq"])
+                self._log().debug(len(prediction["rs_seq"]))
+                otsl_sqr_chk(prediction["rs_seq"], False)
+
+                # Sync bboxes vs tags
                 sync, corrected_bboxes = self._check_bbox_sync(prediction)
                 if not sync:
                     prediction["bboxes"] = corrected_bboxes
-                
-                # Convert table bbox back to ORIGINAL page_input coords
-                tbl_bbox_for_match = [
-                    scaled_bbox[0] / scale_factor,
-                    scaled_bbox[1] / scale_factor,
-                    scaled_bbox[2] / scale_factor,
-                    scaled_bbox[3] / scale_factor,
-                ]
-                
+
                 # Prepare matching details
                 matching_details = {
                     "table_cells": [],
@@ -788,56 +752,34 @@ class TFPredictor:
                     "pdf_cells": [],
                     "prediction_bboxes_page": [],
                 }
-                
-                # Do matching (serial - fast and avoids heavy pickle of iocr_page)
+
+                # Convert table bbox back to ORIGINAL page_input coords (undo page resize)
+                tbl_bbox_for_match = [
+                    scaled_bbox[0] / scale_factor,
+                    scaled_bbox[1] / scale_factor,
+                    scaled_bbox[2] / scale_factor,
+                    scaled_bbox[3] / scale_factor,
+                ]
+
+                # Matching (faithful to original)
                 if len(prediction["bboxes"]) > 0:
                     if do_matching:
                         matching_details = self._cell_matcher.match_cells(
                             iocr_page, tbl_bbox_for_match, prediction
                         )
-                        # Check if postprocessing is needed
+                        # Post-processing if tokens exist and post-process enabled
                         if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
-                            # Queue for parallel postprocessing
-                            postprocess_args.append((i, matching_details, correct_overlapping_cells))
-                        else:
-                            matching_results.append((i, matching_details))
+                            AggProfiler().begin("post_process", self._prof)
+                            matching_details = self._post_processor.process(
+                                matching_details, correct_overlapping_cells
+                            )
+                            AggProfiler().end("post_process", self._prof)
                     else:
                         matching_details = self._cell_matcher.match_cells_dummy(
                             iocr_page, tbl_bbox_for_match, prediction
                         )
-                        matching_results.append((i, matching_details))
-                else:
-                    matching_results.append((i, matching_details))
-            
-            # Second pass: Parallel postprocessing (if needed)
-            if postprocess_args and self._mp_pool is not None and len(postprocess_args) > 1:
-                AggProfiler().begin("post_process_parallel", self._prof)
-                # Use multiprocessing for postprocessing only
-                postprocessed = self._mp_pool.starmap(
-                    _postprocess_worker,
-                    [(self._post_processor, *args) for args in postprocess_args]
-                )
-                matching_results.extend(postprocessed)
-                AggProfiler().end("post_process_parallel", self._prof)
-            elif postprocess_args:
-                # Serial postprocessing fallback
-                AggProfiler().begin("post_process_serial", self._prof)
-                for args in postprocess_args:
-                    idx, matching_details, correct_overlapping_cells = args
-                    processed = self._post_processor.process(
-                        matching_details, correct_overlapping_cells
-                    )
-                    matching_results.append((idx, processed))
-                AggProfiler().end("post_process_serial", self._prof)
-            
-            # Sort results by index to maintain order
-            matching_results.sort(key=lambda x: x[0])
-            
-            # Third pass: Generate docling responses and merge (serial - fast)
-            for (idx, matching_details) in matching_results:
-                prediction = all_predictions[idx]
-                
-                # Generate Docling responses
+
+                # Generate Docling responses (as in original)
                 AggProfiler().begin("generate_docling_response", self._prof)
                 if do_matching:
                     docling_output = self._generate_tf_response(
