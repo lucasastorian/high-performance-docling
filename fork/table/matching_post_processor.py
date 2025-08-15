@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import statistics
+import numpy as np
 
 import docling_ibm_models.tableformer.settings as s
 
@@ -438,34 +439,32 @@ class MatchingPostProcessor:
 
             return box1, box2
 
-        def do_boxes_overlap(box1, box2):
-            B1 = box1["bbox"]
-            B2 = box2["bbox"]
-            if (
-                (B1[0] >= B2[2])
-                or (B1[2] <= B2[0])
-                or (B1[3] <= B2[1])
-                or (B1[1] >= B2[3])
-            ):
-                return False
-            else:
-                return True
+        table_cells = list(table_cells)
+        bboxes = np.array([c["bbox"] for c in table_cells], dtype=np.int32)
+        N = len(bboxes)
 
-        def find_overlapping_pairs_indexes(bboxes):
-            overlapping_indexes = []
-            # Compare each box with every other box (combinations)
-            for i in range(len(bboxes)):
-                for j in range(i + 1, len(bboxes)):
-                    if i != j:
-                        if bboxes[i] != bboxes[j]:
-                            if do_boxes_overlap(bboxes[i], bboxes[j]):
-                                bboxes[i], bboxes[j] = correct_overlap(
-                                    bboxes[i], bboxes[j]
-                                )
+        x1_min = bboxes[:, 0][:, None]
+        y1_min = bboxes[:, 1][:, None]
+        x1_max = bboxes[:, 2][:, None]
+        y1_max = bboxes[:, 3][:, None]
 
-            return overlapping_indexes, bboxes
+        x2_min = bboxes[:, 0][None, :]
+        y2_min = bboxes[:, 1][None, :]
+        x2_max = bboxes[:, 2][None, :]
+        y2_max = bboxes[:, 3][None, :]
 
-        overlapping_indexes, table_cells = find_overlapping_pairs_indexes(table_cells)
+        overlap_x = (np.minimum(x1_max, x2_max) - np.maximum(x1_min, x2_min)) > 0
+        overlap_y = (np.minimum(y1_max, y2_max) - np.maximum(y1_min, y2_min)) > 0
+        overlap_mask = overlap_x & overlap_y
+
+        tri_mask = np.triu(np.ones_like(overlap_mask), k=1).astype(bool)
+        overlap_mask &= tri_mask
+
+        overlap_pairs = np.argwhere(overlap_mask)
+
+        for i, j in overlap_pairs:
+            table_cells[i], table_cells[j] = correct_overlap(table_cells[i], table_cells[j])
+
         return table_cells
 
     def _align_table_cells_to_pdf(self, table_cells, pdf_cells, matches):
