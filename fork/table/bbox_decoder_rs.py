@@ -150,14 +150,14 @@ class BBoxDecoder(nn.Module):
             "bbox inference expects a single table (B=1)."
 
         device = enc_out_nchw.device
-        dtype = enc_out_nchw.dtype
+        
+        # Match input dtypes to the module's weights to avoid mat1/mat2 mismatch
+        # BBox decoder should be FP32, so ensure inputs match
+        param_dtype = next(self.parameters()).dtype
+        enc_out_nchw = enc_out_nchw.to(dtype=param_dtype)
 
-        # Optional autocast (only on CUDA, disabled otherwise)
-        if use_amp and device.type == 'cuda':
-            autocast_cm = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
-        else:
-            # No autocast on CPU or when disabled
-            autocast_cm = torch.autocast(device_type=device.type, enabled=False)
+        # Disable autocast - we're doing explicit dtype control
+        autocast_cm = torch.autocast(device_type=device.type, enabled=False)
 
         with autocast_cm:
             # 1) Optional conv filter (kept to preserve weights/behavior)
@@ -177,21 +177,21 @@ class BBoxDecoder(nn.Module):
             if isinstance(tag_H, torch.Tensor):
                 # Already a tensor [N, D] from preallocated buffer
                 if tag_H.numel() == 0:
-                    empty = torch.empty(0, device=device, dtype=dtype)
+                    empty = torch.empty(0, device=device, dtype=param_dtype)
                     return empty, empty
-                tag_H_stacked = tag_H.to(device=device, dtype=dtype)
+                tag_H_stacked = tag_H.to(device=device, dtype=param_dtype)  # Match module dtype
                 N = tag_H_stacked.size(0)
             else:
                 # Legacy list path
                 if len(tag_H) == 0:
-                    empty = torch.empty(0, device=device, dtype=dtype)
+                    empty = torch.empty(0, device=device, dtype=param_dtype)
                     return empty, empty
                 
                 tag_H_stacked = []
                 for t in tag_H:
                     t = t.squeeze(0) if (t.dim() == 2 and t.size(0) == 1) else t.reshape(-1)
                     tag_H_stacked.append(t)
-                tag_H_stacked = torch.stack(tag_H_stacked, dim=0).to(device=device, dtype=dtype)  # [N, D]
+                tag_H_stacked = torch.stack(tag_H_stacked, dim=0).to(device=device, dtype=param_dtype)  # [N, D]
                 N = tag_H_stacked.size(0)
 
             # 4) Precompute linear pieces (no broadcasts yet)

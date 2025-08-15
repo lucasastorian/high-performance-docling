@@ -138,20 +138,22 @@ class TableModel04_rs(BaseModel, nn.Module):
         return self
     
     def _convert_transformers_to_bf16(self):
-        """Convert ONLY transformer components to bf16 for Flash Attention, keep encoder in FP32"""
+        """Convert ONLY tag transformer to bf16 for Flash Attention; keep encoder and bbox decoder in FP32"""
         def _to_bf16(m):
             if isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.Embedding, nn.LayerNorm)):
                 m.to(torch.bfloat16)
             return m
         
-        # Apply bf16 ONLY to transformer components, NOT the encoder
+        # Apply bf16 ONLY to tag transformer, NOT the encoder or bbox decoder
         self._tag_transformer.apply(_to_bf16)
-        self._bbox_decoder.apply(_to_bf16)
         
         # Ensure positional encoding is also bf16
         if hasattr(self._tag_transformer._positional_encoding, 'pe'):
             pe = self._tag_transformer._positional_encoding.pe
             self._tag_transformer._positional_encoding.pe = pe.to(torch.bfloat16)
+        
+        # Explicitly ensure bbox decoder stays in FP32 (in case it was accidentally converted)
+        self._bbox_decoder.to(torch.float32)
 
     def _encode_in_blocks(self, imgs: torch.Tensor, block_bs: int = 32) -> torch.Tensor:
         """
@@ -208,13 +210,12 @@ class TableModel04_rs(BaseModel, nn.Module):
             mem_enc = self._tag_transformer._encoder(mem, mask=None)  # [S,B,C] BF16
 
         # ===== BATCHED DECODER =====
-        # Wrap decoder in autocast and sdp_kernel context for Flash Attention
-        from torch.backends.cuda import sdp_kernel
+        # Wrap decoder in sdpa_kernel context for Flash Attention (no autocast needed - dtypes already set)
+        from torch.nn.attention import sdpa_kernel
         
         with timer.time_section('batched_ar_decoder'):
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
-                    results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
+            with sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                results = self._batched_decoder.predict_batched(enc_out_batch, mem_enc, max_steps)
 
         # Finalize and print timing if profiling enabled
         if self._prof:
