@@ -475,24 +475,25 @@ class CellMatcher:
         # IOpdf = intersection area / PDF cell area
         iopdf = inter_area / pdf_areas[None, :]  # (T,P)
 
-        # Filter matches where IOpdf > 0
-        match_rows, match_cols = np.nonzero(iopdf > 0)
+        # For each PDF cell (column), find table cell (row) with max IOpdf
+        best_table_idxs = np.argmax(iopdf, axis=0)  # (P,) indices into table_cells
+        best_scores = iopdf[best_table_idxs, np.arange(P)]  # (P,)
+
+        # Optional: thresholding
+        threshold = 0.01
+        valid_mask = best_scores > threshold
+
         matches = {}
         matches_counter = 0
 
-        for i, j in zip(match_rows, match_cols):
+        for j in np.where(valid_mask)[0]:
+            i = best_table_idxs[j]
             pdf_id = pdf_cell_ids[j]
             table_id = table_cell_ids[i]
-            score = float(iopdf[i, j])
-            match = {"table_cell_id": table_id, "iopdf": score}
+            score = float(best_scores[j])
 
-            if pdf_id not in matches:
-                matches[pdf_id] = [match]
-                matches_counter += 1
-            else:
-                if match not in matches[pdf_id]:
-                    matches[pdf_id].append(match)
-                    matches_counter += 1
+            matches[pdf_id] = [{"table_cell_id": table_id, "iopdf": score}]
+            matches_counter += 1
 
         return matches, matches_counter
 
