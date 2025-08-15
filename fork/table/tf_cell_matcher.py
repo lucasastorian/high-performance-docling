@@ -440,7 +440,7 @@ class CellMatcher:
         # y2_top = tbx[1] + (tbx[3] - page_bl[:,3])
         out[:, 1] = tbx[1] + (tbx[3] - page_bl[:, 1])
         out[:, 3] = tbx[1] + (tbx[3] - page_bl[:, 3])
-        return out  # (N,4) TOP-LEFT page coords
+        return out.tolist()
 
     def _intersection_over_pdf_match(self, table_cells, pdf_cells):
         r"""
