@@ -117,24 +117,24 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
 
         # Fused QKV projection: ONE matmul instead of three
         x = last_in.squeeze(0)  # [1,B,D] -> [B,D] to avoid permutes
-        qkv = F.linear(x, mha.in_proj_weight, mha.in_proj_bias)  # [B, 3E] - single GEMM!
+        qkv = F.linear(x, mha.in_proj_weight, mha.in_proj_bias).contiguous()  # [B, 3E] - single GEMM!
         q, k, v = qkv.split(E, dim=-1)  # each [B, E]
         B = q.size(0)
 
-        # Reshape to heads
-        q = q.view(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
-        k = k.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
-        v = v.view(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        # Reshape to heads - use .reshape instead of .view for non-contiguous tensors
+        q = q.reshape(B, H, Dh).reshape(B * H, 1, Dh)  # [B*H,1,Dh]
+        k = k.reshape(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
+        v = v.reshape(B, H, Dh).unsqueeze(2)  # [B,H,1,Dh]
 
         # Use preallocated KV and device cursor
         K_buf, V_buf, t_dev, cap, pos_cap = kv_prev  # K/V: [B, H, cap, Dh]; t_dev: [1] int32
 
         # Capture-safe KV write using scatter_ on flattened views
         BH = B * H
-        Kvh = K_buf.view(BH, cap, Dh)  # [BH, cap, Dh]
-        Vvh = V_buf.view(BH, cap, Dh)  # [BH, cap, Dh]
-        k1 = k.view(BH, 1, Dh)         # [BH, 1, Dh]
-        v1 = v.view(BH, 1, Dh)         # [BH, 1, Dh]
+        Kvh = K_buf.view(BH, cap, Dh)  # [BH, cap, Dh] - OK: K_buf is preallocated and contiguous
+        Vvh = V_buf.view(BH, cap, Dh)  # [BH, cap, Dh] - OK: V_buf is preallocated and contiguous
+        k1 = k.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous k
+        v1 = v.reshape(BH, 1, Dh)      # [BH, 1, Dh] - use reshape for non-contiguous v
 
         # Device cursor -> per-row index [BH,1]
         t_idx_bh = t_dev.to(torch.long).view(1, 1).expand(BH, 1)  # [BH,1]

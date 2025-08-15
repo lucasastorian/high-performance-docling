@@ -8,6 +8,7 @@ import os
 import torch
 import torch.nn as nn
 
+
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
 from fork.timers import _CPUTimer, _CudaTimer
