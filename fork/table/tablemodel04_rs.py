@@ -132,21 +132,30 @@ class TableModel04_rs(BaseModel, nn.Module):
         """Call this AFTER loading checkpoint to prepare model for optimized inference"""
         self._convert_transformers_to_bf16()
 
-        # Compile the decoder
-        self._tag_transformer._decoder = torch.compile(
-            self._tag_transformer._decoder,
-            backend="inductor",
-            dynamic=True,
-            fullgraph=False,
-            mode="max-autotune-no-cudagraphs",
-        )
-
         self.eval()
         torch.set_grad_enabled(False)
+
+        self._compile_decoder()
 
         self._warmup_decoder()
 
         return self
+
+    def _compile_decoder(self):
+        """Compiles the decoder - layer by layer"""
+        for lyr in self._tag_transformer._decoder.layers:
+            lyr.linear1 = torch.compile(
+                lyr.linear1, backend="inductor",
+                dynamic=True, fullgraph=False, mode="reduce-overhead"
+            )
+            lyr.linear2 = torch.compile(
+                lyr.linear2, backend="inductor",
+                dynamic=True, fullgraph=False, mode="reduce-overhead"
+            )
+        self._tag_transformer._fc = torch.compile(
+            self._tag_transformer._fc, backend="inductor",
+            dynamic=True, fullgraph=False, mode="reduce-overhead"
+        )
 
     def _warmup_decoder(self):
         """Warms up the decoder after compilation"""
