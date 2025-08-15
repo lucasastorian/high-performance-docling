@@ -7,7 +7,7 @@ import os
 
 import torch
 import torch.nn as nn
-
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.models.common.base_model import BaseModel
@@ -142,24 +142,80 @@ class TableModel04_rs(BaseModel, nn.Module):
         )
 
         self.eval()
+        self._warmup_decoder()
 
         return self
-    
+
+    def _warmup_decoder(self):
+        """Warms up the decoder after compilation"""
+        device = self._device
+        D = self._tag_transformer._decoder_dim  # e.g., 512
+        H = self._tag_transformer._decoder.layers[0].self_attn.num_heads  # e.g., 8
+        # Use your typical production batch and memory length (h*w). 28*28 = 784 in your logs.
+        B = int(os.getenv("DL_WARMUP_B", "25"))
+        S_mem = int(os.getenv("DL_WARMUP_SMEM", "784"))
+        dtype = self._tag_transformer._embedding.weight.dtype  # bf16 or fp16
+
+        with torch.inference_mode():
+            # ---- Warm the transformer encoder on memory (S,B,D)
+            enc_in = torch.zeros(S_mem, B, D, device=device, dtype=dtype)
+            _ = self._tag_transformer._encoder(enc_in)
+
+            # ---- Build memory & precomputed K/V for cross-attn path
+            memory = torch.zeros(S_mem, B, D, device=device, dtype=dtype)
+            mem_kv = self._tag_transformer.precompute_mem_kv(memory)
+
+            # Mark dynamic sequence dim so Inductor won’t retrace as t grows
+            try:
+                torch._dynamo.mark_dynamic(memory, 0)  # dim 0 is S
+            except Exception:
+                pass  # older torch may not expose mark_dynamic
+
+            # ---- Self-attn incremental warmup: t=1 then t=2 (grows KV cache)
+            # Always call inside an SDPA context that prefers Flash but allows fallback
+            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION,
+                                       SDPBackend.EFFICIENT_ATTENTION,
+                                       SDPBackend.MATH]):
+                sa_kv = None
+                # t=1 (S_q==S_k -> is_causal=True)
+                tgt = torch.zeros(1, B, D, device=device, dtype=dtype)  # one token emb (already PE’d in your code path)
+                last_h, sa_kv = self._tag_transformer._decoder(
+                    tgt, memory=memory, cache=None, memory_kv=None,
+                    sa_kv_cache=sa_kv, max_pred_len=128
+                )
+                # t=2 (S_q=1, S_k=2 -> your code should set is_causal=False)
+                last_h, sa_kv = self._tag_transformer._decoder(
+                    tgt, memory=memory, cache=None, memory_kv=None,
+                    sa_kv_cache=sa_kv, max_pred_len=128
+                )
+
+                # ---- Cross-attn warmup (uses precomputed mem_kv)
+                # (single token query over big memory; exercises Flash cross-attn path)
+                _ = self._tag_transformer._decoder(
+                    tgt, memory=memory, cache=None, memory_kv=mem_kv,
+                    sa_kv_cache=None, max_pred_len=128
+                )
+
+        # Ensure kernels finished compiling before we return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
     def _convert_transformers_to_bf16(self):
         """Convert ONLY tag transformer to bf16 for Flash Attention; keep encoder and bbox decoder in FP32"""
+
         def _to_bf16(m):
             if isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.Embedding, nn.LayerNorm)):
                 m.to(torch.bfloat16)
             return m
-        
+
         # Apply bf16 ONLY to tag transformer, NOT the encoder or bbox decoder
         self._tag_transformer.apply(_to_bf16)
-        
+
         # Ensure positional encoding is also bf16
         if hasattr(self._tag_transformer._positional_encoding, 'pe'):
             pe = self._tag_transformer._positional_encoding.pe
             self._tag_transformer._positional_encoding.pe = pe.to(torch.bfloat16)
-        
+
         # Explicitly ensure bbox decoder stays in FP32 (in case it was accidentally converted)
         self._bbox_decoder.to(torch.float32)
 
@@ -197,7 +253,8 @@ class TableModel04_rs(BaseModel, nn.Module):
 
         # ===== ENCODER TIMING =====
         with timer.time_section('encoder_forward'):
-            enc_out_batch = self._encode_in_blocks(imgs, block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format, FP32
+            enc_out_batch = self._encode_in_blocks(imgs,
+                                                   block_bs=self._encoder_block_bs)  # [B,C,H,W] - NCHW format, FP32
 
         # ===== MEMORY PREPARATION =====
         with timer.time_section('tag_input_filter'):
@@ -208,7 +265,7 @@ class TableModel04_rs(BaseModel, nn.Module):
             filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)  # [B,h,w,C] NHWC
             B_, h, w, C = filtered_nhwc.shape
             mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()  # [B,h*w,C] -> [h*w,B,C] = [S,B,C]
-            
+
             # ===== FP32 → BF16 CUTOFF POINT =====
             # Cast to bf16 for transformer components
             mem = mem.to(torch.bfloat16)
@@ -220,7 +277,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         # ===== BATCHED DECODER =====
         # Force Flash Attention only for testing - will error if Flash can't be used
         from torch.nn.attention import SDPBackend, sdpa_kernel
-        
+
         with timer.time_section('batched_ar_decoder'):
             # Only Flash Attention - no fallback
             with sdpa_kernel(backends=SDPBackend.FLASH_ATTENTION):
