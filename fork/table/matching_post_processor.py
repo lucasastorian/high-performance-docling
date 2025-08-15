@@ -733,7 +733,7 @@ class MatchingPostProcessor:
         """
         bbox_result = [-1, -1, -1, -1]
         bbox_result[0] = min([bbox1[0], bbox2[0]])
-        bbox_result[1] = mi([bbox1[1], bbox2[1]])
+        bbox_result[1] = min([bbox1[1], bbox2[1]])
         bbox_result[2] = max([bbox1[2], bbox2[2]])
         bbox_result[3] = max([bbox1[3], bbox2[3]])
         return bbox_result
