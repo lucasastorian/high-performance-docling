@@ -817,7 +817,7 @@ class MatchingPostProcessor:
 
             # Y coordinates that define band of rows
             if len(bbox_y1s) > 0:
-                row_y1 = mi(bbox_y1s)
+                row_y1 = min(bbox_y1s)
             if len(bbox_y2s) > 0:
                 row_y2 = max(bbox_y2s)
 
