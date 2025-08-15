@@ -174,7 +174,7 @@ class TableModel04_rs(BaseModel, nn.Module):
     @torch.inference_mode()
     def predict(self, imgs, max_steps, k, return_attention=False):
         """
-        Stage 3: batched encoder + batched AR decoder.
+        Stage 3: batched encoder + batched AR decoder with dynamic batching.
         imgs: [B,3,448,448]
         returns: list of (seq, outputs_class, outputs_coord)
         """
@@ -184,6 +184,32 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._tag_transformer.eval()
         self._bbox_decoder.eval()
 
+        # Dynamic batching with maximum batch size of 128
+        MAX_BATCH_SIZE = 128
+        
+        # If batch size is within limit, process normally
+        if B <= MAX_BATCH_SIZE:
+            return self._predict_batch(imgs, max_steps, k, return_attention)
+        
+        # Otherwise, process in chunks
+        all_results = []
+        for i in range(0, B, MAX_BATCH_SIZE):
+            batch_end = min(i + MAX_BATCH_SIZE, B)
+            batch_imgs = imgs[i:batch_end]
+            batch_results = self._predict_batch(batch_imgs, max_steps, k, return_attention)
+            all_results.extend(batch_results)
+        
+        return all_results
+    
+    @torch.inference_mode()
+    def _predict_batch(self, imgs, max_steps, k, return_attention=False):
+        """
+        Process a single batch of images.
+        imgs: [B,3,448,448] where B <= MAX_BATCH_SIZE
+        returns: list of (seq, outputs_class, outputs_coord)
+        """
+        B = imgs.size(0)
+        
         # Use proper timer based on device
         is_cuda = str(self._device).startswith('cuda')
         timer = _CudaTimer() if is_cuda else _CPUTimer()
