@@ -191,12 +191,15 @@ class TMTransformerDecoderLayer(nn.TransformerDecoderLayer):
         # Debug: Check Flash eligibility
         self._flash_debug_guard(q, k_sdp, v_sdp, True, "self-attn")
 
-        # Flash-compatible call: no mask, causal=True for self-attention
+        # Flash-compatible call: For incremental decoding with S_q=1, S_k>1, 
+        # we can't use is_causal=True (Flash requires square attention for causal flag).
+        # Since we're always querying the last position against all previous positions,
+        # we don't need a mask - it's inherently causal.
         ctx = F.scaled_dot_product_attention(
             q, k_sdp, v_sdp,
             attn_mask=None,
             dropout_p=0.0,
-            is_causal=True  # Changed to True for Flash compatibility
+            is_causal=False  # False for non-square attention in incremental mode
         )  # [B,H,1,Dh]
 
         # Merge heads -> [1,B,E]
