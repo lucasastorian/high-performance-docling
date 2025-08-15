@@ -211,6 +211,10 @@ class TFPredictor:
                 self._log().error(err_msg)
                 raise ValueError(err_msg)
 
+            # Setup model for inference (bf16 conversion, eval mode) AFTER loading weights
+            model.setup_for_inference()
+            self._log().info("Model configured for optimized inference (bf16 transformers, fp32 encoder)")
+
             # Prepare the encoder for inference AFTER loading weights
             # This handles fusion, compilation, and graph capture in correct order
             if hasattr(model, '_encoder') and hasattr(model._encoder, 'prepare_for_inference'):

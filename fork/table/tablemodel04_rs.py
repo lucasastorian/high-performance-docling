@@ -126,10 +126,18 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Block size for encoder batching
         self._encoder_block_bs = int(os.getenv("ENCODER_BLOCK_BS", "32"))
 
-        # Convert model to bf16 for Flash Attention compatibility
-        self._setup_bf16()
+        # Don't convert to bf16 here - wait until after checkpoint is loaded
 
-    def _setup_bf16(self):
+    def setup_for_inference(self):
+        """Call this AFTER loading checkpoint to prepare model for optimized inference"""
+        # Convert transformer components to bf16 for Flash Attention
+        self._convert_transformers_to_bf16()
+        
+        # Ensure model is in eval mode
+        self.eval()
+        return self
+    
+    def _convert_transformers_to_bf16(self):
         """Convert ONLY transformer components to bf16 for Flash Attention, keep encoder in FP32"""
         def _to_bf16(m):
             if isinstance(m, (nn.Linear, nn.MultiheadAttention, nn.Embedding, nn.LayerNorm)):
