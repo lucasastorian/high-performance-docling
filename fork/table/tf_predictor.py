@@ -500,24 +500,33 @@ class TFPredictor:
         all_iocr_pages: list[dict] = []
 
         with phase1_timer.time_section('phase1_total'):
-            for page_input, page_tbl_bboxes in zip(page_inputs, table_bboxes_list):
-                # Original pipeline: resize the *page* once, then scale all table bboxes with the same factor
-                page_image = page_input["image"]
-                
-                with phase1_timer.time_section('page_resize'):
-                    resized_page, scale_factor = self.resize_img(page_image, height=1024)
+            # Extract all page images first
+            all_page_images = [page_input["image"] for page_input in page_inputs]
 
-                with phase1_timer.time_section('table_cropping'):
+            with phase1_timer.time_section('page_resize'):
+                resized_pages, scale_factors = self._batch_resize_pages(
+                    pages=all_page_images, target_height=1024, device=self._device  # e.g. 'cuda'
+                )
+
+            with phase1_timer.time_section('table_cropping'):
+                for page_idx, (page_input, page_tbl_bboxes) in enumerate(zip(page_inputs, table_bboxes_list)):
+                    resized_page = resized_pages[page_idx]
+                    scale_factor = scale_factors[page_idx]
+
+                    if isinstance(resized_page, torch.Tensor):
+                        resized_page_np = (resized_page * 255).byte().permute(1, 2, 0).cpu().numpy()
+                    else:
+                        resized_page_np = resized_page
+
                     for tbl_bbox in page_tbl_bboxes:
-                        # Scale bbox into resized-page coordinates (do not mutate caller data)
+                        # Scale bbox into resized-page coordinates
                         x1 = tbl_bbox[0] * scale_factor
                         y1 = tbl_bbox[1] * scale_factor
                         x2 = tbl_bbox[2] * scale_factor
                         y2 = tbl_bbox[3] * scale_factor
                         scaled_bbox = [x1, y1, x2, y2]
 
-                        # Crop table region from the *resized* page (like standard)
-                        crop = resized_page[round(y1):round(y2), round(x1):round(x2)]
+                        crop = resized_page_np[round(y1):round(y2), round(x1):round(x2)]
 
                         all_table_images.append(crop)
                         all_scaled_bboxes.append(scaled_bbox)
@@ -526,7 +535,7 @@ class TFPredictor:
 
             if not all_table_images:
                 return []
-        
+
         # Finalize and print phase 1 timing
         phase1_timer.finalize()
         num_pages = len(page_inputs)
@@ -1148,3 +1157,34 @@ class TFPredictor:
 
         return out  # (N, C, W, H), float32 on device
 
+    def _batch_resize_pages(self, pages: List[np.ndarray], target_height: int, device='cuda'):
+        resized_pages = []
+        orig_shapes = []
+
+        for img in pages:
+            if img.ndim == 2:
+                img = img[..., None]  # Grayscale to HWC
+            if img.shape[2] == 1:
+                img = np.repeat(img, 3, axis=2)  # Promote grayscale to RGB
+
+            orig_shapes.append(img.shape[:2])
+            img = img.astype(np.uint8)
+
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
+            resized_pages.append(img_tensor)
+
+        batch = torch.stack(resized_pages).to(device)  # (N, C, H, W)
+        _, _, h, w = batch.shape
+        scale_factors = [target_height / h_i for (h_i, _) in orig_shapes]
+        target_widths = [int(w_i * sf) for (_, w_i), sf in zip(orig_shapes, scale_factors)]
+        max_width = max(target_widths)
+
+        # Resize to (target_height, max_width) and pad
+        resized_batch = []
+        for i, img in enumerate(batch):
+            resized = F.interpolate(img.unsqueeze(0), size=(target_height, target_widths[i]), mode='bilinear',
+                                    align_corners=False)[0]
+            padded = F.pad(resized, (0, max_width - target_widths[i], 0, 0), mode='constant', value=1.0)  # right pad
+            resized_batch.append(padded)
+
+        return resized_batch, scale_factors
