@@ -1158,33 +1158,39 @@ class TFPredictor:
         return out  # (N, C, W, H), float32 on device
 
     def _batch_resize_pages(self, pages: List[np.ndarray], target_height: int, device='cuda'):
-        resized_pages = []
-        orig_shapes = []
+        resized_pages = [None] * len(pages)
+        scale_factors = [None] * len(pages)
+        max_width = 0
 
-        for img in pages:
+        # Preprocess: convert and compute target width
+        inputs = []
+        shapes = []
+
+        for i, img in enumerate(pages):
             if img.ndim == 2:
-                img = img[..., None]  # Grayscale to HWC
+                img = img[..., None]
             if img.shape[2] == 1:
-                img = np.repeat(img, 3, axis=2)  # Promote grayscale to RGB
-
-            orig_shapes.append(img.shape[:2])
+                img = np.repeat(img, 3, axis=2)
+            h, w = img.shape[:2]
+            scale = target_height / h
+            target_width = int(w * scale)
+            scale_factors[i] = scale
+            max_width = max(max_width, target_width)
             img = img.astype(np.uint8)
+            tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
+            inputs.append((i, tensor, target_width))
 
-            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
-            resized_pages.append(img_tensor)
+        # Launch resizes in parallel using CUDA streams
+        streams = [torch.cuda.Stream(device=device) for _ in range(len(inputs))]
 
-        batch = torch.stack(resized_pages).to(device)  # (N, C, H, W)
-        _, _, h, w = batch.shape
-        scale_factors = [target_height / h_i for (h_i, _) in orig_shapes]
-        target_widths = [int(w_i * sf) for (_, w_i), sf in zip(orig_shapes, scale_factors)]
-        max_width = max(target_widths)
+        for (i, tensor, target_width), stream in zip(inputs, streams):
+            with torch.cuda.stream(stream):
+                t = tensor.unsqueeze(0).to(device, non_blocking=True)  # [1, C, H, W]
+                resized = F.interpolate(t, size=(target_height, target_width), mode='bilinear', align_corners=False)[0]
+                padded = F.pad(resized, (0, max_width - target_width, 0, 0), mode='constant', value=1.0)
+                resized_pages[i] = padded
 
-        # Resize to (target_height, max_width) and pad
-        resized_batch = []
-        for i, img in enumerate(batch):
-            resized = F.interpolate(img.unsqueeze(0), size=(target_height, target_widths[i]), mode='bilinear',
-                                    align_corners=False)[0]
-            padded = F.pad(resized, (0, max_width - target_widths[i], 0, 0), mode='constant', value=1.0)  # right pad
-            resized_batch.append(padded)
+        # Wait for all streams to complete
+        torch.cuda.synchronize()
 
-        return resized_batch, scale_factors
+        return resized_pages, scale_factors

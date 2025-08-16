@@ -97,10 +97,11 @@ class MatchingPostProcessor:
                         if cell["cell_class"] <= 1:
                             allow_class = False
                     else:
-                        self._log().debug("***")
-                        self._log().debug("no cell_class in...")
-                        self._log().debug(cell)
-                        self._log().debug("***")
+                        pass
+                        # self._log().debug("***")
+                        # self._log().debug("no cell_class in...")
+                        # self._log().debug(cell)
+                        # self._log().debug("***")
                     if allow_class:
                         match_list = matches[pdf_cell_id]
                         for match in match_list:
@@ -1399,6 +1400,6 @@ class MatchingPostProcessor:
         matching_details["matches"] = final_matches_wo
         matching_details["pdf_cells"] = pdf_cells
 
-        self._log().debug("Done prediction matching and post-processing!")
+        # self._log().debug("Done prediction matching and post-processing!")
         return matching_details
 
