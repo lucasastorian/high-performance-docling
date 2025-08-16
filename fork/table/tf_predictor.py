@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+import kornia as K
 from safetensors.torch import load_model
 
 import docling_ibm_models.tableformer.common as c
@@ -500,26 +501,20 @@ class TFPredictor:
         all_iocr_pages: list[dict] = []
 
         with phase1_timer.time_section('phase1_total'):
-            # Extract all page images first
-            all_page_images = [page_input["image"] for page_input in page_inputs]
-
             with phase1_timer.time_section('page_resize'):
-                resized_pages, scale_factors = self._batch_resize_pages(
-                    pages=all_page_images, target_height=1024, device=self._device  # e.g. 'cuda'
+                resized_pages, scale_factors = self._kornia_resize_pages(
+                    page_inputs=page_inputs,
+                    target_height=1024,
+                    device=self._device,
                 )
 
             with phase1_timer.time_section('table_cropping'):
-                for page_idx, (page_input, page_tbl_bboxes) in enumerate(zip(page_inputs, table_bboxes_list)):
-                    resized_page = resized_pages[page_idx]
-                    scale_factor = scale_factors[page_idx]
-
-                    if isinstance(resized_page, torch.Tensor):
-                        resized_page_np = (resized_page * 255).byte().permute(1, 2, 0).cpu().numpy()
-                    else:
-                        resized_page_np = resized_page
+                for page_input, resized_page, scale_factor, page_tbl_bboxes in zip(
+                        page_inputs, resized_pages, scale_factors, table_bboxes_list
+                ):
+                    resized_page_np = (resized_page.permute(1, 2, 0) * 255).byte().cpu().numpy()
 
                     for tbl_bbox in page_tbl_bboxes:
-                        # Scale bbox into resized-page coordinates
                         x1 = tbl_bbox[0] * scale_factor
                         y1 = tbl_bbox[1] * scale_factor
                         x2 = tbl_bbox[2] * scale_factor
@@ -1157,40 +1152,35 @@ class TFPredictor:
 
         return out  # (N, C, W, H), float32 on device
 
-    def _batch_resize_pages(self, pages: List[np.ndarray], target_height: int, device='cuda'):
-        resized_pages = [None] * len(pages)
-        scale_factors = [None] * len(pages)
-        max_width = 0
+    def _kornia_resize_pages(
+            self,
+            page_inputs: list[dict],
+            target_height: int = 1024,
+            device: str = 'cuda'
+    ):
+        page_images = []
+        orig_shapes = []
 
-        # Preprocess: convert and compute target width
-        inputs = []
-        shapes = []
-
-        for i, img in enumerate(pages):
+        for page_input in page_inputs:
+            img = page_input["image"]
             if img.ndim == 2:
                 img = img[..., None]
             if img.shape[2] == 1:
                 img = np.repeat(img, 3, axis=2)
             h, w = img.shape[:2]
-            scale = target_height / h
-            target_width = int(w * scale)
-            scale_factors[i] = scale
-            max_width = max(max_width, target_width)
-            img = img.astype(np.uint8)
-            tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
-            inputs.append((i, tensor, target_width))
+            orig_shapes.append((h, w))
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
+            page_images.append(img)
 
-        # Launch resizes in parallel using CUDA streams
-        streams = [torch.cuda.Stream(device=device) for _ in range(len(inputs))]
+        scale_factors = [target_height / h for (h, w) in orig_shapes]
+        target_widths = [int(w * sf) for (_, w), sf in zip(orig_shapes, scale_factors)]
+        max_width = max(target_widths)
 
-        for (i, tensor, target_width), stream in zip(inputs, streams):
-            with torch.cuda.stream(stream):
-                t = tensor.unsqueeze(0).to(device, non_blocking=True)  # [1, C, H, W]
-                resized = F.interpolate(t, size=(target_height, target_width), mode='bilinear', align_corners=False)[0]
-                padded = F.pad(resized, (0, max_width - target_width, 0, 0), mode='constant', value=1.0)
-                resized_pages[i] = padded
-
-        # Wait for all streams to complete
-        torch.cuda.synchronize()
+        resized_pages = []
+        for img, target_w in zip(page_images, target_widths):
+            resized = K.geometry.resize(img.unsqueeze(0), (target_height, target_w), interpolation='bilinear')[0]
+            pad = (0, max_width - resized.shape[2])
+            padded = F.pad(resized, (pad[0], pad[1], 0, 0), mode='constant', value=1.0)
+            resized_pages.append(padded)
 
         return resized_pages, scale_factors
