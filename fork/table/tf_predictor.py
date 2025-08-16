@@ -861,6 +861,7 @@ class TFPredictor:
                 pp_align_to_pdf_time = timer.get_time('pp_align_to_pdf')
                 pp_orphan_cells_time = timer.get_time('pp_orphan_cells')
                 pp_correct_overlaps_time = timer.get_time('pp_correct_overlaps')
+                pp_final_verification_time = timer.get_time('pp_final_verification')
                 
                 if pp_init_time > 0:
                     print(f"        │   ├─ pp_init: {pp_init_time:.1f}ms")
@@ -891,7 +892,9 @@ class TFPredictor:
                 if pp_orphan_cells_time > 0:
                     print(f"        │   ├─ pp_orphan_cells: {pp_orphan_cells_time:.1f}ms")
                 if pp_correct_overlaps_time > 0:
-                    print(f"        │   └─ pp_correct_overlaps: {pp_correct_overlaps_time:.1f}ms")
+                    print(f"        │   ├─ pp_correct_overlaps: {pp_correct_overlaps_time:.1f}ms")
+                if pp_final_verification_time > 0:
+                    print(f"        │   └─ pp_final_verification: {pp_final_verification_time:.1f}ms")
             print(f"        ├─ generate_response: {generate_response_time:.1f}ms")
             print(f"        └─ sort_and_merge: {sort_merge_time:.1f}ms")
 

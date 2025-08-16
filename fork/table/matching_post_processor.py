@@ -1363,24 +1363,25 @@ class MatchingPostProcessor:
         self._log().debug("*** table_cells_wo")
         self._log().debug(table_cells_wo)
 
-        for pdf_cell_id in range(len(final_matches_wo)):
-            if str(pdf_cell_id) in final_matches_wo:
-                pdf_cell_match = final_matches_wo[str(pdf_cell_id)]
-                if len(pdf_cell_match) > 1:
-                    l1 = "!!! Multiple - {}x pdf cell match with id: {}"
-                    self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
-                if pdf_cell_match:
-                    tcellid = pdf_cell_match[0]["table_cell_id"]
-                    for tcell in table_cells_wo:
-                        if tcell["cell_id"] == tcellid:
-                            mrow = tcell["row_id"]
-                            mcol = tcell["column_id"]
-                            l2 = "pdf cell: {} -> row: {} | col:{}"
-                            self._log().debug(l2.format(pdf_cell_id, mrow, mcol))
-            else:
-                self._log().debug(
-                    "!!! pdf cell doesn't have match: {}".format(pdf_cell_id)
-                )
+        with timer.time_section('pp_final_verification'):
+            for pdf_cell_id in range(len(final_matches_wo)):
+                if str(pdf_cell_id) in final_matches_wo:
+                    pdf_cell_match = final_matches_wo[str(pdf_cell_id)]
+                    if len(pdf_cell_match) > 1:
+                        l1 = "!!! Multiple - {}x pdf cell match with id: {}"
+                        self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
+                    if pdf_cell_match:
+                        tcellid = pdf_cell_match[0]["table_cell_id"]
+                        for tcell in table_cells_wo:
+                            if tcell["cell_id"] == tcellid:
+                                mrow = tcell["row_id"]
+                                mcol = tcell["column_id"]
+                                l2 = "pdf cell: {} -> row: {} | col:{}"
+                                self._log().debug(l2.format(pdf_cell_id, mrow, mcol))
+                else:
+                    self._log().debug(
+                        "!!! pdf cell doesn't have match: {}".format(pdf_cell_id)
+                    )
 
         # Example of an object:
         # matching_details = {
