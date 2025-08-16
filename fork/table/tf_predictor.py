@@ -741,9 +741,10 @@ class TFPredictor:
                 otsl_sqr_chk(prediction["rs_seq"], False)
 
                 # Sync bboxes vs tags
-                sync, corrected_bboxes = self._check_bbox_sync(prediction)
-                if not sync:
-                    prediction["bboxes"] = corrected_bboxes
+                with timer.time_section('bbox_sync'):
+                    sync, corrected_bboxes = self._check_bbox_sync(prediction)
+                    if not sync:
+                        prediction["bboxes"] = corrected_bboxes
 
                 # Prepare matching details
                 matching_details = {
@@ -764,45 +765,72 @@ class TFPredictor:
                 # Matching (faithful to original)
                 if len(prediction["bboxes"]) > 0:
                     if do_matching:
-                        matching_details = self._cell_matcher.match_cells(
-                            iocr_page, tbl_bbox_for_match, prediction
-                        )
+                        with timer.time_section('match_cells'):
+                            matching_details = self._cell_matcher.match_cells(
+                                iocr_page, tbl_bbox_for_match, prediction
+                            )
                         # Post-processing if tokens exist and post-process enabled
                         if len(iocr_page.get("tokens", [])) > 0 and self.enable_post_process:
-                            AggProfiler().begin("post_process", self._prof)
-                            matching_details = self._post_processor.process(
-                                matching_details, correct_overlapping_cells
-                            )
-                            AggProfiler().end("post_process", self._prof)
+                            with timer.time_section('post_process'):
+                                AggProfiler().begin("post_process", self._prof)
+                                matching_details = self._post_processor.process(
+                                    matching_details, correct_overlapping_cells
+                                )
+                                AggProfiler().end("post_process", self._prof)
                     else:
-                        matching_details = self._cell_matcher.match_cells_dummy(
-                            iocr_page, tbl_bbox_for_match, prediction
-                        )
+                        with timer.time_section('match_cells_dummy'):
+                            matching_details = self._cell_matcher.match_cells_dummy(
+                                iocr_page, tbl_bbox_for_match, prediction
+                            )
 
                 # Generate Docling responses (as in original)
-                AggProfiler().begin("generate_docling_response", self._prof)
-                if do_matching:
-                    docling_output = self._generate_tf_response(
-                        matching_details["table_cells"], matching_details["matches"]
-                    )
-                else:
-                    docling_output = self._generate_tf_response_dummy(
-                        matching_details["table_cells"]
-                    )
-                AggProfiler().end("generate_docling_response", self._prof)
+                with timer.time_section('generate_response'):
+                    AggProfiler().begin("generate_docling_response", self._prof)
+                    if do_matching:
+                        docling_output = self._generate_tf_response(
+                            matching_details["table_cells"], matching_details["matches"]
+                        )
+                    else:
+                        docling_output = self._generate_tf_response_dummy(
+                            matching_details["table_cells"]
+                        )
+                    AggProfiler().end("generate_docling_response", self._prof)
 
                 # Sort and merge to TF output
-                docling_output.sort(key=lambda item: item["cell_id"])
-                matching_details["docling_responses"] = docling_output
-                tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
+                with timer.time_section('sort_and_merge'):
+                    docling_output.sort(key=lambda item: item["cell_id"])
+                    matching_details["docling_responses"] = docling_output
+                    tf_output = self._merge_tf_output(docling_output, matching_details["pdf_cells"])
 
                 outputs.append((tf_output, matching_details))
         
         # Finalize timing and log results
         timer.finalize()
+        
+        # Main breakdown
         print(f"     └─ tf predictor breakdown: preprocess={timer.get_time('image_preprocessing'):.1f}ms "
               f"inference={timer.get_time('model_inference'):.1f}ms "
               f"matching={timer.get_time('cell_matching_and_postprocess'):.1f}ms")
+        
+        # Detailed matching/postprocess breakdown
+        bbox_sync_time = timer.get_time('bbox_sync')
+        match_cells_time = timer.get_time('match_cells')
+        match_dummy_time = timer.get_time('match_cells_dummy')
+        post_process_time = timer.get_time('post_process')
+        generate_response_time = timer.get_time('generate_response')
+        sort_merge_time = timer.get_time('sort_and_merge')
+        
+        # Print detailed breakdown if any sub-timings exist
+        if any([bbox_sync_time, match_cells_time, match_dummy_time, post_process_time, generate_response_time, sort_merge_time]):
+            print(f"        ├─ bbox_sync: {bbox_sync_time:.1f}ms")
+            if match_cells_time > 0:
+                print(f"        ├─ match_cells: {match_cells_time:.1f}ms")
+            if match_dummy_time > 0:
+                print(f"        ├─ match_cells_dummy: {match_dummy_time:.1f}ms")
+            if post_process_time > 0:
+                print(f"        ├─ post_process: {post_process_time:.1f}ms")
+            print(f"        ├─ generate_response: {generate_response_time:.1f}ms")
+            print(f"        └─ sort_and_merge: {sort_merge_time:.1f}ms")
 
         return outputs
 
