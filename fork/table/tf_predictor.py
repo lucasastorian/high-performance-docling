@@ -14,7 +14,6 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import kornia as K
 from safetensors.torch import load_model
 
 import docling_ibm_models.tableformer.common as c
@@ -501,43 +500,65 @@ class TFPredictor:
         all_iocr_pages: list[dict] = []
 
         with phase1_timer.time_section('phase1_total'):
-            with phase1_timer.time_section('page_resize'):
-                resized_pages, scale_factors = self._kornia_resize_pages(
-                    page_inputs=page_inputs,
-                    target_height=1024,
-                    device=self._device,
-                )
+            with phase1_timer.time_section('roi_resize'):
+                # We no longer resize whole pages. For each page we:
+                #  - compute scale_factor = 1024 / original_page_height
+                #  - crop each table from the ORIGINAL page
+                #  - resize ONLY that crop to the scaled size
+                for page_input, page_tbl_bboxes in zip(page_inputs, table_bboxes_list):
+                    img = page_input["image"]
+                    H, W = img.shape[:2]
+                    scale_factor = 1024.0 / float(H)
 
-            with phase1_timer.time_section('table_cropping'):
-                for page_input, resized_page, scale_factor, page_tbl_bboxes in zip(
-                        page_inputs, resized_pages, scale_factors, table_bboxes_list
-                ):
-                    resized_page_np = (resized_page.permute(1, 2, 0) * 255).byte().cpu().numpy()
+                    # Local aliases to reduce attribute lookups in the inner loop
+                    _resize = cv2.resize
+                    _append_img = all_table_images.append
+                    _append_bbox = all_scaled_bboxes.append
+                    _append_scale = all_scale_factors.append
+                    _append_page = all_iocr_pages.append
 
-                    for tbl_bbox in page_tbl_bboxes:
-                        x1 = tbl_bbox[0] * scale_factor
-                        y1 = tbl_bbox[1] * scale_factor
-                        x2 = tbl_bbox[2] * scale_factor
-                        y2 = tbl_bbox[3] * scale_factor
-                        scaled_bbox = [x1, y1, x2, y2]
+                    for x1, y1, x2, y2 in page_tbl_bboxes:
+                        # Integer crop coordinates in original page space
+                        ix1 = int(round(x1));
+                        iy1 = int(round(y1))
+                        ix2 = int(round(x2));
+                        iy2 = int(round(y2))
 
-                        crop = resized_page_np[round(y1):round(y2), round(x1):round(x2)]
+                        # Clamp to image bounds (robustness)
+                        if ix1 < 0: ix1 = 0
+                        if iy1 < 0: iy1 = 0
+                        if ix2 > W: ix2 = W
+                        if iy2 > H: iy2 = H
 
-                        all_table_images.append(crop)
-                        all_scaled_bboxes.append(scaled_bbox)
-                        all_scale_factors.append(scale_factor)
-                        all_iocr_pages.append(page_input)
+                        if ix2 <= ix1 or iy2 <= iy1:
+                            continue  # skip degenerate boxes
+
+                        crop = img[iy1:iy2, ix1:ix2]
+                        if crop.size == 0:
+                            continue
+
+                        # Target size in the "resized page" coordinates
+                        tw = max(1, int(round((x2 - x1) * scale_factor)))
+                        th = max(1, int(round((y2 - y1) * scale_factor)))
+
+                        # Downscale with INTER_AREA (best quality/speed for shrink)
+                        resized_crop = _resize(crop, (tw, th), interpolation=cv2.INTER_AREA)
+
+                        # Collect outputs, matching your previous semantics
+                        _append_img(resized_crop)
+                        _append_bbox([x1 * scale_factor, y1 * scale_factor, x2 * scale_factor, y2 * scale_factor])
+                        _append_scale(scale_factor)
+                        _append_page(page_input)
 
             if not all_table_images:
                 return []
 
-        # Finalize and print phase 1 timing
+        # print timing with updated key
         phase1_timer.finalize()
         num_pages = len(page_inputs)
         num_tables = len(all_table_images)
-        print(f"     └─ Phase 1 (resize & crop): total={phase1_timer.get_time('phase1_total'):.1f}ms "
-              f"page_resize={phase1_timer.get_time('page_resize'):.1f}ms "
-              f"table_crop={phase1_timer.get_time('table_cropping'):.1f}ms "
+        print(f"     └─ Phase 1 (crop→resize): total={phase1_timer.get_time('phase1_total'):.1f}ms "
+              f"roi_resize={phase1_timer.get_time('roi_resize'):.1f}ms "
               f"({num_pages} pages, {num_tables} tables)")
 
         # -------- Phase 2: model + (optional) matching, batched --------
@@ -1151,36 +1172,3 @@ class TFPredictor:
             torch.cuda.current_stream(device=self._device).wait_stream(stream)
 
         return out  # (N, C, W, H), float32 on device
-
-    def _kornia_resize_pages(
-            self,
-            page_inputs: list[dict],
-            target_height: int = 1024,
-            device: str = 'cuda'
-    ):
-        page_images = []
-        orig_shapes = []
-
-        for page_input in page_inputs:
-            img = page_input["image"]
-            if img.ndim == 2:
-                img = img[..., None]
-            if img.shape[2] == 1:
-                img = np.repeat(img, 3, axis=2)
-            h, w = img.shape[:2]
-            orig_shapes.append((h, w))
-            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0  # CHW
-            page_images.append(img)
-
-        scale_factors = [target_height / h for (h, w) in orig_shapes]
-        target_widths = [int(w * sf) for (_, w), sf in zip(orig_shapes, scale_factors)]
-        max_width = max(target_widths)
-
-        resized_pages = []
-        for img, target_w in zip(page_images, target_widths):
-            resized = K.geometry.resize(img.unsqueeze(0), (target_height, target_w), interpolation='bilinear')[0]
-            pad = (0, max_width - resized.shape[2])
-            padded = F.pad(resized, (pad[0], pad[1], 0, 0), mode='constant', value=1.0)
-            resized_pages.append(padded)
-
-        return resized_pages, scale_factors
