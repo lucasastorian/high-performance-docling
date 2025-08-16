@@ -487,35 +487,54 @@ class TFPredictor:
         in page order, table order (stable).
         """
 
+        # Create timer for phase 1 timing
+        from fork.timers import _CPUTimer
+        import time
+        
+        phase1_timer = _CPUTimer()
+
         # -------- Phase 1: build per-table inputs with original resize semantics --------
         all_table_images: list[np.ndarray] = []
         all_scaled_bboxes: list[list[float]] = []
         all_scale_factors: list[float] = []
         all_iocr_pages: list[dict] = []
 
-        for page_input, page_tbl_bboxes in zip(page_inputs, table_bboxes_list):
-            # Original pipeline: resize the *page* once, then scale all table bboxes with the same factor
-            page_image = page_input["image"]
-            resized_page, scale_factor = self.resize_img(page_image, height=1024)
+        with phase1_timer.time_section('phase1_total'):
+            for page_input, page_tbl_bboxes in zip(page_inputs, table_bboxes_list):
+                # Original pipeline: resize the *page* once, then scale all table bboxes with the same factor
+                page_image = page_input["image"]
+                
+                with phase1_timer.time_section('page_resize'):
+                    resized_page, scale_factor = self.resize_img(page_image, height=1024)
 
-            for tbl_bbox in page_tbl_bboxes:
-                # Scale bbox into resized-page coordinates (do not mutate caller data)
-                x1 = tbl_bbox[0] * scale_factor
-                y1 = tbl_bbox[1] * scale_factor
-                x2 = tbl_bbox[2] * scale_factor
-                y2 = tbl_bbox[3] * scale_factor
-                scaled_bbox = [x1, y1, x2, y2]
+                with phase1_timer.time_section('table_cropping'):
+                    for tbl_bbox in page_tbl_bboxes:
+                        # Scale bbox into resized-page coordinates (do not mutate caller data)
+                        x1 = tbl_bbox[0] * scale_factor
+                        y1 = tbl_bbox[1] * scale_factor
+                        x2 = tbl_bbox[2] * scale_factor
+                        y2 = tbl_bbox[3] * scale_factor
+                        scaled_bbox = [x1, y1, x2, y2]
 
-                # Crop table region from the *resized* page (like standard)
-                crop = resized_page[round(y1):round(y2), round(x1):round(x2)]
+                        # Crop table region from the *resized* page (like standard)
+                        crop = resized_page[round(y1):round(y2), round(x1):round(x2)]
 
-                all_table_images.append(crop)
-                all_scaled_bboxes.append(scaled_bbox)
-                all_scale_factors.append(scale_factor)
-                all_iocr_pages.append(page_input)
+                        all_table_images.append(crop)
+                        all_scaled_bboxes.append(scaled_bbox)
+                        all_scale_factors.append(scale_factor)
+                        all_iocr_pages.append(page_input)
 
-        if not all_table_images:
-            return []
+            if not all_table_images:
+                return []
+        
+        # Finalize and print phase 1 timing
+        phase1_timer.finalize()
+        num_pages = len(page_inputs)
+        num_tables = len(all_table_images)
+        print(f"     └─ Phase 1 (resize & crop): total={phase1_timer.get_time('phase1_total'):.1f}ms "
+              f"page_resize={phase1_timer.get_time('page_resize'):.1f}ms "
+              f"table_crop={phase1_timer.get_time('table_cropping'):.1f}ms "
+              f"({num_pages} pages, {num_tables} tables)")
 
         # -------- Phase 2: model + (optional) matching, batched --------
         # Uses your batched predict() that accepts lists. It will:
@@ -774,7 +793,7 @@ class TFPredictor:
                             with timer.time_section('post_process'):
                                 AggProfiler().begin("post_process", self._prof)
                                 matching_details = self._post_processor.process(
-                                    matching_details, correct_overlapping_cells
+                                    matching_details, correct_overlapping_cells, timer=timer
                                 )
                                 AggProfiler().end("post_process", self._prof)
                     else:
@@ -826,6 +845,53 @@ class TFPredictor:
                 print(f"        ├─ match_cells: {match_cells_time:.1f}ms")
             if post_process_time > 0:
                 print(f"        ├─ post_process: {post_process_time:.1f}ms")
+                # Print detailed post-processing breakdown
+                pp_init_time = timer.get_time('pp_init')
+                pp_initial_intersection_time = timer.get_time('pp_initial_intersection_match')
+                pp_get_dimensions_time = timer.get_time('pp_get_dimensions')
+                pp_column_processing_time = timer.get_time('pp_column_processing')
+                pp_good_bad_cells_time = timer.get_time('pp_good_bad_cells')
+                pp_find_alignment_time = timer.get_time('pp_find_alignment')
+                pp_get_median_time = timer.get_time('pp_get_median')
+                pp_move_cells_time = timer.get_time('pp_move_cells')
+                pp_sort_cells_time = timer.get_time('pp_sort_cells')
+                pp_intersection_match_time = timer.get_time('pp_intersection_match')
+                pp_deduplicate_time = timer.get_time('pp_deduplicate')
+                pp_final_assignment_time = timer.get_time('pp_final_assignment')
+                pp_align_to_pdf_time = timer.get_time('pp_align_to_pdf')
+                pp_orphan_cells_time = timer.get_time('pp_orphan_cells')
+                pp_correct_overlaps_time = timer.get_time('pp_correct_overlaps')
+                
+                if pp_init_time > 0:
+                    print(f"        │   ├─ pp_init: {pp_init_time:.1f}ms")
+                if pp_initial_intersection_time > 0:
+                    print(f"        │   ├─ pp_initial_intersection: {pp_initial_intersection_time:.1f}ms")
+                if pp_get_dimensions_time > 0:
+                    print(f"        │   ├─ pp_get_dimensions: {pp_get_dimensions_time:.1f}ms")
+                if pp_column_processing_time > 0:
+                    print(f"        │   ├─ pp_column_processing: {pp_column_processing_time:.1f}ms")
+                    if pp_good_bad_cells_time > 0:
+                        print(f"        │   │   ├─ good_bad_cells: {pp_good_bad_cells_time:.1f}ms")
+                    if pp_find_alignment_time > 0:
+                        print(f"        │   │   ├─ find_alignment: {pp_find_alignment_time:.1f}ms")
+                    if pp_get_median_time > 0:
+                        print(f"        │   │   ├─ get_median: {pp_get_median_time:.1f}ms")
+                    if pp_move_cells_time > 0:
+                        print(f"        │   │   └─ move_cells: {pp_move_cells_time:.1f}ms")
+                if pp_sort_cells_time > 0:
+                    print(f"        │   ├─ pp_sort_cells: {pp_sort_cells_time:.1f}ms")
+                if pp_intersection_match_time > 0:
+                    print(f"        │   ├─ pp_intersection_match: {pp_intersection_match_time:.1f}ms")
+                if pp_deduplicate_time > 0:
+                    print(f"        │   ├─ pp_deduplicate: {pp_deduplicate_time:.1f}ms")
+                if pp_final_assignment_time > 0:
+                    print(f"        │   ├─ pp_final_assignment: {pp_final_assignment_time:.1f}ms")
+                if pp_align_to_pdf_time > 0:
+                    print(f"        │   ├─ pp_align_to_pdf: {pp_align_to_pdf_time:.1f}ms")
+                if pp_orphan_cells_time > 0:
+                    print(f"        │   ├─ pp_orphan_cells: {pp_orphan_cells_time:.1f}ms")
+                if pp_correct_overlaps_time > 0:
+                    print(f"        │   └─ pp_correct_overlaps: {pp_correct_overlaps_time:.1f}ms")
             print(f"        ├─ generate_response: {generate_response_time:.1f}ms")
             print(f"        └─ sort_and_merge: {sort_merge_time:.1f}ms")
 

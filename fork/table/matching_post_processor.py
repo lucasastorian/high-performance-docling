@@ -1124,7 +1124,7 @@ class MatchingPostProcessor:
                 new_pdf_cells.append(pdf_cells[i])
         return new_pdf_cells
 
-    def process(self, matching_details, correct_overlapping_cells=False):
+    def process(self, matching_details, correct_overlapping_cells=False, timer=None):
         r"""
         Do post processing, see details in the comments below
 
@@ -1133,6 +1133,10 @@ class MatchingPostProcessor:
         matching_details : dictionary
             contains all the necessary information for Docling processing
             already has predictions and initial (IOU) matches
+        correct_overlapping_cells : bool
+            whether to correct overlapping cells
+        timer : _CPUTimer or _CudaTimer
+            timer object passed from tf_predictor for consistent timing
 
         Returns
         -------
@@ -1140,13 +1144,10 @@ class MatchingPostProcessor:
             matching_details that contain post-processed matches
         """
 
-        # Import timer classes for detailed timing
-        from fork.timers import _CPUTimer, _CudaTimer
-        import torch
-        
-        # Create timer based on device availability
-        device_is_cuda = torch.cuda.is_available()
-        timer = _CudaTimer() if device_is_cuda else _CPUTimer()
+        # If no timer provided, create a dummy one that does nothing
+        if timer is None:
+            from fork.timers import _CPUTimer
+            timer = _CPUTimer()
 
         # ====================================================================================
         # Start post-processing
@@ -1396,28 +1397,6 @@ class MatchingPostProcessor:
         matching_details["table_cells"] = table_cells_wo
         matching_details["matches"] = final_matches_wo
         matching_details["pdf_cells"] = pdf_cells
-
-        # Finalize and print timing details
-        timer.finalize()
-        
-        # Print detailed post-processing breakdown
-        print(f"           ├─ pp_init: {timer.get_time('pp_init'):.1f}ms")
-        if timer.get_time('pp_initial_intersection_match') > 0:
-            print(f"           ├─ pp_initial_intersection: {timer.get_time('pp_initial_intersection_match'):.1f}ms")
-        print(f"           ├─ pp_get_dimensions: {timer.get_time('pp_get_dimensions'):.1f}ms")
-        print(f"           ├─ pp_column_processing: {timer.get_time('pp_column_processing'):.1f}ms")
-        print(f"           │   ├─ good_bad_cells: {timer.get_time('pp_good_bad_cells'):.1f}ms")
-        print(f"           │   ├─ find_alignment: {timer.get_time('pp_find_alignment'):.1f}ms")
-        print(f"           │   ├─ get_median: {timer.get_time('pp_get_median'):.1f}ms")
-        print(f"           │   └─ move_cells: {timer.get_time('pp_move_cells'):.1f}ms")
-        print(f"           ├─ pp_sort_cells: {timer.get_time('pp_sort_cells'):.1f}ms")
-        print(f"           ├─ pp_intersection_match: {timer.get_time('pp_intersection_match'):.1f}ms")
-        print(f"           ├─ pp_deduplicate: {timer.get_time('pp_deduplicate'):.1f}ms")
-        print(f"           ├─ pp_final_assignment: {timer.get_time('pp_final_assignment'):.1f}ms")
-        print(f"           ├─ pp_align_to_pdf: {timer.get_time('pp_align_to_pdf'):.1f}ms")
-        print(f"           ├─ pp_orphan_cells: {timer.get_time('pp_orphan_cells'):.1f}ms")
-        if timer.get_time('pp_correct_overlaps') > 0:
-            print(f"           └─ pp_correct_overlaps: {timer.get_time('pp_correct_overlaps'):.1f}ms")
 
         self._log().debug("Done prediction matching and post-processing!")
         return matching_details
