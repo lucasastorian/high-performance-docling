@@ -1140,6 +1140,14 @@ class MatchingPostProcessor:
             matching_details that contain post-processed matches
         """
 
+        # Import timer classes for detailed timing
+        from fork.timers import _CPUTimer, _CudaTimer
+        import torch
+        
+        # Create timer based on device availability
+        device_is_cuda = torch.cuda.is_available()
+        timer = _CudaTimer() if device_is_cuda else _CPUTimer()
+
         # ====================================================================================
         # Start post-processing
         # ====================================================================================
@@ -1192,9 +1200,11 @@ class MatchingPostProcessor:
         # of other cells in a minimal-grid column
 
         self._log().debug("Start prediction post-processing...")
-        table_cells = matching_details["table_cells"]
-        pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
-        matches = matching_details["matches"]
+        
+        with timer.time_section('pp_init'):
+            table_cells = matching_details["table_cells"]
+            pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
+            matches = matching_details["matches"]
 
         # ------------------------------------------------------------------------------------------
         # -1. If initial (IOU) matches are empty,
@@ -1216,13 +1226,15 @@ class MatchingPostProcessor:
             self._log().debug(
                 "-----------------------------------------------------------------"
             )
-            matches = self._run_intersection_match(
-                self._cell_matcher, table_cells, pdf_cells
-            )
+            with timer.time_section('pp_initial_intersection_match'):
+                matches = self._run_intersection_match(
+                    self._cell_matcher, table_cells, pdf_cells
+                )
 
         # ------------------------------------------------------------------------------------------
         # 0. Get minimal grid table dimension (cols/rows)
-        tab_columns, tab_rows, max_cell_id = self._get_table_dimension(table_cells)
+        with timer.time_section('pp_get_dimensions'):
+            tab_columns, tab_rows, max_cell_id = self._get_table_dimension(table_cells)
         self._log().debug(
             "COLS {}/ ROWS {}/ MAX CELL ID {}".format(
                 tab_columns, tab_rows, max_cell_id
@@ -1235,61 +1247,69 @@ class MatchingPostProcessor:
         fixed_table_cells = []
 
         # 1. Get good/bad IOU predicted cells for each structural column (of minimal grid)
-        for col in range(tab_columns):
-            g1, g2 = self._get_good_bad_cells_in_column(table_cells, col, matches)
-            good_table_cells = g1
-            bad_table_cells = g2
-            self._log().debug(
-                "COLUMN {}, Good table cells: {}".format(col, len(good_table_cells))
-            )
-            self._log().debug(
-                "COLUMN {}, Bad table cells: {}".format(col, len(bad_table_cells))
-            )
+        with timer.time_section('pp_column_processing'):
+            for col in range(tab_columns):
+                with timer.time_section('pp_good_bad_cells'):
+                    g1, g2 = self._get_good_bad_cells_in_column(table_cells, col, matches)
+                    good_table_cells = g1
+                    bad_table_cells = g2
+                self._log().debug(
+                    "COLUMN {}, Good table cells: {}".format(col, len(good_table_cells))
+                )
+                self._log().debug(
+                    "COLUMN {}, Bad table cells: {}".format(col, len(bad_table_cells))
+                )
 
-            # 2. Find alignment of good IOU cells per column
-            alignment = self._find_alignment_in_column(good_table_cells)
-            self._log().debug("COLUMN {}, Alignment: {}".format(col, alignment))
-            # alignment = "left"
+                # 2. Find alignment of good IOU cells per column
+                with timer.time_section('pp_find_alignment'):
+                    alignment = self._find_alignment_in_column(good_table_cells)
+                self._log().debug("COLUMN {}, Alignment: {}".format(col, alignment))
+                # alignment = "left"
 
-            # 3. Get median (according to alignment) "bbox left/middle/right X"
-            #    coordinate for good IOU cells, get median* cell size in a column.
-            gm1, gm2, gm3, gm4 = self._get_median_pos_size(good_table_cells, alignment)
-            median_x = gm1
-            # median_y = gm2
-            median_width = gm3
-            median_height = gm4
-            self._log().debug("Median good X = {}".format(median_x))
+                # 3. Get median (according to alignment) "bbox left/middle/right X"
+                #    coordinate for good IOU cells, get median* cell size in a column.
+                with timer.time_section('pp_get_median'):
+                    gm1, gm2, gm3, gm4 = self._get_median_pos_size(good_table_cells, alignment)
+                    median_x = gm1
+                    # median_y = gm2
+                    median_width = gm3
+                    median_height = gm4
+                self._log().debug("Median good X = {}".format(median_x))
 
-            # 4. Move bad cells to the median* (left/middle/right) good in a column
-            # nc = self._move_cells_to_left_pos(bad_table_cells, median_x, True,
-            # TODO:
-            nc = self._move_cells_to_left_pos(
-                bad_table_cells, median_x, False, median_width, median_height, alignment
-            )
-            new_bad_table_cells = nc
-            fixed_table_cells.extend(good_table_cells)
-            fixed_table_cells.extend(new_bad_table_cells)
+                # 4. Move bad cells to the median* (left/middle/right) good in a column
+                # nc = self._move_cells_to_left_pos(bad_table_cells, median_x, True,
+                # TODO:
+                with timer.time_section('pp_move_cells'):
+                    nc = self._move_cells_to_left_pos(
+                        bad_table_cells, median_x, False, median_width, median_height, alignment
+                    )
+                    new_bad_table_cells = nc
+                    fixed_table_cells.extend(good_table_cells)
+                    fixed_table_cells.extend(new_bad_table_cells)
 
         # ====================================================================================
         # Sort table_cells by cell_id before running IOU, to have correct indexes on the output
-        fixed_table_cells_sorted = sorted(fixed_table_cells, key=lambda k: k["cell_id"])
+        with timer.time_section('pp_sort_cells'):
+            fixed_table_cells_sorted = sorted(fixed_table_cells, key=lambda k: k["cell_id"])
 
         # 5. Generate new matches, run Intersection over cell(pdf) on a table cells
-        ip = self._run_intersection_match(
-            self._cell_matcher, fixed_table_cells_sorted, pdf_cells
-        )
-        intersection_pdf_matches = ip
+        with timer.time_section('pp_intersection_match'):
+            ip = self._run_intersection_match(
+                self._cell_matcher, fixed_table_cells_sorted, pdf_cells
+            )
+            intersection_pdf_matches = ip
 
         # 6. NOT USED
 
         # 7. De-duplicate columns in aligned_table_cells
         # according to highest column score in: matches + intersection_pdf_matches
         # (this is easier now, because duplicated cells will have same bboxes)
-        dd1, dd2, dd3 = self._deduplicate_cells(
-            tab_columns, fixed_table_cells_sorted, matches, intersection_pdf_matches
-        )
-        dedupl_table_cells = dd1
-        dedupl_matches = dd2
+        with timer.time_section('pp_deduplicate'):
+            dd1, dd2, dd3 = self._deduplicate_cells(
+                tab_columns, fixed_table_cells_sorted, matches, intersection_pdf_matches
+            )
+            dedupl_table_cells = dd1
+            dedupl_matches = dd2
 
         self._log().debug("...")
 
@@ -1297,41 +1317,45 @@ class MatchingPostProcessor:
         # preferring IOU over PDF Intersection, and higher Intersection over lower
         # ! IOU matches currently disabled,
         # and final assigment is done only on IOC matches
-        final_matches = self._do_final_asignment(
-            dedupl_table_cells, matches, dedupl_matches
-        )
-
-        # 8.a. Re-align bboxes / re-run matching
-        dedupl_table_cells_sorted = sorted(
-            dedupl_table_cells, key=lambda k: k["cell_id"]
-        )
-
-        if (
-            len(pdf_cells) > 300
-        ):  # For performance, skip this step if there are too many pdf_cells
-            aligned_table_cells2 = dedupl_table_cells_sorted
-        else:
-            aligned_table_cells2 = self._align_table_cells_to_pdf(
-                dedupl_table_cells_sorted, pdf_cells, final_matches
+        with timer.time_section('pp_final_assignment'):
+            final_matches = self._do_final_asignment(
+                dedupl_table_cells, matches, dedupl_matches
             )
 
+        # 8.a. Re-align bboxes / re-run matching
+        with timer.time_section('pp_align_to_pdf'):
+            dedupl_table_cells_sorted = sorted(
+                dedupl_table_cells, key=lambda k: k["cell_id"]
+            )
+
+            if (
+                len(pdf_cells) > 300
+            ):  # For performance, skip this step if there are too many pdf_cells
+                aligned_table_cells2 = dedupl_table_cells_sorted
+            else:
+                aligned_table_cells2 = self._align_table_cells_to_pdf(
+                    dedupl_table_cells_sorted, pdf_cells, final_matches
+                )
+
         # 9. Distance-match orphans
-        po1, po2, po3 = self._pick_orphan_cells(
-            tab_rows,
-            tab_columns,
-            max_cell_id,
-            aligned_table_cells2,
-            pdf_cells,
-            final_matches,
-        )
-        final_matches_wo = po1
-        table_cells_wo = po2
-        max_cell_id = po3
+        with timer.time_section('pp_orphan_cells'):
+            po1, po2, po3 = self._pick_orphan_cells(
+                tab_rows,
+                tab_columns,
+                max_cell_id,
+                aligned_table_cells2,
+                pdf_cells,
+                final_matches,
+            )
+            final_matches_wo = po1
+            table_cells_wo = po2
+            max_cell_id = po3
 
         if correct_overlapping_cells:
             # As the last step - correct cell bboxes in a way that they don't overlap:
             if len(table_cells_wo) <= 300:  # For performance reasons
-                table_cells_wo = self._find_overlapping(table_cells_wo)
+                with timer.time_section('pp_correct_overlaps'):
+                    table_cells_wo = self._find_overlapping(table_cells_wo)
 
         self._log().debug("*** final_matches_wo")
         self._log().debug(final_matches_wo)
@@ -1372,6 +1396,28 @@ class MatchingPostProcessor:
         matching_details["table_cells"] = table_cells_wo
         matching_details["matches"] = final_matches_wo
         matching_details["pdf_cells"] = pdf_cells
+
+        # Finalize and print timing details
+        timer.finalize()
+        
+        # Print detailed post-processing breakdown
+        print(f"           ├─ pp_init: {timer.get_time('pp_init'):.1f}ms")
+        if timer.get_time('pp_initial_intersection_match') > 0:
+            print(f"           ├─ pp_initial_intersection: {timer.get_time('pp_initial_intersection_match'):.1f}ms")
+        print(f"           ├─ pp_get_dimensions: {timer.get_time('pp_get_dimensions'):.1f}ms")
+        print(f"           ├─ pp_column_processing: {timer.get_time('pp_column_processing'):.1f}ms")
+        print(f"           │   ├─ good_bad_cells: {timer.get_time('pp_good_bad_cells'):.1f}ms")
+        print(f"           │   ├─ find_alignment: {timer.get_time('pp_find_alignment'):.1f}ms")
+        print(f"           │   ├─ get_median: {timer.get_time('pp_get_median'):.1f}ms")
+        print(f"           │   └─ move_cells: {timer.get_time('pp_move_cells'):.1f}ms")
+        print(f"           ├─ pp_sort_cells: {timer.get_time('pp_sort_cells'):.1f}ms")
+        print(f"           ├─ pp_intersection_match: {timer.get_time('pp_intersection_match'):.1f}ms")
+        print(f"           ├─ pp_deduplicate: {timer.get_time('pp_deduplicate'):.1f}ms")
+        print(f"           ├─ pp_final_assignment: {timer.get_time('pp_final_assignment'):.1f}ms")
+        print(f"           ├─ pp_align_to_pdf: {timer.get_time('pp_align_to_pdf'):.1f}ms")
+        print(f"           ├─ pp_orphan_cells: {timer.get_time('pp_orphan_cells'):.1f}ms")
+        if timer.get_time('pp_correct_overlaps') > 0:
+            print(f"           └─ pp_correct_overlaps: {timer.get_time('pp_correct_overlaps'):.1f}ms")
 
         self._log().debug("Done prediction matching and post-processing!")
         return matching_details

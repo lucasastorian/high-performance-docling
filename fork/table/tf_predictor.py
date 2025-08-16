@@ -815,18 +815,15 @@ class TFPredictor:
         # Detailed matching/postprocess breakdown
         bbox_sync_time = timer.get_time('bbox_sync')
         match_cells_time = timer.get_time('match_cells')
-        match_dummy_time = timer.get_time('match_cells_dummy')
         post_process_time = timer.get_time('post_process')
         generate_response_time = timer.get_time('generate_response')
         sort_merge_time = timer.get_time('sort_and_merge')
         
         # Print detailed breakdown if any sub-timings exist
-        if any([bbox_sync_time, match_cells_time, match_dummy_time, post_process_time, generate_response_time, sort_merge_time]):
+        if any([bbox_sync_time, match_cells_time, post_process_time, generate_response_time, sort_merge_time]):
             print(f"        ├─ bbox_sync: {bbox_sync_time:.1f}ms")
             if match_cells_time > 0:
                 print(f"        ├─ match_cells: {match_cells_time:.1f}ms")
-            if match_dummy_time > 0:
-                print(f"        ├─ match_cells_dummy: {match_dummy_time:.1f}ms")
             if post_process_time > 0:
                 print(f"        ├─ post_process: {post_process_time:.1f}ms")
             print(f"        ├─ generate_response: {generate_response_time:.1f}ms")

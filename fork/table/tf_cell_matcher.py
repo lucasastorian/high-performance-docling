@@ -228,7 +228,6 @@ class CellMatcher:
             "page_height": iocr_page["height"],
             "page_width": iocr_page["width"],
             "table_cells": table_cells,
-            "pdf_cells": pdf_cells,
             "matches": {},
         }
         return matching_details
