@@ -67,13 +67,17 @@ if __name__ == '__main__':
     with GPUProcessor(pipeline_options) as gpu_processor:
         processed_pages = gpu_processor.process_all_pages(url=pdf_url, input_doc=input_doc, pages=preprocessed_pages)
 
-    # ========================================
-    # PHASE 3: Document Assembly
-    # ========================================
-    print(f"\n📄 PHASE 3: Document Assembly")
-    print("-" * 40)
-    assembler = DocumentAssembler(pipeline_options)
-    conv_res = assembler.assemble_document(input_doc, processed_pages)
+        # ========================================
+        # PHASE 3: Document Assembly
+        # ========================================
+        print(f"\n📄 PHASE 3: Document Assembly")
+        print("-" * 40)
+        assembler = DocumentAssembler(pipeline_options)
+        conv_res = assembler.assemble_document(input_doc, processed_pages)
+
+        print(f"\n📄 PHASE 4: Formula Enrichment")
+        print("-" * 40)
+        conv_res = gpu_processor.enrich_document_formulas(conv_res=conv_res)
 
     # ========================================
     # RESULTS

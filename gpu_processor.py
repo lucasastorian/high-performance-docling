@@ -2,7 +2,7 @@ import os
 import re
 import torch
 import time
-from typing import List
+from typing import List, Iterable
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions, LayoutOptions, TableStructureOptions
@@ -10,11 +10,14 @@ from docling.datamodel.pipeline_options import (
 from docling.datamodel.base_models import Page
 from docling.datamodel.document import ConversionResult
 from docling_core.types.doc import DocItemLabel
+from docling.utils.utils import chunkify
+from docling_core.types.doc import NodeItem
 from docling_core.types.doc.page import TextCell, BoundingRectangle
 import numpy as np
 
 from fork.layout.layout_model import LayoutModel
 from fork.table.table_structure_model import TableStructureModel
+from fork.formula.code_formula_model import CodeFormulaModel, CodeFormulaModelOptions
 # from standard.layout.layout_model import LayoutModel
 # from standard.table.table_structure_model import TableStructureModel
 
@@ -59,6 +62,16 @@ class GPUProcessor:
             artifacts_path=None,
             options=pipeline_options.table_structure_options or TableStructureOptions(),
             accelerator_options=pipeline_options.accelerator_options
+        )
+
+        self.formula_model = CodeFormulaModel(
+            enabled=True,
+            artifacts_path=None,
+            options=CodeFormulaModelOptions(
+                do_code_enrichment=False,
+                do_figure_enrichment=True
+            ),
+            accelerator_options=pipeline_options.accelerator_options,
         )
 
         self.device = device
@@ -160,10 +173,28 @@ class GPUProcessor:
             f"total: {fmt_secs(t_all)}"
         )
 
+
+        # Formula enrichment
+
         self.end_of_run_regression(url=url, pages_list=pages_with_tables, mode="compare")
         self.end_of_run_layout_regression(url=url, pages=pages_with_tables, mode="compare")
 
         return pages_with_tables
+
+    def enrich_document_formulas(self, conv_res: ConversionResult) -> ConversionResult:
+        def _prepare_elements(conv_res: ConversionResult) -> Iterable[NodeItem]:
+            for doc_element, _level in conv_res.document.iterate_items():
+                prepared_element = self.formula_model.prepare_element(
+                    conv_res=conv_res, element=doc_element
+                )
+                if prepared_element is not None:
+                    yield prepared_element
+
+        for element_batch in chunkify(_prepare_elements(conv_res), self.formula_model.elements_batch_size):
+            for element in self.formula_model(doc=conv_res.document, element_batch=element_batch):  # Must exhaust!
+                pass
+
+        return conv_res
 
     def _identify_ocr_regions(self, pages: List[Page]) -> List[dict]:
         """Find text regions without extractable text."""
