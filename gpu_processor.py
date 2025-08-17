@@ -182,6 +182,8 @@ class GPUProcessor:
         return pages_with_tables
 
     def enrich_document_formulas(self, conv_res: ConversionResult) -> ConversionResult:
+        t_formula_start = time.perf_counter()
+
         def _prepare_elements(conv_res: ConversionResult) -> Iterable[NodeItem]:
             for doc_element, _level in conv_res.document.iterate_items():
                 prepared_element = self.formula_model.prepare_element(
@@ -193,6 +195,9 @@ class GPUProcessor:
         for element_batch in chunkify(_prepare_elements(conv_res), self.formula_model.elements_batch_size):
             for element in self.formula_model(doc=conv_res.document, element_batch=element_batch):  # Must exhaust!
                 pass
+
+        t_formula = time.perf_counter() - t_formula_start
+        print(f"     ⏱ Formula Enrichment: {fmt_secs(t_formula)}")
 
         return conv_res
 
